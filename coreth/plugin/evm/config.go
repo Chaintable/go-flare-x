@@ -10,6 +10,7 @@ import (
 
 	"github.com/ava-labs/coreth/core/txpool"
 	"github.com/ava-labs/coreth/eth"
+	"github.com/ava-labs/coreth/pipeline/tracer"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/spf13/cast"
@@ -212,6 +213,8 @@ type Config struct {
 	// Note: only supports AddressedCall payloads as defined here:
 	// https://github.com/ava-labs/avalanchego/tree/7623ffd4be915a5185c9ed5e11fa9be15a6e1f00/vms/platformvm/warp/payload#addressedcall
 	WarpOffChainMessages []hexutil.Bytes `json:"warp-off-chain-messages"`
+
+	VMTraceCfg *tracer.PipelineTracerConfig `json:"vm-trace-config"`
 }
 
 // EthAPIs returns an array of strings representing the Eth APIs that should be enabled
@@ -267,6 +270,7 @@ func (c *Config) SetDefaults() {
 	c.StateSyncRequestSize = defaultStateSyncRequestSize
 	c.AllowUnprotectedTxHashes = defaultAllowUnprotectedTxHashes
 	c.AcceptedCacheSize = defaultAcceptedCacheSize
+	c.VMTraceCfg = nil
 }
 
 func (d *Duration) UnmarshalJSON(data []byte) (err error) {

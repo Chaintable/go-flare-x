@@ -24,6 +24,8 @@ type gatherer struct {
 	reg metrics.Registry
 }
 
+func ptrTo[T any](x T) *T { return &x }
+
 func (g gatherer) Gather() ([]*dto.MetricFamily, error) {
 	// Gather and pre-sort the metrics to avoid random listings
 	var names []string
@@ -70,6 +72,24 @@ func (g gatherer) Gather() ([]*dto.MetricFamily, error) {
 				Metric: []*dto.Metric{{
 					Gauge: &dto.Gauge{
 						Value: &valFloat,
+					},
+				}},
+			})
+		case metrics.GaugeInfo:
+			Lables := make([]*dto.LabelPair, 0, len(m.Snapshot().Value()))
+			for k, v := range m.Snapshot().Value() {
+				Lables = append(Lables, &dto.LabelPair{
+					Name:  ptrTo(k),
+					Value: ptrTo(v),
+				})
+			}
+			mfs = append(mfs, &dto.MetricFamily{
+				Name: &name,
+				Type: dto.MetricType_GAUGE.Enum(),
+				Metric: []*dto.Metric{{
+					Label: Lables,
+					Gauge: &dto.Gauge{
+						Value: ptrTo(float64(1)),
 					},
 				}},
 			})

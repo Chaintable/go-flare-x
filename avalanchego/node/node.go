@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1322,11 +1324,35 @@ func (n *Node) initMetricsAPI() error {
 
 	n.Log.Info("initializing metrics API")
 
+	mux := http.NewServeMux()
+
+	promHandler := promhttp.HandlerFor(
+		n.MetricsGatherer,
+		promhttp.HandlerOpts{},
+	)
+
+	mux.Handle("/debug/metrics/prometheus", promHandler)
+	metricsHost := os.Getenv("METRICS_HOST")
+	if len(metricsHost) != 0 {
+		metricsHost = "0.0.0.0"
+	}
+	metricsPort := os.Getenv("METRICS_PORT")
+	if len(metricsPort) == 0 {
+		metricsPort = "9260"
+	}
+
+	listenAddress := net.JoinHostPort(metricsHost, metricsPort)
+
+	go func() {
+		n.Log.Info("starting metrics server")
+		err := http.ListenAndServe(listenAddress, mux)
+		if err != nil {
+			log.Fatalf("Could not start server: %s\n", err)
+		}
+	}()
+
 	return n.APIServer.AddRoute(
-		promhttp.HandlerFor(
-			n.MetricsGatherer,
-			promhttp.HandlerOpts{},
-		),
+		promHandler,
 		"metrics",
 		"",
 	)

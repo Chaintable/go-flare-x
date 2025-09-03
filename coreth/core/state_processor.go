@@ -35,6 +35,7 @@ import (
 	"github.com/ava-labs/coreth/core/types"
 	"github.com/ava-labs/coreth/core/vm"
 	"github.com/ava-labs/coreth/params"
+	"github.com/ava-labs/coreth/pipeline/tracer"
 	"github.com/ava-labs/coreth/precompile/contract"
 	"github.com/ava-labs/coreth/precompile/modules"
 	"github.com/ethereum/go-ethereum/common"
@@ -91,6 +92,20 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 		vmenv   = vm.NewEVM(context, vm.TxContext{}, statedb, p.config, cfg)
 		signer  = types.MakeSigner(p.config, header.Number, header.Time)
 	)
+
+	// Iterate over and process the individual transactions
+	var pipelineTracer *tracer.PipelineTracer
+	if p, ok := cfg.Tracer.(*tracer.PipelineTracer); !ok {
+		log.Warn("vmConfig.Tracer must be a pipeline.Tracer")
+	} else {
+		pipelineTracer = p
+	}
+
+	if pipelineTracer != nil {
+		statedb.OnCommit = pipelineTracer.OnCommit
+		statedb.OnLog = pipelineTracer.OnLog
+	}
+
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
@@ -98,7 +113,15 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
 		statedb.SetTxContext(tx.Hash(), i)
+		if pipelineTracer != nil {
+			pipelineTracer.OnTxStart(
+				tx, msg.From)
+		}
 		receipt, err := applyTransaction(msg, p.config, gp, statedb, blockNumber, blockHash, tx, usedGas, vmenv)
+		if pipelineTracer != nil {
+			receipt.SetEffectiveGasPrice(tx, vmenv.Context.BaseFee)
+			pipelineTracer.OnTxEnd(receipt, err)
+		}
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}

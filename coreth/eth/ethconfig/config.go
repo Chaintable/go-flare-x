@@ -35,6 +35,7 @@ import (
 	"github.com/ava-labs/coreth/core/txpool"
 	"github.com/ava-labs/coreth/eth/gasprice"
 	"github.com/ava-labs/coreth/miner"
+	"github.com/ava-labs/coreth/pipeline/tracer"
 	"github.com/ethereum/go-ethereum/common"
 )
 
@@ -205,4 +206,6 @@ type Config struct {
 	// This is useful for validators that don't need to index transactions.
 	// TxLookupLimit can be still used to control unindexing old transactions.
 	SkipTxIndexing bool
+
+	VMTraceCfg *tracer.PipelineTracerConfig
 }

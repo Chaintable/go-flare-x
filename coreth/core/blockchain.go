@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,42 +43,51 @@ import (
 	"github.com/ava-labs/coreth/core/rawdb"
 	"github.com/ava-labs/coreth/core/state"
 	"github.com/ava-labs/coreth/core/state/snapshot"
+	"github.com/ava-labs/coreth/core/tracing"
 	"github.com/ava-labs/coreth/core/types"
 	"github.com/ava-labs/coreth/core/vm"
 	"github.com/ava-labs/coreth/internal/version"
 	"github.com/ava-labs/coreth/metrics"
 	"github.com/ava-labs/coreth/params"
+
+	"github.com/ava-labs/coreth/pipeline/tracer"
+	ptypes "github.com/ava-labs/coreth/pipeline/types"
+	"github.com/ava-labs/coreth/pipeline/util"
 	"github.com/ava-labs/coreth/trie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
+
+	gcore "github.com/ethereum/go-ethereum/core"
 )
 
 var (
-	accountReadTimer         = metrics.NewRegisteredCounter("chain/account/reads", nil)
-	accountHashTimer         = metrics.NewRegisteredCounter("chain/account/hashes", nil)
-	accountUpdateTimer       = metrics.NewRegisteredCounter("chain/account/updates", nil)
-	accountCommitTimer       = metrics.NewRegisteredCounter("chain/account/commits", nil)
-	storageReadTimer         = metrics.NewRegisteredCounter("chain/storage/reads", nil)
-	storageHashTimer         = metrics.NewRegisteredCounter("chain/storage/hashes", nil)
-	storageUpdateTimer       = metrics.NewRegisteredCounter("chain/storage/updates", nil)
-	storageCommitTimer       = metrics.NewRegisteredCounter("chain/storage/commits", nil)
-	snapshotAccountReadTimer = metrics.NewRegisteredCounter("chain/snapshot/account/reads", nil)
-	snapshotStorageReadTimer = metrics.NewRegisteredCounter("chain/snapshot/storage/reads", nil)
-	snapshotCommitTimer      = metrics.NewRegisteredCounter("chain/snapshot/commits", nil)
+	accountReadTimer         = metrics.GetOrRegisterTimer("chain/account/reads", nil)
+	accountHashTimer         = metrics.GetOrRegisterTimer("chain/account/hashes", nil)
+	accountUpdateTimer       = metrics.GetOrRegisterTimer("chain/account/updates", nil)
+	accountCommitTimer       = metrics.GetOrRegisterTimer("chain/account/commits", nil)
+	storageReadTimer         = metrics.GetOrRegisterTimer("chain/storage/reads", nil)
+	storageHashTimer         = metrics.GetOrRegisterTimer("chain/storage/hashes", nil)
+	storageUpdateTimer       = metrics.GetOrRegisterTimer("chain/storage/updates", nil)
+	storageCommitTimer       = metrics.GetOrRegisterTimer("chain/storage/commits", nil)
+	snapshotAccountReadTimer = metrics.GetOrRegisterTimer("chain/snapshot/account/reads", nil)
+	snapshotStorageReadTimer = metrics.GetOrRegisterTimer("chain/snapshot/storage/reads", nil)
+	snapshotCommitTimer      = metrics.GetOrRegisterTimer("chain/snapshot/commits", nil)
 
-	triedbCommitTimer = metrics.NewRegisteredCounter("chain/triedb/commits", nil)
+	blockHeadNum = metrics.GetOrRegisterGauge("chain/head/block", nil)
 
-	blockInsertTimer            = metrics.NewRegisteredCounter("chain/block/inserts", nil)
+	triedbCommitTimer = metrics.GetOrRegisterTimer("chain/triedb/commits", nil)
+
+	blockInsertTimer            = metrics.GetOrRegisterTimer("chain/inserts", nil)
 	blockInsertCount            = metrics.NewRegisteredCounter("chain/block/inserts/count", nil)
-	blockContentValidationTimer = metrics.NewRegisteredCounter("chain/block/validations/content", nil)
-	blockStateInitTimer         = metrics.NewRegisteredCounter("chain/block/inits/state", nil)
-	blockExecutionTimer         = metrics.NewRegisteredCounter("chain/block/executions", nil)
-	blockTrieOpsTimer           = metrics.NewRegisteredCounter("chain/block/trie", nil)
-	blockValidationTimer        = metrics.NewRegisteredCounter("chain/block/validations/state", nil)
-	blockWriteTimer             = metrics.NewRegisteredCounter("chain/block/writes", nil)
+	blockContentValidationTimer = metrics.GetOrRegisterTimer("chain/validations/content", nil)
+	blockStateInitTimer         = metrics.GetOrRegisterTimer("chain/inits/state", nil)
+	blockExecutionTimer         = metrics.GetOrRegisterTimer("chain/execution", nil)
+	blockTrieOpsTimer           = metrics.GetOrRegisterTimer("chain/trie", nil)
+	blockValidationTimer        = metrics.GetOrRegisterTimer("chain/validation", nil)
+	blockWriteTimer             = metrics.GetOrRegisterTimer("chain/write", nil)
 
 	acceptorQueueGauge           = metrics.NewRegisteredGauge("chain/acceptor/queue/size", nil)
 	acceptorWorkTimer            = metrics.NewRegisteredCounter("chain/acceptor/work", nil)
@@ -86,7 +96,7 @@ var (
 	acceptedBlockGasUsedCounter  = metrics.NewRegisteredCounter("chain/block/gas/used/accepted", nil)
 	badBlockCounter              = metrics.NewRegisteredCounter("chain/block/bad/count", nil)
 
-	txUnindexTimer      = metrics.NewRegisteredCounter("chain/txs/unindex", nil)
+	txUnindexTimer      = metrics.GetOrRegisterTimer("chain/txs/unindex", nil)
 	acceptedTxsCounter  = metrics.NewRegisteredCounter("chain/txs/accepted", nil)
 	processedTxsCounter = metrics.NewRegisteredCounter("chain/txs/processed", nil)
 
@@ -278,6 +288,8 @@ type BlockChain struct {
 
 	// [acceptedLogsCache] stores recently accepted logs to improve the performance of eth_getLogs.
 	acceptedLogsCache FIFOCache[common.Hash, [][]*types.Log]
+
+	hooks *tracing.Hooks
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -350,6 +362,18 @@ func NewBlockChain(
 	// Create the state manager
 	bc.stateManager = NewTrieWriter(bc.triedb, cacheConfig)
 
+	if vmConfig.PipelineTracer != nil {
+		if _, ok := vmConfig.PipelineTracer.(*tracer.PipelineTracer); !ok {
+			log.Crit("vmConfig.Tracer must be a pipeline.Tracer")
+		} else {
+			bc.hooks = tracing.BuildHooks(vmConfig.PipelineTracer.(*tracer.PipelineTracer))
+		}
+	}
+
+	if bc.hooks != nil && bc.hooks.OnBlockchainInit != nil {
+		bc.hooks.OnBlockchainInit(chainConfig)
+	}
+
 	// Re-generate current block state if it is missing
 	if err := bc.loadLastState(lastAcceptedHash); err != nil {
 		return nil, err
@@ -408,6 +432,12 @@ func NewBlockChain(
 		bc.wg.Add(1)
 		go bc.dispatchTxUnindexer()
 	}
+
+	if bc.hooks != nil && bc.hooks.OnGenesisBlock != nil {
+		if block := bc.CurrentBlock(); block.Number.Uint64() == 0 {
+			bc.hooks.OnGenesisBlock(bc.genesisBlock, convertGenesisToGGenesis(genesis.Alloc))
+		}
+	}
 	return bc, nil
 }
 
@@ -416,7 +446,7 @@ func (bc *BlockChain) unindexBlocks(tail uint64, head uint64, done chan struct{}
 	start := time.Now()
 	txLookupLimit := bc.cacheConfig.TxLookupLimit
 	defer func() {
-		txUnindexTimer.Inc(time.Since(start).Milliseconds())
+		txUnindexTimer.UpdateSince(start)
 		close(done)
 	}()
 
@@ -961,6 +991,9 @@ func (bc *BlockChain) Stop() {
 		log.Error("Failed to Shutdown state manager", "err", err)
 	}
 	log.Info("State manager shut down", "t", time.Since(start))
+	if bc.hooks != nil && bc.hooks.OnClose != nil {
+		bc.hooks.OnClose()
+	}
 	// Flush the collected preimages to disk
 	if err := bc.stateCache.TrieDB().Close(); err != nil {
 		log.Error("Failed to close trie db", "err", err)
@@ -1140,6 +1173,45 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, receipts []*types
 	// setPreference is called. Otherwise, we consider it a side chain block.
 	if bc.newTip(block) {
 		bc.writeCanonicalBlockWithLogs(block, logs)
+		// 先确保 pipeline tracer 不为空，然后再判断是否需要push kafka
+		// 上一个push kafka的block, 必然存在(至少有genesis block)
+		// 上一个push kafka的block比当前的head block还要新，说明有unwind回退，不需要处理, 即使是fork，等有更新的block的时候再一起push
+		if tracer.NodeXPusher != nil && !tracer.NodeXPusher.IsBackup && tracer.NodeXPusher.LastPushedBlock().BlockNumber <= block.NumberU64() {
+			lastPushBlock := tracer.NodeXPusher.LastPushedBlock()
+			_, dropBlocks, newBlocks := bc.getCommonAncestor(*lastPushBlock, ptypes.BlockContext{
+				BlockNumber: block.NumberU64(),
+				Hash:        block.Hash(),
+				ParentHash:  block.ParentHash(),
+				Timestamp:   block.Time(),
+			})
+			var blockChange *ptypes.BlockChangeNotification
+			if len(dropBlocks) > 0 {
+				blockChange = &ptypes.BlockChangeNotification{
+					ChangeType: 2,
+					NewBlocks:  newBlocks,
+					DropBlocks: dropBlocks,
+				}
+			} else if len(newBlocks) > 0 {
+				blockChange = &ptypes.BlockChangeNotification{
+					ChangeType: 1,
+					NewBlocks:  newBlocks,
+				}
+			}
+
+			parent := bc.GetHeaderByHash(block.Header().ParentHash)
+
+			if parent.Root == block.Root() {
+				bc.hooks.OnCommit(parent.Root, block.Root(), nil, nil, nil, nil, nil, nil)
+			}
+
+			if blockChange != nil {
+				err := tracer.NodeXPusher.PushBlockChangeNotification(blockChange)
+				if err != nil {
+					log.Error("SetCanonical PushBlockChangeNotification error", "err", err)
+				}
+				log.Info("NodeXPusher PushBlockChangeNotification", "blockChange", blockChange)
+			}
+		}
 	} else {
 		bc.chainSideFeed.Send(ChainSideEvent{Block: block})
 	}
@@ -1285,7 +1357,7 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 		bc.reportBlock(block, nil, err)
 		return err
 	}
-	blockContentValidationTimer.Inc(time.Since(substart).Milliseconds())
+	blockContentValidationTimer.UpdateSince(substart)
 
 	// No validation errors for the block
 	var activeState *state.StateDB
@@ -1313,7 +1385,7 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 	if err != nil {
 		return err
 	}
-	blockStateInitTimer.Inc(time.Since(substart).Milliseconds())
+	blockStateInitTimer.UpdateSince(substart)
 
 	// Enable prefetching to pull in trie node paths while processing transactions
 	statedb.StartPrefetcher("chain", bc.cacheConfig.TriePrefetcherParallelism)
@@ -1340,21 +1412,21 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 	vtime := time.Since(vstart)
 
 	// Update the metrics touched during block processing and validation
-	accountReadTimer.Inc(statedb.AccountReads.Milliseconds())                  // Account reads are complete(in processing)
-	storageReadTimer.Inc(statedb.StorageReads.Milliseconds())                  // Storage reads are complete(in processing)
-	snapshotAccountReadTimer.Inc(statedb.SnapshotAccountReads.Milliseconds())  // Account reads are complete(in processing)
-	snapshotStorageReadTimer.Inc(statedb.SnapshotStorageReads.Milliseconds())  // Storage reads are complete(in processing)
-	accountUpdateTimer.Inc(statedb.AccountUpdates.Milliseconds())              // Account updates are complete(in validation)
-	storageUpdateTimer.Inc(statedb.StorageUpdates.Milliseconds())              // Storage updates are complete(in validation)
-	accountHashTimer.Inc(statedb.AccountHashes.Milliseconds())                 // Account hashes are complete(in validation)
-	storageHashTimer.Inc(statedb.StorageHashes.Milliseconds())                 // Storage hashes are complete(in validation)
-	triehash := statedb.AccountHashes + statedb.StorageHashes                  // The time spent on tries hashing
-	trieUpdate := statedb.AccountUpdates + statedb.StorageUpdates              // The time spent on tries update
-	trieRead := statedb.SnapshotAccountReads + statedb.AccountReads            // The time spent on account read
-	trieRead += statedb.SnapshotStorageReads + statedb.StorageReads            // The time spent on storage read
-	blockExecutionTimer.Inc((ptime - trieRead).Milliseconds())                 // The time spent on EVM processing
-	blockValidationTimer.Inc((vtime - (triehash + trieUpdate)).Milliseconds()) // The time spent on block validation
-	blockTrieOpsTimer.Inc((triehash + trieUpdate + trieRead).Milliseconds())   // The time spent on trie operations
+	accountReadTimer.Update(statedb.AccountReads)                   // Account reads are complete(in processing)
+	storageReadTimer.Update(statedb.StorageReads)                   // Storage reads are complete(in processing)
+	snapshotAccountReadTimer.Update(statedb.SnapshotAccountReads)   // Account reads are complete(in processing)
+	snapshotStorageReadTimer.Update(statedb.SnapshotStorageReads)   // Storage reads are complete(in processing)
+	accountUpdateTimer.Update(statedb.AccountUpdates)               // Account updates are complete(in validation)
+	storageUpdateTimer.Update(statedb.StorageUpdates)               // Storage updates are complete(in validation)
+	accountHashTimer.Update(statedb.AccountHashes)                  // Account hashes are complete(in validation)
+	storageHashTimer.Update(statedb.StorageHashes)                  // Storage hashes are complete(in validation)
+	triehash := statedb.AccountHashes + statedb.StorageHashes       // The time spent on tries hashing
+	trieUpdate := statedb.AccountUpdates + statedb.StorageUpdates   // The time spent on tries update
+	trieRead := statedb.SnapshotAccountReads + statedb.AccountReads // The time spent on account read
+	trieRead += statedb.SnapshotStorageReads + statedb.StorageReads // The time spent on storage read
+	blockExecutionTimer.Update(ptime - trieRead)                    // The time spent on EVM processing
+	blockValidationTimer.Update(vtime - (triehash + trieUpdate))    // The time spent on block validation
+	blockTrieOpsTimer.Update(triehash + trieUpdate + trieRead)      // The time spent on trie operations
 
 	// If [writes] are disabled, skip [writeBlockWithState] so that we do not write the block
 	// or the state trie to disk.
@@ -1372,12 +1444,12 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 		return err
 	}
 	// Update the metrics touched during block commit
-	accountCommitTimer.Inc(statedb.AccountCommits.Milliseconds())   // Account commits are complete, we can mark them
-	storageCommitTimer.Inc(statedb.StorageCommits.Milliseconds())   // Storage commits are complete, we can mark them
-	snapshotCommitTimer.Inc(statedb.SnapshotCommits.Milliseconds()) // Snapshot commits are complete, we can mark them
-	triedbCommitTimer.Inc(statedb.TrieDBCommits.Milliseconds())     // Trie database commits are complete, we can mark them
-	blockWriteTimer.Inc((time.Since(wstart) - statedb.AccountCommits - statedb.StorageCommits - statedb.SnapshotCommits - statedb.TrieDBCommits).Milliseconds())
-	blockInsertTimer.Inc(time.Since(start).Milliseconds())
+	accountCommitTimer.Update(statedb.AccountCommits)   // Account commits are complete, we can mark them
+	storageCommitTimer.Update(statedb.StorageCommits)   // Storage commits are complete, we can mark them
+	snapshotCommitTimer.Update(statedb.SnapshotCommits) // Snapshot commits are complete, we can mark them
+	triedbCommitTimer.Update(statedb.TrieDBCommits)     // Trie database commits are complete, we can mark them
+	blockWriteTimer.Update((time.Since(wstart) - statedb.AccountCommits - statedb.StorageCommits - statedb.SnapshotCommits - statedb.TrieDBCommits))
+	blockInsertTimer.Update(time.Since(start))
 
 	log.Debug("Inserted new block", "number", block.Number(), "hash", block.Hash(),
 		"parentHash", block.ParentHash(),
@@ -2103,4 +2175,92 @@ func (bc *BlockChain) ResetToStateSyncedBlock(block *types.Block) error {
 // during block building.
 func (bc *BlockChain) CacheConfig() *CacheConfig {
 	return bc.cacheConfig
+}
+
+func (bc *BlockChain) GetHeaderByHash2(blockHash common.Hash) *types.Header {
+	header := bc.GetHeaderByHash(blockHash)
+	if header == nil {
+		if tracer.NodeXPusher != nil {
+			header := &types.Header{}
+			err := util.DownloadFileFromS3Json(tracer.NodeXPusher.Uploader, tracer.NodeXPusher.Bucket, fmt.Sprintf("%s/%s/block", tracer.BizChainID, blockHash.String()), header)
+			if err != nil {
+				log.Error("GetHeaderByHash2 DownloadFileFromS3Json error", "err", err)
+				return nil
+			} else {
+				return header
+			}
+		}
+	}
+	return header
+}
+
+// 返回两个块的共同祖先，以及两个块的从共同祖先到两个块的路径,即drop和new
+func (bc *BlockChain) getCommonAncestor(blocka ptypes.BlockContext, blockb ptypes.BlockContext) (ptypes.BlockContext, []ptypes.BlockContext, []ptypes.BlockContext) {
+	var (
+		chainA, chainB []ptypes.BlockContext
+	)
+	if blockb.ParentHash == blocka.Hash {
+		return blocka, chainA, []ptypes.BlockContext{blockb}
+	}
+	for blockb.BlockNumber > blocka.BlockNumber {
+		chainB = append(chainB, blockb)
+		headerb := bc.GetHeaderByHash2(blockb.ParentHash)
+		if headerb == nil {
+			log.Crit("Failed to get header by hash", "hash", blockb.ParentHash)
+		} else {
+			blockb = ptypes.BlockContext{
+				BlockNumber: headerb.Number.Uint64(),
+				Hash:        headerb.Hash(),
+				ParentHash:  headerb.ParentHash,
+				Timestamp:   headerb.Time,
+			}
+		}
+	}
+	for blocka.Hash != blockb.Hash {
+		chainA = append(chainA, blocka)
+		headera := bc.GetHeaderByHash2(blocka.ParentHash)
+		if headera == nil {
+			log.Crit("Failed to get header by hash", "hash", blocka.ParentHash)
+		} else {
+			blocka = ptypes.BlockContext{
+				BlockNumber: headera.Number.Uint64(),
+				Hash:        headera.Hash(),
+				ParentHash:  headera.ParentHash,
+				Timestamp:   headera.Time,
+			}
+		}
+
+		chainB = append(chainB, blockb)
+		headerb := bc.GetHeaderByHash2(blockb.ParentHash)
+		if headerb == nil {
+			log.Crit("Failed to get header by hash", "hash", blockb.ParentHash)
+		} else {
+			blockb = ptypes.BlockContext{
+				BlockNumber: headerb.Number.Uint64(),
+				Hash:        headerb.Hash(),
+				ParentHash:  headerb.ParentHash,
+				Timestamp:   headerb.Time,
+			}
+		}
+	}
+	// now blocka == blockb == ancestor
+
+	// reverse chainA
+	slices.Reverse(chainA)
+	// reverse chainB
+	slices.Reverse(chainB)
+	return blocka, chainA, chainB
+}
+
+func convertGenesisToGGenesis(g GenesisAlloc) gcore.GenesisAlloc {
+	genesis := make(gcore.GenesisAlloc)
+	for addr, account := range g {
+		genesis[addr] = gcore.GenesisAccount{
+			Code:    account.Code,
+			Storage: account.Storage,
+			Balance: account.Balance,
+			Nonce:   account.Nonce,
+		}
+	}
+	return genesis
 }

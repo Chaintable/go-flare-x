@@ -1,0 +1,26 @@
+FROM golang:1.22 as builder
+
+RUN apt-get update && apt-get install -y make gcc build-essential git bash rsync
+
+WORKDIR /app
+
+COPY ./.git /app/.git
+COPY ./avalanchego /app/avalanchego
+COPY ./config /app/config
+COPY ./coreth /app/coreth
+
+WORKDIR /app/avalanchego/
+
+RUN /app/avalanchego/scripts/build.sh
+
+FROM ubuntu:24.10
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y ca-certificates wget curl jq
+
+COPY --from=builder /app/avalanchego/build /app/build
+
+EXPOSE 9650 9651 8545 8546
+
+ENTRYPOINT ["/app/build/avalanchego"]

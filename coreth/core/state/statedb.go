@@ -141,6 +141,9 @@ type StateDB struct {
 	StorageUpdated int
 	AccountDeleted int
 	StorageDeleted int
+
+	OnLog    func(log *types.Log)
+	OnCommit func(originRoot common.Hash, root common.Hash, destructs map[common.Hash]struct{}, accounts map[common.Hash][]byte, accountsOrigin map[common.Address][]byte, storages map[common.Hash]map[common.Hash][]byte, storagesOrigin map[common.Address]map[common.Hash][]byte, codes map[common.Hash][]byte)
 }
 
 // New creates a new state from a given trie.
@@ -176,14 +179,14 @@ func NewWithSnapshot(root common.Hash, db Database, snap snapshot.Snapshot) (*St
 		accessList:            newAccessList(),
 		transientStorage:      newTransientStorage(),
 		hasher:                crypto.NewKeccakState(),
+		snapAccounts:          make(map[common.Hash][]byte),
+		snapStorage:           make(map[common.Hash]map[common.Hash][]byte),
 	}
 	if snap != nil {
 		if snap.Root() != root {
 			return nil, fmt.Errorf("cannot create new statedb for root: %s, using snapshot with mismatched root: %s", root, snap.Root().Hex())
 		}
 		sdb.snap = snap
-		sdb.snapAccounts = make(map[common.Hash][]byte)
-		sdb.snapStorage = make(map[common.Hash]map[common.Hash][]byte)
 	}
 	return sdb, nil
 }
@@ -237,6 +240,9 @@ func (s *StateDB) AddLog(addr common.Address, topics []common.Hash, data []byte,
 	log.TxHash = s.thash
 	log.TxIndex = uint(s.txIndex)
 	log.Index = s.logSize
+	if s.OnLog != nil {
+		s.OnLog(log)
+	}
 	s.logs[s.thash] = append(s.logs[s.thash], log)
 	s.logSize++
 }
@@ -617,9 +623,7 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 	// update mechanism is not symmetric to the deletion, because whereas it is
 	// enough to track account updates at commit time, deletions need tracking
 	// at transaction boundary level to ensure we capture state clearing.
-	if s.snap != nil {
-		s.snapAccounts[obj.addrHash] = snapshot.SlimAccountRLP(obj.data.Nonce, obj.data.Balance, obj.data.Root, obj.data.CodeHash, obj.data.IsMultiCoin)
-	}
+	s.snapAccounts[obj.addrHash] = snapshot.SlimAccountRLP(obj.data.Nonce, obj.data.Balance, obj.data.Root, obj.data.CodeHash, obj.data.IsMultiCoin)
 }
 
 // deleteStateObject removes the given object from the state trie.
@@ -893,19 +897,19 @@ func (s *StateDB) Copy() *StateDB {
 		// and force the miner to operate trie-backed only
 		state.snap = s.snap
 
-		// deep copy needed
-		state.snapAccounts = make(map[common.Hash][]byte, len(s.snapAccounts))
-		for k, v := range s.snapAccounts {
-			state.snapAccounts[k] = v
+	}
+	// deep copy needed
+	state.snapAccounts = make(map[common.Hash][]byte, len(s.snapAccounts))
+	for k, v := range s.snapAccounts {
+		state.snapAccounts[k] = v
+	}
+	state.snapStorage = make(map[common.Hash]map[common.Hash][]byte, len(s.snapStorage))
+	for k, v := range s.snapStorage {
+		temp := make(map[common.Hash][]byte, len(v))
+		for kk, vv := range v {
+			temp[kk] = vv
 		}
-		state.snapStorage = make(map[common.Hash]map[common.Hash][]byte, len(s.snapStorage))
-		for k, v := range s.snapStorage {
-			temp := make(map[common.Hash][]byte, len(v))
-			for kk, vv := range v {
-				temp[kk] = vv
-			}
-			state.snapStorage[k] = temp
-		}
+		state.snapStorage[k] = temp
 	}
 	return state
 }
@@ -966,10 +970,8 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 			// Note, we can't do this only at the end of a block because multiple
 			// transactions within the same block might self destruct and then
 			// resurrect an account; but the snapshotter needs both events.
-			if s.snap != nil {
-				delete(s.snapAccounts, obj.addrHash) // Clear out any previously updated account data (may be recreated via a resurrect)
-				delete(s.snapStorage, obj.addrHash)  // Clear out any previously updated storage data (may be recreated via a resurrect)
-			}
+			delete(s.snapAccounts, obj.addrHash) // Clear out any previously updated account data (may be recreated via a resurrect)
+			delete(s.snapStorage, obj.addrHash)  // Clear out any previously updated storage data (may be recreated via a resurrect)
 		} else {
 			obj.finalise(true) // Prefetch slots in the background
 		}
@@ -1096,11 +1098,13 @@ func (s *StateDB) commit(deleteEmptyObjects bool, snaps *snapshot.Tree, blockHas
 		nodes                   = trienode.NewMergedNodeSet()
 		codeWriter              = s.db.DiskDB().NewBatch()
 	)
+	codes := make(map[common.Hash][]byte)
 	for addr := range s.stateObjectsDirty {
 		if obj := s.stateObjects[addr]; !obj.deleted {
 			// Write any contract code associated with the state object
 			if obj.code != nil && obj.dirtyCode {
 				rawdb.WriteCode(codeWriter, common.BytesToHash(obj.CodeHash()), obj.code)
+				codes[common.Hash(obj.CodeHash())] = obj.code
 				obj.dirtyCode = false
 			}
 			// Write any storage changes in the state object to its storage trie
@@ -1172,8 +1176,9 @@ func (s *StateDB) commit(deleteEmptyObjects bool, snaps *snapshot.Tree, blockHas
 		if metrics.EnabledExpensive {
 			s.SnapshotCommits += time.Since(start)
 		}
-		s.snap, s.snapAccounts, s.snapStorage = nil, nil, nil
+		s.snap = nil
 	}
+	destructs := s.convertAccountSet(s.stateObjectsDestruct)
 	if len(s.stateObjectsDestruct) > 0 {
 		s.stateObjectsDestruct = make(map[common.Address]struct{})
 	}
@@ -1198,6 +1203,11 @@ func (s *StateDB) commit(deleteEmptyObjects bool, snaps *snapshot.Tree, blockHas
 		s.originalRoot = root
 		if metrics.EnabledExpensive {
 			s.TrieDBCommits += time.Since(start)
+		}
+		if s.OnCommit != nil {
+			s.OnCommit(origin, root, destructs, s.snapAccounts, nil, s.snapStorage, nil, codes)
+			s.snapAccounts = nil
+			s.snapStorage = nil
 		}
 	}
 	return root, nil

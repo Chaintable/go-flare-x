@@ -31,15 +31,17 @@ source "$AVALANCHE_PATH"/scripts/versions.sh
 source "$AVALANCHE_PATH"/scripts/constants.sh
 
 # Download dependencies
-echo "Downloading dependencies..."
-go mod download -modcacherw
+# echo "Downloading dependencies..."
+# go mod download -modcacherw
 
 build_args="$race"
 
 echo "Syncing with sources at GOPATH: $GOPATH"
 
-rsync -ar --delete $AVALANCHE_PATH/* $GOPATH/pkg/mod/github.com/ava-labs/avalanchego@$avalanche_version
-rsync -ar --delete $CORETH_PATH/* $GOPATH/pkg/mod/github.com/ava-labs/coreth@$coreth_version
+go mod edit -replace github.com/ava-labs/coreth=$CORETH_PATH
+go mod tidy
+# rsync -ar --delete $AVALANCHE_PATH/* $GOPATH/pkg/mod/github.com/ava-labs/avalanchego@$avalanche_version
+# rsync -ar --delete $CORETH_PATH/* $GOPATH/pkg/mod/github.com/ava-labs/coreth@$coreth_version
 
 # Build avalanchego
 "$AVALANCHE_PATH"/scripts/build_avalanche.sh $build_args

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -57,7 +58,11 @@ func (g *multiGatherer) Gather() ([]*dto.MetricFamily, error) {
 		for _, gatheredMetric := range gatheredMetrics {
 			var name string
 			if gatheredMetric.Name != nil {
-				name = metric.AppendNamespace(namespace, *gatheredMetric.Name)
+				if !strings.Contains(*gatheredMetric.Name, "pipeline_") && !strings.Contains(*gatheredMetric.Name, "chain_") {
+					name = metric.AppendNamespace(namespace, *gatheredMetric.Name)
+				} else {
+					name = *gatheredMetric.Name
+				}
 			} else {
 				name = namespace
 			}

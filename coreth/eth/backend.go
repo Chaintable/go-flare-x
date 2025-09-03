@@ -53,6 +53,7 @@ import (
 	"github.com/ava-labs/coreth/miner"
 	"github.com/ava-labs/coreth/node"
 	"github.com/ava-labs/coreth/params"
+	"github.com/ava-labs/coreth/pipeline/tracer"
 	"github.com/ava-labs/coreth/rpc"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -210,6 +211,20 @@ func New(
 
 	if err := eth.precheckPopulateMissingTries(); err != nil {
 		return nil, err
+	}
+
+	if config.VMTraceCfg == nil {
+		log.Warn("VM tracing is disabled, no VM traces will be recorded")
+	} else {
+		log.Info("VM tracing enabled", "config", *config.VMTraceCfg)
+	}
+
+	if config.VMTraceCfg != nil {
+		t, err := tracer.NewPipelineTracer(*config.VMTraceCfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create tracer %+v: %v", *config.VMTraceCfg, err)
+		}
+		vmConfig.PipelineTracer = t
 	}
 
 	var err error

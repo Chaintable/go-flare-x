@@ -15,7 +15,7 @@ jobs:
   build-and-package:
     strategy:
       matrix:
-        arch: [ amd64, arm64 ]
+        arch: [ amd64 ]
     runs-on: [self-hosted, "${{ matrix.arch }}"]
     steps:
       - name: Checkout code
@@ -26,6 +26,10 @@ jobs:
       - name: Set env
         run: |
           echo "REVISION=$(git rev-parse --short=9 HEAD)" >> $GITHUB_ENV
+          
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build image and push to ECR
         run: |

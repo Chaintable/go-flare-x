@@ -28,7 +28,7 @@ jobs:
         with:
           app_id: ${{ secrets.RELEASE_MANAGER_APP_ID }}
           private_key: ${{ secrets.RELEASE_MANAGER_APP_SECRET }}
-          
+
       - name: Set env
         run: |
           echo "REVISION=$(git rev-parse --short=9 HEAD)" >> $GITHUB_ENV
@@ -43,36 +43,3 @@ jobs:
           docker push ${REGISTRY}/${IMAGE}:${{ matrix.arch }}-${REVISION}
           docker run --name dryrun --rm ${REGISTRY}/${IMAGE}:${{ matrix.arch }}-${REVISION} --version
           docker rmi ${REGISTRY}/${IMAGE}:${{ matrix.arch }}-${REVISION}
-
-      - name: Lark Notification
-        continue-on-error: true
-        run: |
-          notiv3 "Blockchain flare image pushed 🎉" ${REGISTRY}/${IMAGE}:${{ matrix.arch }}-${REVISION}
-
-  merge-docker-manifest:
-    runs-on: [self-hosted, general]
-    needs: build-and-package
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Set env
-        run: |
-          echo "REVISION=$(git rev-parse --short=9 HEAD)" >> $GITHUB_ENV
-
-      - name: Merge manifest
-        run: |
-          docker pull --platform=linux/amd64 ${REGISTRY}/${IMAGE}:amd64-${REVISION}
-          docker pull --platform=linux/arm64 ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-          docker buildx imagetools create --tag ${REGISTRY}/${IMAGE}:${REVISION} ${REGISTRY}/${IMAGE}:amd64-${REVISION} ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-          docker run --name dryrun --rm ${REGISTRY}/${IMAGE}:${REVISION} --version
-          docker rmi ${REGISTRY}/${IMAGE}:${REVISION}
-          docker rmi ${REGISTRY}/${IMAGE}:amd64-${REVISION}
-          docker rmi ${REGISTRY}/${IMAGE}:arm64-${REVISION}
-
-      - name: Lark Notification
-        continue-on-error: true
-        run: |
-          notiv3 "Blockchain flare image pushed 🎉" ${REGISTRY}/${IMAGE}:${REVISION}

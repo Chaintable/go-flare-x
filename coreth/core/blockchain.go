@@ -1393,7 +1393,13 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 
 	// Process block using the parent state as reference point
 	pstart := time.Now()
+	if bc.hooks != nil && bc.hooks.OnBlockStart != nil {
+		bc.hooks.OnBlockStart(block)
+	}
 	receipts, logs, usedGas, err := bc.processor.Process(block, parent, statedb, bc.vmConfig)
+	if bc.hooks != nil && bc.hooks.OnBlockEnd != nil {
+		bc.hooks.OnBlockEnd(err)
+	}
 	if serr := statedb.Error(); serr != nil {
 		log.Error("statedb error encountered", "err", serr, "number", block.Number(), "hash", block.Hash())
 	}

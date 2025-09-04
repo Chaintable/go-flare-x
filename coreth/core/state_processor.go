@@ -99,6 +99,7 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 		log.Warn("vmConfig.Tracer must be a pipeline.Tracer")
 	} else {
 		pipelineTracer = p
+		vmenv.Config.Tracer = pipelineTracer
 	}
 
 	if pipelineTracer != nil {

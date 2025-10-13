@@ -95,10 +95,11 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 
 	// Iterate over and process the individual transactions
 	var pipelineTracer *tracer.PipelineTracer
-	if p, ok := cfg.Tracer.(*tracer.PipelineTracer); !ok {
-		log.Warn("vmConfig.Tracer must be a pipeline.Tracer")
+	if p, ok := cfg.PipelineTracer.(*tracer.PipelineTracer); !ok {
+		log.Crit("vmConfig.PipelineTracer must be a pipeline.Tracer")
 	} else {
 		pipelineTracer = p
+		vmenv.Config.Tracer = pipelineTracer
 	}
 
 	if pipelineTracer != nil {

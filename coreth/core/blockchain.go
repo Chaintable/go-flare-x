@@ -1773,7 +1773,7 @@ func (bc *BlockChain) reprocessBlock(parent *types.Block, current *types.Block) 
 	}()
 
 	// Process previously stored block
-	receipts, _, usedGas, err := bc.processor.Process(current, parent.Header(), statedb, vm.Config{})
+	receipts, _, usedGas, err := bc.processor.Process(current, parent.Header(), statedb, bc.vmConfig)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("failed to re-process block (%s: %d): %v", current.Hash().Hex(), current.NumberU64(), err)
 	}

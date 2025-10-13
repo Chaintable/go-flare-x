@@ -1771,9 +1771,14 @@ func (bc *BlockChain) reprocessBlock(parent *types.Block, current *types.Block) 
 	defer func() {
 		statedb.StopPrefetcher()
 	}()
-
+	if bc.hooks != nil && bc.hooks.OnBlockStart != nil {
+		bc.hooks.OnBlockStart(current)
+	}
 	// Process previously stored block
 	receipts, _, usedGas, err := bc.processor.Process(current, parent.Header(), statedb, bc.vmConfig)
+	if bc.hooks != nil && bc.hooks.OnBlockEnd != nil {
+		bc.hooks.OnBlockEnd(err)
+	}
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("failed to re-process block (%s: %d): %v", current.Hash().Hex(), current.NumberU64(), err)
 	}

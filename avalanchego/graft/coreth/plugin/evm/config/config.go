@@ -187,6 +187,10 @@ type Config struct {
 
 	// Database Scheme
 	StateScheme string `json:"state-scheme"`
+
+	// Pipeline Tracer
+	VMTrace           string `json:"vm-trace"`
+	VMTraceJsonConfig string `json:"vm-trace-json-config"`
 }
 
 // GetConfig returns a new config object with the default values set and the

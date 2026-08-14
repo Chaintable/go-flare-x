@@ -43,6 +43,7 @@ import (
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
 	"github.com/ava-labs/avalanchego/graft/coreth/core/extstate"
+	"github.com/ava-labs/avalanchego/graft/coreth/core/tracing"
 	"github.com/ava-labs/avalanchego/graft/coreth/internal/version"
 	"github.com/ava-labs/avalanchego/graft/coreth/params"
 	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
@@ -50,6 +51,7 @@ import (
 	"github.com/ava-labs/avalanchego/graft/evm/firewood"
 	"github.com/ava-labs/avalanchego/graft/evm/triedb/hashdb"
 	"github.com/ava-labs/avalanchego/graft/evm/triedb/pathdb"
+	"github.com/ava-labs/avalanchego/pipeline/tracer"
 	"github.com/ava-labs/avalanchego/vms/evm/acp176"
 	"github.com/ava-labs/avalanchego/vms/evm/sync/customrawdb"
 	"github.com/ava-labs/libevm/common"
@@ -371,6 +373,9 @@ type BlockChain struct {
 	acceptorTip     *types.Block
 	acceptorTipLock sync.Mutex
 
+	// Pipeline hooks for tracing
+	hooks *tracing.Hooks
+}
 	// [flattenLock] prevents the [acceptor] from flattening snapshots while
 	// a block is being verified.
 	flattenLock sync.Mutex
@@ -503,6 +508,25 @@ func NewBlockChain(
 	if bc.cacheConfig.TransactionHistory != 0 {
 		bc.txIndexer = newTxIndexer(bc.cacheConfig.TransactionHistory, bc)
 	}
+
+	// Initialize pipeline hooks if tracer is present
+	if vmConfig.Tracer != nil {
+		if pipelineTracer, ok := vmConfig.Tracer.(*tracer.PipelineTracer); ok {
+			bc.hooks = tracer.BuildHooks(pipelineTracer)
+			if bc.hooks != nil && bc.hooks.OnBlockchainInit != nil {
+				bc.hooks.OnBlockchainInit(chainConfig)
+			}
+			// Dispatch genesis block hook
+			if bc.hooks != nil && bc.hooks.OnGenesisBlock != nil {
+				genesisAlloc := genesis.Alloc
+				if genesisAlloc == nil {
+					genesisAlloc = types.GenesisAlloc{}
+				}
+				bc.hooks.OnGenesisBlock(bc.genesisBlock, genesisAlloc)
+			}
+		}
+	}
+
 	return bc, nil
 }
 
@@ -998,6 +1022,11 @@ func (bc *BlockChain) stopWithoutSaving() {
 func (bc *BlockChain) Stop() {
 	bc.stopWithoutSaving()
 
+	// Dispatch OnClose hook before shutdown
+	if bc.hooks != nil && bc.hooks.OnClose != nil {
+		bc.hooks.OnClose()
+	}
+
 	// Stop snapshot generation and release resources
 	if bc.snaps != nil {
 		bc.snaps.Release()
@@ -1389,7 +1418,19 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 
 	// Process block using the parent state as reference point
 	pstart := time.Now()
+
+	// Dispatch OnBlockStart hook
+	if bc.hooks != nil && bc.hooks.OnBlockStart != nil {
+		bc.hooks.OnBlockStart(block.WithBody(block.Body()))
+	}
+
 	receipts, logs, usedGas, err := bc.processor.Process(block, parent, statedb, bc.vmConfig)
+
+	// Dispatch OnBlockEnd hook
+	if bc.hooks != nil && bc.hooks.OnBlockEnd != nil {
+		bc.hooks.OnBlockEnd(err)
+	}
+
 	if serr := statedb.Error(); serr != nil {
 		log.Error("statedb error encountered", "err", serr, "number", block.Number(), "hash", block.Hash())
 	}
@@ -1782,6 +1823,15 @@ func (bc *BlockChain) commitWithSnap(
 	if err != nil {
 		return common.Hash{}, err
 	}
+
+	// Dispatch OnCommit hook after state commit
+	if bc.hooks != nil && bc.hooks.OnCommit != nil {
+		// Note: We cannot access internal StateDB fields (accounts, storages, etc.)
+		// from libevm, so we pass nil for those fields. The pipeline will need to
+		// track state changes via OnLog and other hooks instead.
+		bc.hooks.OnCommit(parentRoot, root, nil, nil, nil, nil, nil, nil)
+	}
+
 	// Upstream does not perform a snapshot update if the root is the same as the
 	// parent root, however here the snapshots are based on the block hash, so
 	// this update is necessary. Note blockHashes are passed here as well.

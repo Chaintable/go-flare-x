@@ -13,6 +13,7 @@ import (
 	"github.com/ava-labs/libevm/libevm/stateconf"
 	"github.com/holiman/uint256"
 
+	"github.com/ava-labs/avalanchego/graft/coreth/core/tracing"
 	"github.com/ava-labs/avalanchego/graft/coreth/params"
 	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/customtypes"
 	"github.com/ava-labs/avalanchego/vms/evm/predicate"
@@ -53,6 +54,9 @@ type StateDB struct {
 	// Ordered storage slots to be used in predicate verification as set in the tx access list.
 	// Only set in [StateDB.Prepare], and un-modified through execution.
 	predicates map[common.Address][]predicate.Predicate
+
+	// Pipeline hooks for tracing
+	hooks *tracing.Hooks
 }
 
 // New creates a new [StateDB] with the given [state.StateDB], wrapping it with
@@ -136,4 +140,17 @@ func normalizeStateKey(key *common.Hash) {
 // This partitions multicoin storage from normal state storage.
 func normalizeCoinID(coinID *common.Hash) {
 	coinID[0] |= 0x01
+}
+
+// SetHooks sets the pipeline hooks for tracing
+func (s *StateDB) SetHooks(hooks *tracing.Hooks) {
+	s.hooks = hooks
+}
+
+// AddLog intercepts log additions to dispatch OnLog hook
+func (s *StateDB) AddLog(log *types.Log) {
+	s.StateDB.AddLog(log)
+	if s.hooks != nil && s.hooks.OnLog != nil {
+		s.hooks.OnLog(log)
+	}
 }

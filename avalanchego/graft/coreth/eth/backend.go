@@ -52,6 +52,7 @@ import (
 	"github.com/ava-labs/avalanchego/graft/coreth/params"
 	"github.com/ava-labs/avalanchego/graft/evm/core/state/pruner"
 	"github.com/ava-labs/avalanchego/graft/evm/rpc"
+	"github.com/ava-labs/avalanchego/pipeline/tracer"
 	"github.com/ava-labs/avalanchego/utils/timer/mockable"
 	"github.com/ava-labs/avalanchego/version"
 	"github.com/ava-labs/avalanchego/vms/evm/sync/customrawdb"
@@ -241,6 +242,16 @@ func New(
 			ChainDataDir:                    chainDataDir,
 		}
 	)
+
+	// Initialize pipeline tracer if configured
+	if config.VMTrace != "" {
+		log.Info("Initializing pipeline tracer", "name", config.VMTrace)
+		pipelineTracer, err := tracer.NewPipelineTracer(config.VMTrace, config.VMTraceJsonConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create pipeline tracer: %w", err)
+		}
+		vmConfig.Tracer = pipelineTracer
+	}
 
 	if err := eth.precheckPopulateMissingTries(); err != nil {
 		return nil, err

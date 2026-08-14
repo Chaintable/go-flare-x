@@ -224,6 +224,10 @@ type Config struct {
 	// TransactionHistory can be still used to control unindexing old transactions.
 	SkipTxIndexing bool
 
+	// VMTrace enables the pipeline tracer
+	VMTrace           string
+	VMTraceJsonConfig string
+
 	// TODO: remove once we move SuggestPriceOptions to AVAX/custom API
 	PriceOptionConfig ethapi.PriceOptionConfig
 }

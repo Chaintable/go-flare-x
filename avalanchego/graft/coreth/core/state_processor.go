@@ -32,7 +32,9 @@ import (
 	"math/big"
 
 	"github.com/ava-labs/avalanchego/graft/coreth/consensus"
+	"github.com/ava-labs/avalanchego/graft/coreth/core/tracing"
 	"github.com/ava-labs/avalanchego/graft/coreth/params"
+	"github.com/ava-labs/avalanchego/pipeline/tracer"
 	"github.com/ava-labs/libevm/common"
 	"github.com/ava-labs/libevm/core/state"
 	"github.com/ava-labs/libevm/core/types"
@@ -93,9 +95,27 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 		signer  = types.MakeSigner(p.config, header.Number, header.Time)
 	)
 
+	// Extract pipeline tracer if present
+	var pipelineTracer *tracer.PipelineTracer
+	if cfg.Tracer != nil {
+		if pt, ok := cfg.Tracer.(*tracer.PipelineTracer); ok {
+			pipelineTracer = pt
+		}
+	}
+
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {
+		if pipelineTracer != nil {
+			pipelineTracer.OnSystemCallStartHookV2(&tracing.VMContext{
+				Coinbase:    header.Coinbase,
+				BlockNumber: header.Number,
+				Time:        header.Time,
+				BaseFee:     header.BaseFee,
+				StateDB:     statedb,
+			})
+		}
 		ProcessBeaconBlockRoot(*beaconRoot, vmenv, statedb)
 	}
+
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
 		msg, err := TransactionToMessage(tx, signer, header.BaseFee)
@@ -103,10 +123,29 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
 		statedb.SetTxContext(tx.Hash(), i)
+
+		// Manually dispatch OnTxStart
+		if pipelineTracer != nil {
+			pipelineTracer.OnTxStart(&tracing.VMContext{
+				Coinbase:    header.Coinbase,
+				BlockNumber: header.Number,
+				Time:        header.Time,
+				BaseFee:     header.BaseFee,
+				StateDB:     statedb,
+			}, tx, msg.From)
+		}
+
 		receipt, err := applyTransaction(msg, p.config, gp, statedb, blockNumber, blockHash, tx, usedGas, vmenv)
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
+
+		// Manually dispatch OnTxEnd
+		if pipelineTracer != nil {
+			receipt.SetEffectiveGasPrice(tx, header.BaseFee)
+			pipelineTracer.OnTxEnd(receipt, err)
+		}
+
 		receipts = append(receipts, receipt)
 		allLogs = append(allLogs, receipt.Logs...)
 	}

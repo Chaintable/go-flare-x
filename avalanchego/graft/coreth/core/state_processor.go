@@ -142,7 +142,12 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 
 		// Manually dispatch OnTxEnd
 		if pipelineTracer != nil {
-			receipt.SetEffectiveGasPrice(tx, header.BaseFee)
+			// Set effective gas price on receipt
+			effectiveGasTip, _ := tx.EffectiveGasTip(header.BaseFee)
+			receipt.EffectiveGasPrice = effectiveGasTip
+			if header.BaseFee != nil {
+				receipt.EffectiveGasPrice = new(big.Int).Add(receipt.EffectiveGasPrice, header.BaseFee)
+			}
 			pipelineTracer.OnTxEnd(receipt, err)
 		}
 

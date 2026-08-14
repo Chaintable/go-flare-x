@@ -1421,7 +1421,7 @@ func (bc *BlockChain) insertBlock(block *types.Block, writes bool) error {
 
 	// Dispatch OnBlockStart hook
 	if bc.hooks != nil && bc.hooks.OnBlockStart != nil {
-		bc.hooks.OnBlockStart(block.WithBody(block.Body()))
+		bc.hooks.OnBlockStart(block.WithBody(*block.Body()))
 	}
 
 	receipts, logs, usedGas, err := bc.processor.Process(block, parent, statedb, bc.vmConfig)

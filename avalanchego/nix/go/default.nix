@@ -19,16 +19,25 @@ let
     };
 
   # Update the following to change the version:
-  goVersion = "1.24.9";
+  goVersion = "1.25.11";
   # The sha256 checksums can fetched from https://go.dev/dl/ for new versions.
+  #
+  # If using a version of nix < 2.25, it will be necessary to manually update the golang flake hash:
+  #
+  #  HASH=$(nix hash path ./nix/go)
+  #  jq --arg hash "$HASH" \
+  #    '.nodes["go-flake"].locked += {"lastModified": 1, "narHash": $hash}' \
+  #    flake.lock > flake.lock.tmp
+  #  mv flake.lock.tmp flake.lock
+  #
   goSHA256s = {
-    "linux-amd64" = "5b7899591c2dd6e9da1809fde4a2fad842c45d3f6b9deb235ba82216e31e34a6";
-    "linux-arm64" = "9aa1243d51d41e2f93e895c89c0a2daf7166768c4a4c3ac79db81029d295a540";
-    "darwin-amd64" = "961aa2ae2b97e428d6d8991367e7c98cb403bac54276b8259aead42a0081591c";
-    "darwin-arm64" = "af451b40651d7fb36db1bbbd9c66ddbed28b96d7da48abea50a19f82c6e9d1d6";
+    "linux-amd64" = "34f14304e856893f4ba30c2cacfe93906e9de7915c5f6aaaf3a81cdccd7ba30b";
+    "linux-arm64" = "c30bf9e156a54ea4e31fbbbf31a712b32734b58cc9a22426fa5ee632d0885124";
+    "darwin-amd64" = "26d0ee4071de42b5c332337db9fdd234072877697c547e46e85efb0f59507c66";
+    "darwin-arm64" = "cd8d4920e7930d55da1a5a57ba43a64b1305f71cdf2ca3c76cd8c549272b1680";
   };
 
-  targetSystem = parseSystem pkgs.system;
+  targetSystem = parseSystem pkgs.stdenv.hostPlatform.system;
 in
 pkgs.stdenv.mkDerivation {
   name = "go-${goVersion}";
@@ -40,7 +49,7 @@ pkgs.stdenv.mkDerivation {
 
   src = pkgs.fetchurl {
     url = "https://go.dev/dl/go${goVersion}.${targetSystem.goURLPath}.tar.gz";
-    sha256 = goSHA256s.${targetSystem.goURLPath} or (throw "Unsupported system: ${pkgs.system}");
+    sha256 = goSHA256s.${targetSystem.goURLPath} or (throw "Unsupported system: ${pkgs.stdenv.hostPlatform.system}");
   };
 
   # Skip unpacking since we need special handling for the tarball

@@ -1,6 +1,17 @@
 # Release Notes: Flare and Songbird networks
 
-Here are listed specific changes to the code for the Flare and Songbird networks. For a comprehensive list of general changes, see [here](./avalanchego/RELEASES.md) for the AvalancheGo project and [here](./coreth/RELEASES.md) for the Coreth project.
+Here are listed specific changes to the code for the Flare and Songbird networks. For a comprehensive list of general changes, see [here](./avalanchego/RELEASES.md) for the AvalancheGo project — which, since v1.14.x, also contains Coreth (grafted in at `avalanchego/graft/coreth`).
+
+## v1.14.2
+
+This release updates the Flare and Songbird codebase to AvalancheGo v1.14.2.
+
+The upgrade is optional but encouraged. It is backwards compatible with v1.14.0 (the minimum compatible version remains v1.14.0) and does not schedule any new fork times.
+
+### Note:
+
+ * Coreth and Subnet-EVM are now grafted into the AvalancheGo tree — there is no separate `coreth` module anymore. Go import paths change from `github.com/ava-labs/coreth/...` to `github.com/ava-labs/avalanchego/graft/coreth/...`, which affects downstream tools that import Coreth packages.
+ * Building from source now requires Go 1.25.11 or later.
 
 ## v1.14.0
 
@@ -19,6 +30,7 @@ Nodes should be updated to this version before these times.
  * The minimum C-chain gas price (base fee floor) is raised to 500 GWei.
  * For the Flare network, the maximum validator stake amount is increased from 200 million to 300 million FLR.
  * For the Flare and Coston2 networks, the minimum delegation fee for validators is set to 20% (previously 0%).
+ * The deprecated top-level `rewardOwner` field has been removed from validator entries returned by `platform.getCurrentValidators`. It previously duplicated `validationRewardOwner`.
 
 ## v1.13.0
 

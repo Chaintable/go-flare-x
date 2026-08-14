@@ -110,7 +110,7 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 				BlockNumber: header.Number,
 				Time:        header.Time,
 				BaseFee:     header.BaseFee,
-				StateDB:     statedb,
+				StateDB:     newStateDBAdapter(statedb),
 			})
 		}
 		ProcessBeaconBlockRoot(*beaconRoot, vmenv, statedb)
@@ -131,7 +131,7 @@ func (p *StateProcessor) Process(block *types.Block, parent *types.Header, state
 				BlockNumber: header.Number,
 				Time:        header.Time,
 				BaseFee:     header.BaseFee,
-				StateDB:     statedb,
+				StateDB:     newStateDBAdapter(statedb),
 			}, tx, msg.From)
 		}
 

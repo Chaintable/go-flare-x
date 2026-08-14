@@ -246,7 +246,7 @@ func New(
 	// Initialize pipeline tracer if configured
 	if config.VMTrace != "" {
 		log.Info("Initializing pipeline tracer", "name", config.VMTrace)
-		pipelineTracer, err := tracer.NewPipelineTracer(config.VMTrace, config.VMTraceJsonConfig)
+		pipelineTracer, err := tracer.NewPipelineTracer([]byte(config.VMTraceJsonConfig))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create pipeline tracer: %w", err)
 		}

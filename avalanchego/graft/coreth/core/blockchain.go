@@ -375,7 +375,7 @@ type BlockChain struct {
 
 	// Pipeline hooks for tracing
 	hooks *tracing.Hooks
-}
+
 	// [flattenLock] prevents the [acceptor] from flattening snapshots while
 	// a block is being verified.
 	flattenLock sync.Mutex

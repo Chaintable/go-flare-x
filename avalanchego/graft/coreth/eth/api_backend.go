@@ -302,7 +302,11 @@ func (b *EthAPIBackend) GetLogs(ctx context.Context, hash common.Hash, number ui
 
 func (b *EthAPIBackend) GetEVM(ctx context.Context, msg *core.Message, state *state.StateDB, header *types.Header, vmConfig *vm.Config, blockCtx *vm.BlockContext) *vm.EVM {
 	if vmConfig == nil {
-		vmConfig = b.eth.blockchain.GetVMConfig()
+		// Copy the chain's config and drop the pipeline tracer: it keeps
+		// per-block global state and must only observe block processing.
+		cfg := *b.eth.blockchain.GetVMConfig()
+		cfg.Tracer = nil
+		vmConfig = &cfg
 	}
 	txContext := core.NewEVMTxContext(msg)
 	var context vm.BlockContext

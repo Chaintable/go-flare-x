@@ -373,7 +373,11 @@ func (w *worker) applyTransaction(env *environment, tx *types.Transaction, coinb
 		blockContext = core.NewEVMBlockContext(env.header, w.chain, &coinbase)
 	}
 
-	receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, blockContext, env.gasPool, env.state, env.header, tx, &env.header.GasUsed, *w.chain.GetVMConfig())
+	// Block building must not feed the pipeline tracer, which only traces
+	// blocks as they are inserted into the chain.
+	vmConfig := *w.chain.GetVMConfig()
+	vmConfig.Tracer = nil
+	receipt, err := core.ApplyTransaction(w.chainConfig, w.chain, blockContext, env.gasPool, env.state, env.header, tx, &env.header.GasUsed, vmConfig)
 	if err != nil {
 		env.state.RevertToSnapshot(snap)
 		env.gasPool.SetGas(gp)

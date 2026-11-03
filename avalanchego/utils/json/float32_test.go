@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package json
@@ -50,7 +50,7 @@ func TestFloat32(t *testing.T) {
 	for _, tt := range tests {
 		jsonBytes, err := tt.f.MarshalJSON()
 		require.NoError(err)
-		require.Equal(fmt.Sprintf(`"%s"`, tt.expectedStr), string(jsonBytes))
+		require.JSONEq(fmt.Sprintf(`"%s"`, tt.expectedStr), string(jsonBytes))
 
 		var f Float32
 		require.NoError(f.UnmarshalJSON(jsonBytes))

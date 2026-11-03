@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package network
@@ -9,12 +9,17 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/mock/gomock"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/snow/snowtest"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/vms/components/avax"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
+	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
+	"github.com/ava-labs/avalanchego/vms/txs/mempool"
+
+	pmempool "github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
 )
 
 var errFoo = errors.New("foo")
@@ -22,53 +27,21 @@ var errFoo = errors.New("foo")
 // Add should error if verification errors
 func TestGossipMempoolAddVerificationError(t *testing.T) {
 	require := require.New(t)
-	ctrl := gomock.NewController(t)
 
 	txID := ids.GenerateTestID()
 	tx := &txs.Tx{
 		TxID: txID,
 	}
 
-	mempool := mempool.NewMockMempool(ctrl)
-	txVerifier := testTxVerifier{err: errFoo}
-
-	mempool.EXPECT().Get(txID).Return(nil, false)
-	mempool.EXPECT().GetDropReason(txID).Return(nil)
-	mempool.EXPECT().MarkDropped(txID, errFoo)
-
-	gossipMempool, err := newGossipMempool(
-		mempool,
+	mempool, err := pmempool.New(
+		"",
+		gas.Dimensions{},
+		1_000_000,
+		ids.ID{},
 		prometheus.NewRegistry(),
-		logging.NoLog{},
-		txVerifier,
-		testConfig.ExpectedBloomFilterElements,
-		testConfig.ExpectedBloomFilterFalsePositiveProbability,
-		testConfig.MaxBloomFilterFalsePositiveProbability,
 	)
 	require.NoError(err)
-
-	err = gossipMempool.Add(tx)
-	require.ErrorIs(err, errFoo)
-	require.False(gossipMempool.bloom.Has(tx))
-}
-
-// Add should error if adding to the mempool errors
-func TestGossipMempoolAddError(t *testing.T) {
-	require := require.New(t)
-	ctrl := gomock.NewController(t)
-
-	txID := ids.GenerateTestID()
-	tx := &txs.Tx{
-		TxID: txID,
-	}
-
-	txVerifier := testTxVerifier{}
-	mempool := mempool.NewMockMempool(ctrl)
-
-	mempool.EXPECT().Get(txID).Return(nil, false)
-	mempool.EXPECT().GetDropReason(txID).Return(nil)
-	mempool.EXPECT().Add(tx).Return(errFoo)
-	mempool.EXPECT().MarkDropped(txID, errFoo).AnyTimes()
+	txVerifier := testTxVerifier{err: errFoo}
 
 	gossipMempool, err := newGossipMempool(
 		mempool,
@@ -89,18 +62,40 @@ func TestGossipMempoolAddError(t *testing.T) {
 // Adding a duplicate to the mempool should return an error
 func TestMempoolDuplicate(t *testing.T) {
 	require := require.New(t)
-	ctrl := gomock.NewController(t)
 
-	testMempool := mempool.NewMockMempool(ctrl)
+	testMempool, err := pmempool.New(
+		"",
+		gas.Dimensions{1, 1, 1, 1},
+		1_000_000,
+		snowtest.AVAXAssetID,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(err)
 	txVerifier := testTxVerifier{}
 
 	txID := ids.GenerateTestID()
 	tx := &txs.Tx{
+		Unsigned: &txs.BaseTx{
+			BaseTx: avax.BaseTx{
+				Ins: []*avax.TransferableInput{
+					{
+						UTXOID: avax.UTXOID{
+							TxID: ids.GenerateTestID(),
+						},
+						Asset: avax.Asset{
+							ID: snowtest.AVAXAssetID,
+						},
+						In: &secp256k1fx.TransferInput{
+							Amt: 1,
+						},
+					},
+				},
+			},
+		},
 		TxID: txID,
 	}
 
-	testMempool.EXPECT().Get(txID).Return(tx, true)
-
+	require.NoError(testMempool.Add(tx))
 	gossipMempool, err := newGossipMempool(
 		testMempool,
 		prometheus.NewRegistry(),
@@ -120,21 +115,38 @@ func TestMempoolDuplicate(t *testing.T) {
 // Adding a tx to the mempool should add it to the bloom filter
 func TestGossipAddBloomFilter(t *testing.T) {
 	require := require.New(t)
-	ctrl := gomock.NewController(t)
 
 	txID := ids.GenerateTestID()
 	tx := &txs.Tx{
+		Unsigned: &txs.BaseTx{
+			BaseTx: avax.BaseTx{
+				Ins: []*avax.TransferableInput{
+					{
+						UTXOID: avax.UTXOID{
+							TxID: ids.GenerateTestID(),
+						},
+						Asset: avax.Asset{
+							ID: snowtest.AVAXAssetID,
+						},
+						In: &secp256k1fx.TransferInput{
+							Amt: 1,
+						},
+					},
+				},
+			},
+		},
 		TxID: txID,
 	}
 
 	txVerifier := testTxVerifier{}
-	mempool := mempool.NewMockMempool(ctrl)
-
-	mempool.EXPECT().Get(txID).Return(nil, false)
-	mempool.EXPECT().GetDropReason(txID).Return(nil)
-	mempool.EXPECT().Add(tx).Return(nil)
-	mempool.EXPECT().Len().Return(0)
-	mempool.EXPECT().RequestBuildBlock(false)
+	mempool, err := pmempool.New(
+		"",
+		gas.Dimensions{1, 1, 1, 1},
+		1_000_000,
+		snowtest.AVAXAssetID,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(err)
 
 	gossipMempool, err := newGossipMempool(
 		mempool,

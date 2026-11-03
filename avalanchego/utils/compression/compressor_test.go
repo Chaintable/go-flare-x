@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package compression
@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/DataDog/zstd"
 	"github.com/stretchr/testify/require"
 
 	_ "embed"
@@ -24,18 +25,13 @@ var (
 		TypeNone: func(int64) (Compressor, error) { //nolint:unparam // an error is needed to be returned to compile
 			return NewNoCompressor(), nil
 		},
-		TypeGzip: NewGzipCompressor,
 		TypeZstd: NewZstdCompressor,
 	}
-
-	//go:embed gzip_zip_bomb.bin
-	gzipZipBomb []byte
 
 	//go:embed zstd_zip_bomb.bin
 	zstdZipBomb []byte
 
 	zipBombs = map[Type][]byte{
-		TypeGzip: gzipZipBomb,
 		TypeZstd: zstdZipBomb,
 	}
 )
@@ -154,8 +150,17 @@ func TestNewCompressorWithInvalidLimit(t *testing.T) {
 	}
 }
 
-func FuzzGzipCompressor(f *testing.F) {
-	fuzzHelper(f, TypeGzip)
+func TestNewZstdCompressorWithLevel(t *testing.T) {
+	compressor, err := NewZstdCompressorWithLevel(maxMessageSize, zstd.BestSpeed)
+	require.NoError(t, err)
+
+	data := utils.RandomBytes(4096)
+	compressed, err := compressor.Compress(data)
+	require.NoError(t, err)
+
+	decompressed, err := compressor.Decompress(compressed)
+	require.NoError(t, err)
+	require.Equal(t, data, decompressed)
 }
 
 func FuzzZstdCompressor(f *testing.F) {
@@ -168,9 +173,6 @@ func fuzzHelper(f *testing.F, compressionType Type) {
 		err        error
 	)
 	switch compressionType {
-	case TypeGzip:
-		compressor, err = NewGzipCompressor(maxMessageSize)
-		require.NoError(f, err)
 	case TypeZstd:
 		compressor, err = NewZstdCompressor(maxMessageSize)
 		require.NoError(f, err)

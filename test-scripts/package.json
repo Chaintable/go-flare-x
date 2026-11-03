@@ -1,0 +1,27 @@
+{
+  "name": "go-flare-scripts",
+  "version": "1.0.0",
+  "scripts": {
+    "p-chain-import": "ts-node ./src/test-p-chain-import.ts",
+    "p-chain-export": "ts-node ./src/test-p-chain-export.ts",
+    "p-chain-transfer": "ts-node ./src/test-p-chain-transfer.ts",
+    "x-chain-import": "ts-node ./src/test-x-chain-import.ts",
+    "x-chain-export": "ts-node ./src/test-x-chain-export.ts",
+    "add-validator": "ts-node ./src/test-add-validator.ts",
+    "add-delegator": "ts-node ./src/test-add-delegator.ts"
+  },
+  "keywords": [],
+  "author": "Flare Foundation",
+  "license": "ISC",
+  "description": "Test scripts for Flare's P-Chain operations",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@flarenetwork/flarejs": "^5.1.0-rc.0",
+    "ethers": "^6.15.0"
+  },
+  "packageManager": "pnpm@11.15.1+sha512.81350b07e53c9538a02f1f2303b4290fa2d7be04e56e2a970c4cc4b417dc761de196edabd49d55c7dc9580db81007c44143e4e3d7e462b3000d23c255122d065"
+}

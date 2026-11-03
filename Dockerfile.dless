@@ -1,26 +1,22 @@
-FROM golang:1.22 AS build
-
-RUN apt-get update -y && \
-    apt-get install -y rsync
+#checkov:skip=CKV_DOCKER_2: "Ensure that HEALTHCHECK instructions have been added to container images"
+FROM golang:1.25.11-trixie@sha256:56a4d6ead4365cd569ca388003bdce672e7ca7286513f96b44b03d3b5e79d26f AS build
 
 WORKDIR /app/
 
 COPY ./.git /app/.git
 COPY ./avalanchego /app/avalanchego
 COPY ./config /app/config
-COPY ./coreth /app/coreth
 
 WORKDIR /app/avalanchego/
 
-RUN /app/avalanchego/scripts/build.sh
-
-RUN mkdir -p /app/conf/coston /app/conf/C /app/logs /app/db
+RUN /app/avalanchego/scripts/build.sh && \
+    mkdir -p /app/conf/coston /app/conf/C /app/logs /app/db
 
 WORKDIR /entrypoint
 COPY entrypoint/main.go .
 RUN go build -ldflags="-s -w" -o /out/entrypoint main.go
 
-FROM gcr.io/distroless/base:nonroot AS final
+FROM gcr.io/distroless/base:nonroot@sha256:e00da4d3bd422820880b080115b3bad24349bef37ed46d68ed0d13e150dc8d67 AS final
 
 USER nonroot
 

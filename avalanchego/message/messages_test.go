@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package message
@@ -17,15 +17,12 @@ import (
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	"github.com/ava-labs/avalanchego/staking"
 	"github.com/ava-labs/avalanchego/utils/compression"
-	"github.com/ava-labs/avalanchego/utils/logging"
 )
 
 func TestMessage(t *testing.T) {
 	t.Parallel()
 
 	mb, err := newMsgBuilder(
-		logging.NoLog{},
-		"test",
 		prometheus.NewRegistry(),
 		5*time.Second,
 	)
@@ -55,7 +52,7 @@ func TestMessage(t *testing.T) {
 		bytesSaved       bool // if true, outbound message saved bytes must be non-zero
 	}{
 		{
-			desc: "ping message with no compression no subnet uptimes",
+			desc: "ping message with no compression no uptime",
 			op:   PingOp,
 			msg: &p2p.Message{
 				Message: &p2p.Message_Ping{
@@ -67,13 +64,11 @@ func TestMessage(t *testing.T) {
 			bytesSaved:       false,
 		},
 		{
-			desc: "pong message with no compression no subnet uptimes",
+			desc: "pong message with no compression",
 			op:   PongOp,
 			msg: &p2p.Message{
 				Message: &p2p.Message_Pong{
-					Pong: &p2p.Pong{
-						Uptime: 100,
-					},
+					Pong: &p2p.Pong{},
 				},
 			},
 			compressionType:  compression.TypeNone,
@@ -81,37 +76,12 @@ func TestMessage(t *testing.T) {
 			bytesSaved:       false,
 		},
 		{
-			desc: "ping message with no compression and subnet uptimes",
+			desc: "ping message with no compression and uptime",
 			op:   PingOp,
 			msg: &p2p.Message{
 				Message: &p2p.Message_Ping{
 					Ping: &p2p.Ping{
-						SubnetUptimes: []*p2p.SubnetUptime{
-							{
-								SubnetId: testID[:],
-								Uptime:   100,
-							},
-						},
-					},
-				},
-			},
-			compressionType:  compression.TypeNone,
-			bypassThrottling: true,
-			bytesSaved:       false,
-		},
-		{
-			desc: "pong message with no compression and subnet uptimes",
-			op:   PongOp,
-			msg: &p2p.Message{
-				Message: &p2p.Message_Pong{
-					Pong: &p2p.Pong{
 						Uptime: 100,
-						SubnetUptimes: []*p2p.SubnetUptime{
-							{
-								SubnetId: testID[:],
-								Uptime:   100,
-							},
-						},
 					},
 				},
 			},
@@ -129,7 +99,6 @@ func TestMessage(t *testing.T) {
 						MyTime:         uint64(nowUnix),
 						IpAddr:         []byte(net.IPv6zero),
 						IpPort:         9651,
-						MyVersion:      "v1.2.3",
 						IpSigningTime:  uint64(nowUnix),
 						IpNodeIdSig:    []byte{'y', 'e', 'e', 't'},
 						TrackedSubnets: [][]byte{testID[:]},
@@ -339,10 +308,9 @@ func TestMessage(t *testing.T) {
 			msg: &p2p.Message{
 				Message: &p2p.Message_GetAcceptedFrontier{
 					GetAcceptedFrontier: &p2p.GetAcceptedFrontier{
-						ChainId:    testID[:],
-						RequestId:  1,
-						Deadline:   1,
-						EngineType: p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+						ChainId:   testID[:],
+						RequestId: 1,
+						Deadline:  1,
 					},
 				},
 			},
@@ -376,7 +344,6 @@ func TestMessage(t *testing.T) {
 						RequestId:    1,
 						Deadline:     1,
 						ContainerIds: [][]byte{testID[:], testID[:]},
-						EngineType:   p2p.EngineType_ENGINE_TYPE_AVALANCHE,
 					},
 				},
 			},
@@ -410,7 +377,7 @@ func TestMessage(t *testing.T) {
 						RequestId:   1,
 						Deadline:    1,
 						ContainerId: testID[:],
-						EngineType:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+						EngineType:  p2p.EngineType_ENGINE_TYPE_DAG,
 					},
 				},
 			},
@@ -460,7 +427,6 @@ func TestMessage(t *testing.T) {
 						RequestId:   1,
 						Deadline:    1,
 						ContainerId: testID[:],
-						EngineType:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
 					},
 				},
 			},
@@ -474,10 +440,9 @@ func TestMessage(t *testing.T) {
 			msg: &p2p.Message{
 				Message: &p2p.Message_Put{
 					Put: &p2p.Put{
-						ChainId:    testID[:],
-						RequestId:  1,
-						Container:  []byte{0},
-						EngineType: p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+						ChainId:   testID[:],
+						RequestId: 1,
+						Container: []byte{0},
 					},
 				},
 			},
@@ -491,10 +456,9 @@ func TestMessage(t *testing.T) {
 			msg: &p2p.Message{
 				Message: &p2p.Message_Put{
 					Put: &p2p.Put{
-						ChainId:    testID[:],
-						RequestId:  1,
-						Container:  compressibleContainers[0],
-						EngineType: p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+						ChainId:   testID[:],
+						RequestId: 1,
+						Container: compressibleContainers[0],
 					},
 				},
 			},
@@ -508,11 +472,10 @@ func TestMessage(t *testing.T) {
 			msg: &p2p.Message{
 				Message: &p2p.Message_PushQuery{
 					PushQuery: &p2p.PushQuery{
-						ChainId:    testID[:],
-						RequestId:  1,
-						Deadline:   1,
-						Container:  []byte{0},
-						EngineType: p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+						ChainId:   testID[:],
+						RequestId: 1,
+						Deadline:  1,
+						Container: []byte{0},
 					},
 				},
 			},
@@ -526,11 +489,10 @@ func TestMessage(t *testing.T) {
 			msg: &p2p.Message{
 				Message: &p2p.Message_PushQuery{
 					PushQuery: &p2p.PushQuery{
-						ChainId:    testID[:],
-						RequestId:  1,
-						Deadline:   1,
-						Container:  compressibleContainers[0],
-						EngineType: p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+						ChainId:   testID[:],
+						RequestId: 1,
+						Deadline:  1,
+						Container: compressibleContainers[0],
 					},
 				},
 			},
@@ -548,7 +510,6 @@ func TestMessage(t *testing.T) {
 						RequestId:   1,
 						Deadline:    1,
 						ContainerId: testID[:],
-						EngineType:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
 					},
 				},
 			},
@@ -668,6 +629,26 @@ func TestMessage(t *testing.T) {
 			bypassThrottling: true,
 			bytesSaved:       true,
 		},
+		{
+			desc: "simplex message with no compression",
+			op:   SimplexOp,
+			msg: &p2p.Message{
+				Message: &p2p.Message_Simplex{
+					Simplex: &p2p.Simplex{
+						ChainId: testID[:],
+						Message: &p2p.Simplex_ReplicationRequest{
+							ReplicationRequest: &p2p.ReplicationRequest{
+								Seqs:        []uint64{1, 2, 3},
+								LatestRound: 1,
+							},
+						},
+					},
+				},
+			},
+			compressionType:  compression.TypeNone,
+			bypassThrottling: true,
+			bytesSaved:       false,
+		},
 	}
 
 	for _, tv := range tests {
@@ -677,16 +658,16 @@ func TestMessage(t *testing.T) {
 			encodedMsg, err := mb.createOutbound(tv.msg, tv.compressionType, tv.bypassThrottling)
 			require.NoError(err)
 
-			require.Equal(tv.bypassThrottling, encodedMsg.BypassThrottling())
-			require.Equal(tv.op, encodedMsg.Op())
+			require.Equal(tv.bypassThrottling, encodedMsg.BypassThrottling)
+			require.Equal(tv.op, encodedMsg.Op)
 
-			if bytesSaved := encodedMsg.BytesSavedCompression(); tv.bytesSaved {
-				require.Greater(bytesSaved, 0)
+			if bytesSaved := encodedMsg.BytesSavedCompression; tv.bytesSaved {
+				require.Positive(bytesSaved)
 			}
 
-			parsedMsg, err := mb.parseInbound(encodedMsg.Bytes(), ids.EmptyNodeID, func() {})
+			parsedMsg, err := mb.parseInbound(encodedMsg.Bytes, ids.EmptyNodeID, func() {})
 			require.NoError(err)
-			require.Equal(tv.op, parsedMsg.Op())
+			require.Equal(tv.op, parsedMsg.Op)
 		})
 	}
 }
@@ -698,8 +679,6 @@ func TestInboundMessageToString(t *testing.T) {
 	require := require.New(t)
 
 	mb, err := newMsgBuilder(
-		logging.NoLog{},
-		"test",
 		prometheus.NewRegistry(),
 		5*time.Second,
 	)
@@ -708,9 +687,7 @@ func TestInboundMessageToString(t *testing.T) {
 	// msg that will become the tested InboundMessage
 	msg := &p2p.Message{
 		Message: &p2p.Message_Pong{
-			Pong: &p2p.Pong{
-				Uptime: 100,
-			},
+			Pong: &p2p.Pong{},
 		},
 	}
 	msgBytes, err := proto.Marshal(msg)
@@ -719,7 +696,7 @@ func TestInboundMessageToString(t *testing.T) {
 	inboundMsg, err := mb.parseInbound(msgBytes, ids.EmptyNodeID, func() {})
 	require.NoError(err)
 
-	require.Equal("NodeID-111111111111111111116DBWJs Op: pong Message: uptime:100", inboundMsg.String())
+	require.Equal("NodeID-111111111111111111116DBWJs Op: pong Message: ", inboundMsg.String())
 
 	internalMsg := InternalGetStateSummaryFrontierFailed(ids.EmptyNodeID, ids.Empty, 1)
 	require.Equal("NodeID-111111111111111111116DBWJs Op: get_state_summary_frontier_failed Message: ChainID: 11111111111111111111111111111111LpoYY RequestID: 1", internalMsg.String())
@@ -731,8 +708,6 @@ func TestEmptyInboundMessage(t *testing.T) {
 	require := require.New(t)
 
 	mb, err := newMsgBuilder(
-		logging.NoLog{},
-		"test",
 		prometheus.NewRegistry(),
 		5*time.Second,
 	)
@@ -752,8 +727,6 @@ func TestNilInboundMessage(t *testing.T) {
 	require := require.New(t)
 
 	mb, err := newMsgBuilder(
-		logging.NoLog{},
-		"test",
 		prometheus.NewRegistry(),
 		5*time.Second,
 	)
@@ -770,7 +743,7 @@ func TestNilInboundMessage(t *testing.T) {
 	parsedMsg, err := mb.parseInbound(msgBytes, ids.EmptyNodeID, func() {})
 	require.NoError(err)
 
-	require.IsType(&p2p.Ping{}, parsedMsg.message)
-	pingMsg := parsedMsg.message.(*p2p.Ping)
+	require.IsType(&p2p.Ping{}, parsedMsg.Message)
+	pingMsg := parsedMsg.Message.(*p2p.Ping)
 	require.NotNil(pingMsg)
 }

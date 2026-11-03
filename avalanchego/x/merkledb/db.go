@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package merkledb
@@ -15,7 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/exp/maps"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/ids"
@@ -25,6 +24,7 @@ import (
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/utils/units"
 
+	merklesync "github.com/ava-labs/avalanchego/database/merkle/sync"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -32,40 +32,51 @@ const (
 	// TODO: name better
 	rebuildViewSizeFractionOfCacheSize   = 50
 	minRebuildViewSizePerCommit          = 1000
-	clearBatchSize                       = units.MiB
 	rebuildIntermediateDeletionWriteSize = units.MiB
 	valueNodePrefixLen                   = 1
 	cacheEntryOverHead                   = 8
 )
 
 var (
-	_ MerkleDB = (*merkleDB)(nil)
-
-	codec = newCodec()
+	_ MerkleDB                                 = (*merkleDB)(nil)
+	_ merklesync.DB[*RangeProof, *ChangeProof] = (MerkleDB)(nil)
 
 	metadataPrefix         = []byte{0}
 	valueNodePrefix        = []byte{1}
 	intermediateNodePrefix = []byte{2}
 
+	// cleanShutdownKey is used to flag that the database did (or did not)
+	// previously shutdown correctly.
+	//
+	// If this key has value [hadCleanShutdown] it must be true that all
+	// intermediate nodes of the trie are correctly populated on disk and that
+	// the [rootDBKey] has the correct key for the root node.
+	//
+	// If this key has value [didNotHaveCleanShutdown] the intermediate nodes of
+	// the trie may not be correct and the [rootDBKey] may not exist or point to
+	// a node that node longer exists.
+	//
+	// Regardless of the value of [cleanShutdownKey], the value nodes must
+	// always be persisted correctly.
 	cleanShutdownKey        = []byte(string(metadataPrefix) + "cleanShutdown")
 	rootDBKey               = []byte(string(metadataPrefix) + "root")
 	hadCleanShutdown        = []byte{1}
 	didNotHaveCleanShutdown = []byte{0}
 
-	errSameRoot = errors.New("start and end root are the same")
+	errSameRoot    = errors.New("start and end root are the same")
+	errTooManyKeys = errors.New("response contains more than requested keys")
 )
 
 type ChangeProofer interface {
 	// GetChangeProof returns a proof for a subset of the key/value changes in key range
 	// [start, end] that occurred between [startRootID] and [endRootID].
 	// Returns at most [maxLength] key/value pairs.
-	// Returns [ErrInsufficientHistory] if this node has insufficient history
+	// Returns [xsync.ErrInsufficientHistory] if this node has insufficient history
 	// to generate the proof.
 	// Returns ErrEmptyProof if [endRootID] is ids.Empty.
 	// Note that [endRootID] == ids.Empty means the trie is empty
 	// (i.e. we don't need a change proof.)
-	// Returns [ErrNoEndRoot], which wraps [ErrInsufficientHistory], if the
-	// history doesn't contain the [endRootID].
+	// Returns [xsync.ErrNoEndRoot], if the history doesn't contain the [endRootID].
 	GetChangeProof(
 		ctx context.Context,
 		startRootID ids.ID,
@@ -78,12 +89,13 @@ type ChangeProofer interface {
 	// Returns nil iff all the following hold:
 	//   - [start] <= [end].
 	//   - [proof] is non-empty.
-	//   - All keys in [proof.KeyValues] and [proof.DeletedKeys] are in [start, end].
+	//   - [proof.KeyChanges] is not longer than [maxLength].
+	//   - All keys in [proof.KeyChanges] are in [start, end].
 	//     If [start] is nothing, all keys are considered > [start].
 	//     If [end] is nothing, all keys are considered < [end].
-	//   - [proof.KeyValues] and [proof.DeletedKeys] are sorted in order of increasing key.
+	//   - [proof.KeyChanges] are sorted in order of increasing key.
 	//   - [proof.StartProof] and [proof.EndProof] are well-formed.
-	//   - When the changes in [proof.KeyChanes] are applied,
+	//   - When the changes in [proof.KeyChanges] are applied,
 	//     the root ID of the database is [expectedEndRootID].
 	VerifyChangeProof(
 		ctx context.Context,
@@ -91,10 +103,17 @@ type ChangeProofer interface {
 		start maybe.Maybe[[]byte],
 		end maybe.Maybe[[]byte],
 		expectedEndRootID ids.ID,
+		maxLength int,
 	) error
 
 	// CommitChangeProof commits the key/value pairs within the [proof] to the db.
-	CommitChangeProof(ctx context.Context, proof *ChangeProof) error
+	// [end] is the largest possible key in the range this [proof] covers.
+	// [end] may be Nothing, meaning that there is no upper bound on the
+	// range.
+	// The key returned indicates the next key after the largest key in
+	// the proof. If the database has all keys from the start of the proof
+	// until [end], then Nothing is returned.
+	CommitChangeProof(ctx context.Context, end maybe.Maybe[[]byte], proof *ChangeProof) (maybe.Maybe[[]byte], error)
 }
 
 type RangeProofer interface {
@@ -105,6 +124,7 @@ type RangeProofer interface {
 	// Returns ErrEmptyProof if [rootID] is ids.Empty.
 	// Note that [rootID] == ids.Empty means the trie is empty
 	// (i.e. we don't need a range proof.)
+	// Returns [xsync.ErrNoEndRoot], if the history doesn't contain the [rootID].
 	GetRangeProofAtRoot(
 		ctx context.Context,
 		rootID ids.ID,
@@ -113,10 +133,35 @@ type RangeProofer interface {
 		maxLength int,
 	) (*RangeProof, error)
 
+	// Returns nil iff all the following hold:
+	//   - [start] <= [end].
+	//   - [proof] is non-empty.
+	//   - [proof.KeyChanges] is not longer than [maxLength].
+	//   - All keys in [proof.KeyChanges] are in [start, end].
+	//     If [start] is nothing, all keys are considered > [start].
+	//     If [end] is nothing, all keys are considered < [end].
+	//   - [proof.KeyChanges] are sorted in order of increasing key.
+	//   - [proof.StartProof] and [proof.EndProof] are well-formed.
+	//   - When the changes in [proof.KeyChanges] are applied,
+	//     the root ID of the database is [expectedEndRootID].
+	VerifyRangeProof(
+		ctx context.Context,
+		proof *RangeProof,
+		start maybe.Maybe[[]byte],
+		end maybe.Maybe[[]byte],
+		expectedEndRootID ids.ID,
+		maxLength int,
+	) error
+
 	// CommitRangeProof commits the key/value pairs within the [proof] to the db.
 	// [start] is the smallest possible key in the range this [proof] covers.
 	// [end] is the largest possible key in the range this [proof] covers.
-	CommitRangeProof(ctx context.Context, start, end maybe.Maybe[[]byte], proof *RangeProof) error
+	// [end] may be Nothing, meaning that there is no upper bound on the
+	// range.
+	// The key returned indicates the next key after the largest key in
+	// the proof. If the database has all keys from the start of the proof
+	// until [end], then Nothing is returned.
+	CommitRangeProof(ctx context.Context, start, end maybe.Maybe[[]byte], proof *RangeProof) (maybe.Maybe[[]byte], error)
 }
 
 type Clearer interface {
@@ -141,7 +186,7 @@ type Prefetcher interface {
 type MerkleDB interface {
 	database.Database
 	Clearer
-	Trie
+	View
 	MerkleRootGetter
 	ProofGetter
 	ChangeProofer
@@ -149,9 +194,29 @@ type MerkleDB interface {
 	Prefetcher
 }
 
+func NewConfig() Config {
+	return Config{
+		BranchFactor:                BranchFactor16,
+		Hasher:                      DefaultHasher,
+		RootGenConcurrency:          0,
+		HistoryLength:               300,
+		ValueNodeCacheSize:          units.MiB,
+		IntermediateNodeCacheSize:   units.MiB,
+		IntermediateWriteBufferSize: units.KiB,
+		IntermediateWriteBatchSize:  256 * units.KiB,
+		TraceLevel:                  InfoTrace,
+		Tracer:                      trace.Noop,
+	}
+}
+
 type Config struct {
 	// BranchFactor determines the number of children each node can have.
 	BranchFactor BranchFactor
+
+	// Hasher defines the hash function to use when hashing the trie.
+	//
+	// If not specified, [DefaultHasher] will be used.
+	Hasher Hasher
 
 	// RootGenConcurrency is the number of goroutines to use when
 	// generating a new state root.
@@ -175,6 +240,7 @@ type Config struct {
 	// Prometheus.
 	// This may be useful for testing.
 	Reg        prometheus.Registerer
+	Namespace  string
 	TraceLevel TraceLevel
 	Tracer     trace.Tracer
 }
@@ -204,7 +270,7 @@ type merkleDB struct {
 	// True iff the db has been closed.
 	closed bool
 
-	metrics merkleMetrics
+	metrics metrics
 
 	debugTracer trace.Tracer
 	infoTracer  trace.Tracer
@@ -218,16 +284,19 @@ type merkleDB struct {
 	// Valid children of this trie.
 	childViews []*view
 
-	// calculateNodeIDsSema controls the number of goroutines inside
-	// [calculateNodeIDsHelper] at any given time.
-	calculateNodeIDsSema *semaphore.Weighted
+	// hashNodesKeyPool controls the number of goroutines that are created
+	// inside [hashChangedNode] at any given time and provides slices for the
+	// keys needed while hashing.
+	hashNodesKeyPool *bytesPool
 
 	tokenSize int
+
+	hasher Hasher
 }
 
 // New returns a new merkle database.
 func New(ctx context.Context, db database.Database, config Config) (MerkleDB, error) {
-	metrics, err := newMetrics("merkleDB", config.Reg)
+	metrics, err := newMetrics(config.Namespace, config.Reg)
 	if err != nil {
 		return nil, err
 	}
@@ -238,24 +307,25 @@ func newDatabase(
 	ctx context.Context,
 	db database.Database,
 	config Config,
-	metrics merkleMetrics,
+	metrics metrics,
 ) (*merkleDB, error) {
 	if err := config.BranchFactor.Valid(); err != nil {
 		return nil, err
 	}
 
-	rootGenConcurrency := uint(runtime.NumCPU())
-	if config.RootGenConcurrency != 0 {
-		rootGenConcurrency = config.RootGenConcurrency
+	hasher := config.Hasher
+	if hasher == nil {
+		hasher = DefaultHasher
 	}
 
-	// Share a sync.Pool of []byte between the intermediateNodeDB and valueNodeDB
-	// to reduce memory allocations.
-	bufferPool := &sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, defaultBufferLength)
-		},
+	rootGenConcurrency := runtime.NumCPU()
+	if config.RootGenConcurrency != 0 {
+		rootGenConcurrency = int(config.RootGenConcurrency)
 	}
+
+	// Share a bytes pool between the intermediateNodeDB and valueNodeDB to
+	// reduce memory allocations.
+	bufferPool := utils.NewBytesPool()
 
 	trieDB := &merkleDB{
 		metrics: metrics,
@@ -267,21 +337,43 @@ func newDatabase(
 			int(config.IntermediateNodeCacheSize),
 			int(config.IntermediateWriteBufferSize),
 			int(config.IntermediateWriteBatchSize),
-			BranchFactorToTokenSize[config.BranchFactor]),
-		valueNodeDB: newValueNodeDB(db,
+			BranchFactorToTokenSize[config.BranchFactor],
+			hasher,
+		),
+		valueNodeDB: newValueNodeDB(
+			db,
 			bufferPool,
 			metrics,
-			int(config.ValueNodeCacheSize)),
-		history:              newTrieHistory(int(config.HistoryLength)),
-		debugTracer:          getTracerIfEnabled(config.TraceLevel, DebugTrace, config.Tracer),
-		infoTracer:           getTracerIfEnabled(config.TraceLevel, InfoTrace, config.Tracer),
-		childViews:           make([]*view, 0, defaultPreallocationSize),
-		calculateNodeIDsSema: semaphore.NewWeighted(int64(rootGenConcurrency)),
-		tokenSize:            BranchFactorToTokenSize[config.BranchFactor],
+			int(config.ValueNodeCacheSize),
+			hasher,
+		),
+		history:          newTrieHistory(int(config.HistoryLength)),
+		debugTracer:      getTracerIfEnabled(config.TraceLevel, DebugTrace, config.Tracer),
+		infoTracer:       getTracerIfEnabled(config.TraceLevel, InfoTrace, config.Tracer),
+		childViews:       make([]*view, 0, defaultPreallocationSize),
+		hashNodesKeyPool: newBytesPool(rootGenConcurrency),
+		tokenSize:        BranchFactorToTokenSize[config.BranchFactor],
+		hasher:           hasher,
 	}
 
-	if err := trieDB.initializeRoot(); err != nil {
+	shutdownType, err := trieDB.baseDB.Get(cleanShutdownKey)
+	switch err {
+	case nil:
+	case database.ErrNotFound:
+		// If the marker wasn't found then the DB is being created for the first
+		// time and there is nothing to do.
+		shutdownType = hadCleanShutdown
+	default:
 		return nil, err
+	}
+	if bytes.Equal(shutdownType, didNotHaveCleanShutdown) {
+		if err := trieDB.rebuild(ctx, int(config.ValueNodeCacheSize)); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := trieDB.initializeRoot(); err != nil {
+			return nil, err
+		}
 	}
 
 	// add current root to history (has no changes)
@@ -290,24 +382,10 @@ func newDatabase(
 		rootChange: change[maybe.Maybe[*node]]{
 			after: trieDB.root,
 		},
-		values: map[Key]*change[maybe.Maybe[[]byte]]{},
-		nodes:  map[Key]*change[*node]{},
+		sortedKeys: []Key{},
+		nodes:      map[Key]*change[*node]{},
+		keyChanges: map[Key]*change[maybe.Maybe[[]byte]]{},
 	})
-
-	shutdownType, err := trieDB.baseDB.Get(cleanShutdownKey)
-	switch err {
-	case nil:
-		if bytes.Equal(shutdownType, didNotHaveCleanShutdown) {
-			if err := trieDB.rebuild(ctx, int(config.ValueNodeCacheSize)); err != nil {
-				return nil, err
-			}
-		}
-	case database.ErrNotFound:
-		// If the marker wasn't found then the DB is being created for the first
-		// time and there is nothing to do.
-	default:
-		return nil, err
-	}
 
 	// mark that the db has not yet been cleanly closed
 	err = trieDB.baseDB.Put(cleanShutdownKey, didNotHaveCleanShutdown)
@@ -369,13 +447,19 @@ func (db *merkleDB) rebuild(ctx context.Context, cacheSize int) error {
 	return db.Compact(nil, nil)
 }
 
-func (db *merkleDB) CommitChangeProof(ctx context.Context, proof *ChangeProof) error {
+func (db *merkleDB) CommitChangeProof(ctx context.Context, end maybe.Maybe[[]byte], proof *ChangeProof) (maybe.Maybe[[]byte], error) {
 	db.commitLock.Lock()
 	defer db.commitLock.Unlock()
 
 	if db.closed {
-		return database.ErrClosed
+		return maybe.Nothing[[]byte](), database.ErrClosed
 	}
+
+	// If there's no changes to make, we don't have to commit anything.
+	if len(proof.KeyChanges) == 0 {
+		return maybe.Nothing[[]byte](), nil
+	}
+
 	ops := make([]database.BatchOp, len(proof.KeyChanges))
 	for i, kv := range proof.KeyChanges {
 		ops[i] = database.BatchOp{
@@ -387,36 +471,43 @@ func (db *merkleDB) CommitChangeProof(ctx context.Context, proof *ChangeProof) e
 
 	view, err := newView(db, db, ViewChanges{BatchOps: ops})
 	if err != nil {
-		return err
+		return maybe.Nothing[[]byte](), err
 	}
-	return view.commitToDB(ctx)
+
+	// Commit the changes to the DB.
+	if err := view.commitToDB(ctx); err != nil {
+		return maybe.Nothing[[]byte](), err
+	}
+	largestKey := maybe.Some(proof.KeyChanges[len(proof.KeyChanges)-1].Key)
+
+	return db.findNextKey(largestKey, end, proof.EndProof)
 }
 
-func (db *merkleDB) CommitRangeProof(ctx context.Context, start, end maybe.Maybe[[]byte], proof *RangeProof) error {
+func (db *merkleDB) CommitRangeProof(ctx context.Context, start, end maybe.Maybe[[]byte], proof *RangeProof) (maybe.Maybe[[]byte], error) {
 	db.commitLock.Lock()
 	defer db.commitLock.Unlock()
 
 	if db.closed {
-		return database.ErrClosed
+		return maybe.Nothing[[]byte](), database.ErrClosed
 	}
 
-	ops := make([]database.BatchOp, len(proof.KeyValues))
-	keys := set.NewSet[string](len(proof.KeyValues))
-	for i, kv := range proof.KeyValues {
+	ops := make([]database.BatchOp, len(proof.KeyChanges))
+	keys := set.NewSet[string](len(proof.KeyChanges))
+	for i, kv := range proof.KeyChanges {
 		keys.Add(string(kv.Key))
 		ops[i] = database.BatchOp{
 			Key:   kv.Key,
-			Value: kv.Value,
+			Value: kv.Value.Value(),
 		}
 	}
 
 	largestKey := end
-	if len(proof.KeyValues) > 0 {
-		largestKey = maybe.Some(proof.KeyValues[len(proof.KeyValues)-1].Key)
+	if len(proof.KeyChanges) > 0 {
+		largestKey = maybe.Some(proof.KeyChanges[len(proof.KeyChanges)-1].Key)
 	}
 	keysToDelete, err := db.getKeysNotInSet(start, largestKey, keys)
 	if err != nil {
-		return err
+		return maybe.Nothing[[]byte](), err
 	}
 	for _, keyToDelete := range keysToDelete {
 		ops = append(ops, database.BatchOp{
@@ -428,10 +519,13 @@ func (db *merkleDB) CommitRangeProof(ctx context.Context, start, end maybe.Maybe
 	// Don't need to lock [view] because nobody else has a reference to it.
 	view, err := newView(db, db, ViewChanges{BatchOps: ops})
 	if err != nil {
-		return err
+		return maybe.Nothing[[]byte](), err
 	}
 
-	return view.commitToDB(ctx)
+	if err := view.commitToDB(ctx); err != nil {
+		return maybe.Nothing[[]byte](), err
+	}
+	return db.findNextKey(largestKey, end, proof.EndProof)
 }
 
 func (db *merkleDB) Compact(start []byte, limit []byte) error {
@@ -462,8 +556,26 @@ func (db *merkleDB) Close() error {
 		return err
 	}
 
-	// Successfully wrote intermediate nodes.
-	return db.baseDB.Put(cleanShutdownKey, hadCleanShutdown)
+	var (
+		batch = db.baseDB.NewBatch()
+		err   error
+	)
+	// Write the root key
+	if db.root.IsNothing() {
+		err = batch.Delete(rootDBKey)
+	} else {
+		rootKey := encodeKey(db.root.Value().key)
+		err = batch.Put(rootDBKey, rootKey)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Write the clean shutdown marker
+	if err := batch.Put(cleanShutdownKey, hadCleanShutdown); err != nil {
+		return err
+	}
+	return batch.Write()
 }
 
 func (db *merkleDB) PrefetchPaths(keys [][]byte) error {
@@ -687,29 +799,23 @@ func (db *merkleDB) GetChangeProof(
 		return nil, database.ErrClosed
 	}
 
-	changes, err := db.history.getValueChanges(startRootID, endRootID, start, end, maxLength)
+	// [valueChanges] contains a subset of the keys that were added or had their
+	// values modified between [startRootID] to [endRootID].
+	valueChanges, err := db.history.getValueChanges(startRootID, endRootID, start, end, maxLength)
 	if err != nil {
 		return nil, err
 	}
 
-	// [changedKeys] are a subset of the keys that were added or had their
-	// values modified between [startRootID] to [endRootID] sorted in increasing
-	// order.
-	changedKeys := maps.Keys(changes.values)
-	utils.Sort(changedKeys)
-
 	result := &ChangeProof{
-		KeyChanges: make([]KeyChange, 0, len(changedKeys)),
+		KeyChanges: make([]KeyChange, len(valueChanges)),
 	}
 
-	for _, key := range changedKeys {
-		change := changes.values[key]
-
-		result.KeyChanges = append(result.KeyChanges, KeyChange{
-			Key: key.Bytes(),
+	for i, valueChange := range valueChanges {
+		result.KeyChanges[i] = KeyChange{
+			Key: valueChange.key.Bytes(),
 			// create a copy so edits of the []byte don't affect the db
-			Value: maybe.Bind(change.after, slices.Clone[[]byte]),
-		})
+			Value: maybe.Bind(valueChange.change.after, slices.Clone[[]byte]),
+		}
 	}
 
 	largestKey := end
@@ -779,7 +885,7 @@ func (db *merkleDB) NewView(
 		return nil, database.ErrClosed
 	}
 
-	newView, err := newView(db, db, changes)
+	view, err := newView(db, db, changes)
 	if err != nil {
 		return nil, err
 	}
@@ -788,8 +894,8 @@ func (db *merkleDB) NewView(
 	db.lock.Lock()
 	defer db.lock.Unlock()
 
-	db.childViews = append(db.childViews, newView)
-	return newView, nil
+	db.childViews = append(db.childViews, view)
+	return view, nil
 }
 
 func (db *merkleDB) Has(k []byte) (bool, error) {
@@ -902,10 +1008,10 @@ func (db *merkleDB) commitBatch(ops []database.BatchOp) error {
 	return view.commitToDB(context.Background())
 }
 
-// commitChanges commits the changes in [trieToCommit] to [db].
+// commitView commits the changes in [trieToCommit] to [db].
 // Assumes [trieToCommit]'s node IDs have been calculated.
 // Assumes [db.commitLock] is held.
-func (db *merkleDB) commitChanges(ctx context.Context, trieToCommit *view) error {
+func (db *merkleDB) commitView(ctx context.Context, trieToCommit *view) error {
 	db.lock.Lock()
 	defer db.lock.Unlock()
 
@@ -923,9 +1029,9 @@ func (db *merkleDB) commitChanges(ctx context.Context, trieToCommit *view) error
 	}
 
 	changes := trieToCommit.changes
-	_, span := db.infoTracer.Start(ctx, "MerkleDB.commitChanges", oteltrace.WithAttributes(
+	_, span := db.infoTracer.Start(ctx, "MerkleDB.commitView", oteltrace.WithAttributes(
 		attribute.Int("nodesChanged", len(changes.nodes)),
-		attribute.Int("valuesChanged", len(changes.values)),
+		attribute.Int("valuesChanged", len(changes.keyChanges)),
 	))
 	defer span.End()
 
@@ -939,39 +1045,12 @@ func (db *merkleDB) commitChanges(ctx context.Context, trieToCommit *view) error
 		return nil
 	}
 
-	currentValueNodeBatch := db.valueNodeDB.NewBatch()
-	_, nodesSpan := db.infoTracer.Start(ctx, "MerkleDB.commitChanges.writeNodes")
-	for key, nodeChange := range changes.nodes {
-		shouldAddIntermediate := nodeChange.after != nil && !nodeChange.after.hasValue()
-		shouldDeleteIntermediate := !shouldAddIntermediate && nodeChange.before != nil && !nodeChange.before.hasValue()
-
-		shouldAddValue := nodeChange.after != nil && nodeChange.after.hasValue()
-		shouldDeleteValue := !shouldAddValue && nodeChange.before != nil && nodeChange.before.hasValue()
-
-		if shouldAddIntermediate {
-			if err := db.intermediateNodeDB.Put(key, nodeChange.after); err != nil {
-				nodesSpan.End()
-				return err
-			}
-		} else if shouldDeleteIntermediate {
-			if err := db.intermediateNodeDB.Delete(key); err != nil {
-				nodesSpan.End()
-				return err
-			}
-		}
-
-		if shouldAddValue {
-			currentValueNodeBatch.Put(key, nodeChange.after)
-		} else if shouldDeleteValue {
-			currentValueNodeBatch.Delete(key)
-		}
+	valueNodeBatch := db.baseDB.NewBatch()
+	if err := db.applyChanges(ctx, valueNodeBatch, changes); err != nil {
+		return err
 	}
-	nodesSpan.End()
 
-	_, commitSpan := db.infoTracer.Start(ctx, "MerkleDB.commitChanges.valueNodeDBCommit")
-	err := currentValueNodeBatch.Write()
-	commitSpan.End()
-	if err != nil {
+	if err := db.commitValueChanges(ctx, valueNodeBatch); err != nil {
 		return err
 	}
 
@@ -980,16 +1059,12 @@ func (db *merkleDB) commitChanges(ctx context.Context, trieToCommit *view) error
 	// Update root in database.
 	db.root = changes.rootChange.after
 	db.rootID = changes.rootID
-
-	if db.root.IsNothing() {
-		return db.baseDB.Delete(rootDBKey)
-	}
-
-	rootKey := codec.encodeKey(db.root.Value().key)
-	return db.baseDB.Put(rootDBKey, rootKey)
+	return nil
 }
 
-// moveChildViewsToDB removes any child views from the trieToCommit and moves them to the db
+// moveChildViewsToDB removes any child views from the trieToCommit and moves
+// them to the db.
+//
 // assumes [db.lock] is held
 func (db *merkleDB) moveChildViewsToDB(trieToCommit *view) {
 	trieToCommit.validityTrackingLock.Lock()
@@ -1000,6 +1075,53 @@ func (db *merkleDB) moveChildViewsToDB(trieToCommit *view) {
 		db.childViews = append(db.childViews, childView)
 	}
 	trieToCommit.childViews = make([]*view, 0, defaultPreallocationSize)
+}
+
+// applyChanges takes the [changes] and applies them to [db.intermediateNodeDB]
+// and [valueNodeBatch].
+//
+// assumes [db.lock] is held
+func (db *merkleDB) applyChanges(ctx context.Context, valueNodeBatch database.KeyValueWriterDeleter, changes *changeSummary) error {
+	_, span := db.infoTracer.Start(ctx, "MerkleDB.applyChanges")
+	defer span.End()
+
+	for key, nodeChange := range changes.nodes {
+		shouldAddIntermediate := nodeChange.after != nil && !nodeChange.after.hasValue()
+		shouldDeleteIntermediate := !shouldAddIntermediate && nodeChange.before != nil && !nodeChange.before.hasValue()
+
+		shouldAddValue := nodeChange.after != nil && nodeChange.after.hasValue()
+		shouldDeleteValue := !shouldAddValue && nodeChange.before != nil && nodeChange.before.hasValue()
+
+		if shouldAddIntermediate {
+			if err := db.intermediateNodeDB.Put(key, nodeChange.after); err != nil {
+				return err
+			}
+		} else if shouldDeleteIntermediate {
+			if err := db.intermediateNodeDB.Delete(key); err != nil {
+				return err
+			}
+		}
+
+		if shouldAddValue {
+			if err := db.valueNodeDB.Write(valueNodeBatch, key, nodeChange.after); err != nil {
+				return err
+			}
+		} else if shouldDeleteValue {
+			if err := db.valueNodeDB.Write(valueNodeBatch, key, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// commitValueChanges is a thin wrapper around [valueNodeBatch.Write()] to
+// provide tracing.
+func (db *merkleDB) commitValueChanges(ctx context.Context, valueNodeBatch database.Batch) error {
+	_, span := db.infoTracer.Start(ctx, "MerkleDB.commitValueChanges")
+	defer span.End()
+
+	return valueNodeBatch.Write()
 }
 
 // CommitToDB is a no-op for db since it is already in sync with itself.
@@ -1017,57 +1139,37 @@ func (db *merkleDB) VerifyChangeProof(
 	start maybe.Maybe[[]byte],
 	end maybe.Maybe[[]byte],
 	expectedEndRootID ids.ID,
+	maxLength int,
 ) error {
-	switch {
-	case start.HasValue() && end.HasValue() && bytes.Compare(start.Value(), end.Value()) > 0:
-		return ErrStartAfterEnd
-	case proof.Empty():
+	if proof == nil {
 		return ErrEmptyProof
-	case end.HasValue() && len(proof.KeyChanges) == 0 && len(proof.EndProof) == 0:
-		// We requested an end proof but didn't get one.
-		return ErrNoEndProof
-	case start.HasValue() && len(proof.StartProof) == 0 && len(proof.EndProof) == 0:
-		// We requested a start proof but didn't get one.
-		// Note that we also have to check that [proof.EndProof] is empty
-		// to handle the case that the start proof is empty because all
-		// its nodes are also in the end proof, and those nodes are omitted.
-		return ErrNoStartProof
+	}
+	if len(proof.KeyChanges) > maxLength {
+		return fmt.Errorf("%w: [%d], max: [%d]", errTooManyKeys, len(proof.KeyChanges), maxLength)
 	}
 
-	// Make sure the key-value pairs are sorted and in [start, end].
-	if err := verifyKeyChanges(proof.KeyChanges, start, end); err != nil {
-		return err
-	}
+	startProofKey := maybe.Bind(start, ToKey)
+	endProofKey := maybe.Bind(end, ToKey)
 
-	smallestKey := maybe.Bind(start, ToKey)
-
-	// Make sure the start proof, if given, is well-formed.
-	if err := verifyProofPath(proof.StartProof, smallestKey); err != nil {
-		return err
-	}
-
-	// Find the greatest key in [proof.KeyChanges]
-	// Note that [proof.EndProof] is a proof for this key.
-	// [largestKey] is also used when we add children of proof nodes to [trie] below.
-	largestKey := maybe.Bind(end, ToKey)
+	// Update [endProofKey] with the largest key in [keyValues].
 	if len(proof.KeyChanges) > 0 {
-		// If [proof] has key-value pairs, we should insert children
-		// greater than [end] to ancestors of the node containing [end]
-		// so that we get the expected root ID.
-		largestKey = maybe.Some(ToKey(proof.KeyChanges[len(proof.KeyChanges)-1].Key))
+		endProofKey = maybe.Some(ToKey(proof.KeyChanges[len(proof.KeyChanges)-1].Key))
 	}
 
-	// Make sure the end proof, if given, is well-formed.
-	if err := verifyProofPath(proof.EndProof, largestKey); err != nil {
+	// Validate proof.
+	if err := validateChangeProof(
+		startProofKey,
+		maybe.Bind(end, ToKey),
+		proof.StartProof,
+		proof.EndProof,
+		proof.KeyChanges,
+		endProofKey,
+		db.tokenSize,
+	); err != nil {
 		return err
 	}
 
-	keyValues := make(map[Key]maybe.Maybe[[]byte], len(proof.KeyChanges))
-	for _, keyValue := range proof.KeyChanges {
-		keyValues[ToKey(keyValue.Key)] = keyValue.Value
-	}
-
-	// want to prevent commit writes to DB, but not prevent DB reads
+	// Prevent commit writes to DB, but not prevent DB reads
 	db.commitLock.RLock()
 	defer db.commitLock.RUnlock()
 
@@ -1075,29 +1177,33 @@ func (db *merkleDB) VerifyChangeProof(
 		return database.ErrClosed
 	}
 
-	if err := verifyAllChangeProofKeyValuesPresent(
+	// Ensure that the [startProof] has correct values.
+	if err := verifyChangeProofKeyValues(
 		ctx,
 		db,
+		proof.KeyChanges,
 		proof.StartProof,
-		smallestKey,
-		largestKey,
-		keyValues,
+		startProofKey,
+		endProofKey,
+		db.hasher,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to verify start proof nodes: %w", err)
 	}
 
-	if err := verifyAllChangeProofKeyValuesPresent(
+	// Ensure that the [endProof] has correct values.
+	if err := verifyChangeProofKeyValues(
 		ctx,
 		db,
+		proof.KeyChanges,
 		proof.EndProof,
-		smallestKey,
-		largestKey,
-		keyValues,
+		startProofKey,
+		endProofKey,
+		db.hasher,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to validate end proof nodes: %w", err)
 	}
 
-	// Insert the key-value pairs into the trie.
+	// Prepare ops for the creation of the view.
 	ops := make([]database.BatchOp, len(proof.KeyChanges))
 	for i, kv := range proof.KeyChanges {
 		ops[i] = database.BatchOp{
@@ -1113,25 +1219,26 @@ func (db *merkleDB) VerifyChangeProof(
 		return err
 	}
 
-	// For all the nodes along the edges of the proof, insert the children whose
+	// For all the nodes along the edges of the proofs, insert the children whose
 	// keys are less than [insertChildrenLessThan] or whose keys are greater
 	// than [insertChildrenGreaterThan] into the trie so that we get the
 	// expected root ID (if this proof is valid).
 	if err := addPathInfo(
 		view,
 		proof.StartProof,
-		smallestKey,
-		largestKey,
+		startProofKey,
+		endProofKey,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to add start proof path info: %w", err)
 	}
+
 	if err := addPathInfo(
 		view,
 		proof.EndProof,
-		smallestKey,
-		largestKey,
+		startProofKey,
+		endProofKey,
 	); err != nil {
-		return err
+		return fmt.Errorf("failed to add end proof path info: %w", err)
 	}
 
 	// Make sure we get the expected root.
@@ -1139,11 +1246,31 @@ func (db *merkleDB) VerifyChangeProof(
 	if err != nil {
 		return err
 	}
+
 	if expectedEndRootID != calculatedRoot {
 		return fmt.Errorf("%w:[%s], expected:[%s]", ErrInvalidProof, calculatedRoot, expectedEndRootID)
 	}
 
 	return nil
+}
+
+func (db *merkleDB) VerifyRangeProof(
+	ctx context.Context,
+	proof *RangeProof,
+	start maybe.Maybe[[]byte],
+	end maybe.Maybe[[]byte],
+	expectedEndRootID ids.ID,
+	maxLength int,
+) error {
+	return proof.Verify(
+		ctx,
+		start,
+		end,
+		expectedEndRootID,
+		db.tokenSize,
+		db.hasher,
+		maxLength,
+	)
 }
 
 // Invalidates and removes any child views that aren't [exception].
@@ -1168,23 +1295,21 @@ func (db *merkleDB) invalidateChildrenExcept(exception *view) {
 // Otherwise leave [db.root] as Nothing.
 func (db *merkleDB) initializeRoot() error {
 	rootKeyBytes, err := db.baseDB.Get(rootDBKey)
+	if errors.Is(err, database.ErrNotFound) {
+		return nil // Root isn't on disk.
+	}
 	if err != nil {
-		if !errors.Is(err, database.ErrNotFound) {
-			return err
-		}
-		// Root isn't on disk.
-		return nil
+		return err
 	}
 
 	// Root is on disk.
-	rootKey, err := codec.decodeKey(rootKeyBytes)
+	rootKey, err := decodeKey(rootKeyBytes)
 	if err != nil {
 		return err
 	}
 
 	// First, see if root is an intermediate node.
-	var root *node
-	root, err = db.getEditableNode(rootKey, false /* hasValue */)
+	root, err := db.getEditableNode(rootKey, false /* hasValue */)
 	if err != nil {
 		if !errors.Is(err, database.ErrNotFound) {
 			return err
@@ -1197,7 +1322,9 @@ func (db *merkleDB) initializeRoot() error {
 		}
 	}
 
-	db.rootID = root.calculateID(db.metrics)
+	db.rootID = db.hasher.HashNode(root)
+	db.metrics.HashCalculated()
+
 	db.root = maybe.Some(root)
 	return nil
 }
@@ -1307,9 +1434,10 @@ func (db *merkleDB) Clear() error {
 	// Clear history
 	db.history = newTrieHistory(db.history.maxHistoryLen)
 	db.history.record(&changeSummary{
-		rootID: db.rootID,
-		values: map[Key]*change[maybe.Maybe[[]byte]]{},
-		nodes:  map[Key]*change[*node]{},
+		rootID:     db.rootID,
+		sortedKeys: []Key{},
+		nodes:      map[Key]*change[*node]{},
+		keyChanges: map[Key]*change[maybe.Maybe[[]byte]]{},
 	})
 	return nil
 }
@@ -1319,31 +1447,15 @@ func (db *merkleDB) getTokenSize() int {
 }
 
 // Returns [key] prefixed by [prefix].
-// The returned []byte is taken from [bufferPool] and
-// should be returned to it when the caller is done with it.
-func addPrefixToKey(bufferPool *sync.Pool, prefix []byte, key []byte) []byte {
+// The returned *[]byte is taken from [bufferPool] and should be returned to it
+// when the caller is done with it.
+func addPrefixToKey(bufferPool *utils.BytesPool, prefix []byte, key []byte) *[]byte {
 	prefixLen := len(prefix)
 	keyLen := prefixLen + len(key)
-	prefixedKey := getBufferFromPool(bufferPool, keyLen)
-	copy(prefixedKey, prefix)
-	copy(prefixedKey[prefixLen:], key)
+	prefixedKey := bufferPool.Get(keyLen)
+	copy(*prefixedKey, prefix)
+	copy((*prefixedKey)[prefixLen:], key)
 	return prefixedKey
-}
-
-// Returns a []byte from [bufferPool] with length exactly [size].
-// The []byte is not guaranteed to be zeroed.
-func getBufferFromPool(bufferPool *sync.Pool, size int) []byte {
-	buffer := bufferPool.Get().([]byte)
-	if cap(buffer) >= size {
-		// The [] byte we got from the pool is big enough to hold the prefixed key
-		buffer = buffer[:size]
-	} else {
-		// The []byte from the pool wasn't big enough.
-		// Put it back and allocate a new, bigger one
-		bufferPool.Put(buffer)
-		buffer = make([]byte, size)
-	}
-	return buffer
 }
 
 // cacheEntrySize returns a rough approximation of the memory consumed by storing the key and node.
@@ -1351,5 +1463,226 @@ func cacheEntrySize(key Key, n *node) int {
 	if n == nil {
 		return cacheEntryOverHead + len(key.Bytes())
 	}
-	return cacheEntryOverHead + len(key.Bytes()) + codec.encodedDBNodeSize(&n.dbNode)
+	return cacheEntryOverHead + len(key.Bytes()) + encodedDBNodeSize(&n.dbNode)
+}
+
+// findNextKey returns the start of the key range that should be fetched next
+// given that we just received a range/change proof that proved a range of
+// key-value pairs ending at [lastReceivedKey].
+//
+// [rangeEnd] is the end of the range that we want to fetch.
+//
+// Returns Nothing if there are no more keys to fetch in [lastReceivedKey, rangeEnd].
+//
+// [endProof] is the end proof of the last proof received.
+//
+// Invariant: [lastReceivedKey] < [rangeEnd].
+// If [rangeEnd] is Nothing it's considered > [lastReceivedKey].
+func (db *merkleDB) findNextKey(
+	largestHandledKey maybe.Maybe[[]byte],
+	rangeEnd maybe.Maybe[[]byte],
+	endProof []ProofNode,
+) (maybe.Maybe[[]byte], error) {
+	if maybe.Equal(largestHandledKey, rangeEnd, bytes.Equal) {
+		return maybe.Nothing[[]byte](), nil
+	}
+
+	// The largest handled key isn't equal to the end of the range.
+	// Find the start of the next key range to fetch.
+	// Note that [largestHandledKey] can't be Nothing.
+	// Proof: Suppose it is. That means that we got a range/change proof that proved up to the
+	// greatest key-value pair in the database. That means we requested a proof with no upper
+	// bound. That is, [rangeEnd] is Nothing. Since we're here, [bothNothing] is false,
+	// which means [rangeEnd] isn't Nothing. Contradiction.
+	lastReceivedKey := largestHandledKey.Value()
+
+	if len(endProof) == 0 {
+		// We try to find the next key to fetch by looking at the end proof.
+		// If the end proof is empty, we have no information to use.
+		// Start fetching from the next key after [lastReceivedKey].
+		nextKey := lastReceivedKey
+		nextKey = append(nextKey, 0)
+		return maybe.Some(nextKey), nil
+	}
+
+	// We want the first key larger than the [lastReceivedKey].
+	// This is done by taking two proofs for the same key
+	// (one that was just received as part of a proof, and one from the local db)
+	// and traversing them from the longest key to the shortest key.
+	// For each node in these proofs, compare if the children of that node exist
+	// or have the same ID in the other proof.
+	proofKeyPath := ToKey(lastReceivedKey)
+
+	// If the received proof is an exclusion proof, the last node may be for a
+	// key that is after the [lastReceivedKey].
+	// If the last received node's key is after the [lastReceivedKey], it can
+	// be removed to obtain a valid proof for a prefix of the [lastReceivedKey].
+	if !proofKeyPath.HasPrefix(endProof[len(endProof)-1].Key) {
+		endProof = endProof[:len(endProof)-1]
+		// update the proofKeyPath to be for the prefix
+		proofKeyPath = endProof[len(endProof)-1].Key
+	}
+
+	// get a proof for the same key as the received proof from the local db
+	localProofOfKey, err := getProof(db, lastReceivedKey)
+	if err != nil {
+		return maybe.Nothing[[]byte](), err
+	}
+	localProofNodes := localProofOfKey.Path
+
+	// The local proof may also be an exclusion proof with an extra node.
+	// Remove this extra node if it exists to get a proof of the same key as the received proof
+	if !proofKeyPath.HasPrefix(localProofNodes[len(localProofNodes)-1].Key) {
+		localProofNodes = localProofNodes[:len(localProofNodes)-1]
+	}
+
+	nextKey := maybe.Nothing[[]byte]()
+
+	// Add sentinel node back into the localProofNodes, if it is missing.
+	// Required to ensure that a common node exists in both proofs
+	if len(localProofNodes) > 0 && localProofNodes[0].Key.Length() != 0 {
+		sentinel := ProofNode{
+			Children: map[byte]ids.ID{
+				localProofNodes[0].Key.Token(0, db.tokenSize): ids.Empty,
+			},
+		}
+		localProofNodes = append([]ProofNode{sentinel}, localProofNodes...)
+	}
+
+	// Add sentinel node back into the endProof, if it is missing.
+	// Required to ensure that a common node exists in both proofs
+	if len(endProof) > 0 && endProof[0].Key.Length() != 0 {
+		sentinel := ProofNode{
+			Children: map[byte]ids.ID{
+				endProof[0].Key.Token(0, db.tokenSize): ids.Empty,
+			},
+		}
+		endProof = append([]ProofNode{sentinel}, endProof...)
+	}
+
+	localProofNodeIndex := len(localProofNodes) - 1
+	receivedProofNodeIndex := len(endProof) - 1
+
+	// traverse the two proofs from the deepest nodes up to the sentinel node until a difference is found
+	for localProofNodeIndex >= 0 && receivedProofNodeIndex >= 0 && nextKey.IsNothing() {
+		localProofNode := localProofNodes[localProofNodeIndex]
+		receivedProofNode := endProof[receivedProofNodeIndex]
+
+		// [deepestNode] is the proof node with the longest key (deepest in the trie) in the
+		// two proofs that hasn't been handled yet.
+		// [deepestNodeFromOtherProof] is the proof node from the other proof with
+		// the same key/depth if it exists, nil otherwise.
+		var deepestNode, deepestNodeFromOtherProof *ProofNode
+
+		// select the deepest proof node from the two proofs
+		switch {
+		case receivedProofNode.Key.Length() > localProofNode.Key.Length():
+			// there was a branch node in the received proof that isn't in the local proof
+			// see if the received proof node has children not present in the local proof
+			deepestNode = &receivedProofNode
+
+			// we have dealt with this received node, so move on to the next received node
+			receivedProofNodeIndex--
+
+		case localProofNode.Key.Length() > receivedProofNode.Key.Length():
+			// there was a branch node in the local proof that isn't in the received proof
+			// see if the local proof node has children not present in the received proof
+			deepestNode = &localProofNode
+
+			// we have dealt with this local node, so move on to the next local node
+			localProofNodeIndex--
+
+		default:
+			// the two nodes are at the same depth
+			// see if any of the children present in the local proof node are different
+			// from the children in the received proof node
+			deepestNode = &localProofNode
+			deepestNodeFromOtherProof = &receivedProofNode
+
+			// we have dealt with this local node and received node, so move on to the next nodes
+			localProofNodeIndex--
+			receivedProofNodeIndex--
+		}
+
+		// We only want to look at the children with keys greater than the proofKey.
+		// The proof key has the deepest node's key as a prefix,
+		// so only the next token of the proof key needs to be considered.
+
+		// If the deepest node has the same key as [proofKeyPath],
+		// then all of its children have keys greater than the proof key,
+		// so we can start at the 0 token.
+		startingChildToken := 0
+
+		// If the deepest node has a key shorter than the key being proven,
+		// we can look at the next token index of the proof key to determine which of that
+		// node's children have keys larger than [proofKeyPath].
+		// Any child with a token greater than the [proofKeyPath]'s token at that
+		// index will have a larger key.
+		if deepestNode.Key.Length() < proofKeyPath.Length() {
+			startingChildToken = int(proofKeyPath.Token(deepestNode.Key.Length(), db.tokenSize)) + 1
+		}
+
+		// determine if there are any differences in the children for the deepest unhandled node of the two proofs
+		if childIndex, hasDifference := findChildDifference(deepestNode, deepestNodeFromOtherProof, startingChildToken); hasDifference {
+			nextKey = maybe.Some(deepestNode.Key.Extend(ToToken(childIndex, db.tokenSize)).Bytes())
+			break
+		}
+	}
+
+	// If the nextKey is before or equal to the [lastReceivedKey]
+	// then we couldn't find a better answer than the [lastReceivedKey].
+	// Set the nextKey to [lastReceivedKey] + 0, which is the first key in
+	// the open range (lastReceivedKey, rangeEnd).
+	if nextKey.HasValue() && bytes.Compare(nextKey.Value(), lastReceivedKey) <= 0 {
+		nextKeyVal := slices.Clone(lastReceivedKey)
+		nextKeyVal = append(nextKeyVal, 0)
+		nextKey = maybe.Some(nextKeyVal)
+	}
+
+	// If the [nextKey] is larger than the end of the range, return Nothing to signal that there is no next key in range
+	if rangeEnd.HasValue() && bytes.Compare(nextKey.Value(), rangeEnd.Value()) >= 0 {
+		return maybe.Nothing[[]byte](), nil
+	}
+
+	// the nextKey is within the open range (lastReceivedKey, rangeEnd), so return it
+	return nextKey, nil
+}
+
+// findChildDifference returns the first child index that is different between node 1 and node 2 if one exists and
+// a bool indicating if any difference was found
+func findChildDifference(node1, node2 *ProofNode, startIndex int) (byte, bool) {
+	// Children indices >= [startIndex] present in at least one of the nodes.
+	childIndices := set.Set[byte]{}
+	for _, node := range []*ProofNode{node1, node2} {
+		if node == nil {
+			continue
+		}
+		for key := range node.Children {
+			if int(key) >= startIndex {
+				childIndices.Add(key)
+			}
+		}
+	}
+
+	sortedChildIndices := maps.Keys(childIndices)
+	slices.Sort(sortedChildIndices)
+	var (
+		child1, child2 ids.ID
+		ok1, ok2       bool
+	)
+	for _, childIndex := range sortedChildIndices {
+		if node1 != nil {
+			child1, ok1 = node1.Children[childIndex]
+		}
+		if node2 != nil {
+			child2, ok2 = node2.Children[childIndex]
+		}
+		// if one node has a child and the other doesn't or the children ids don't match,
+		// return the current child index as the first difference
+		if (ok1 || ok2) && child1 != child2 {
+			return childIndex, true
+		}
+	}
+	// there were no differences found
+	return 0, false
 }

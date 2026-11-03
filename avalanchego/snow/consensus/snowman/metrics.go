@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package snowman
@@ -10,9 +10,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/snow/choices"
-	"github.com/ava-labs/avalanchego/utils/linkedhashmap"
+	"github.com/ava-labs/avalanchego/utils/linked"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/math"
 	"github.com/ava-labs/avalanchego/utils/metric"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 )
@@ -34,7 +34,7 @@ type metrics struct {
 	// processingBlocks keeps track of the [processingStart] that each block was
 	// issued into the consensus instance. This is used to calculate the amount
 	// of time to accept or reject the block.
-	processingBlocks linkedhashmap.LinkedHashmap[ids.ID, processingStart]
+	processingBlocks *linked.Hashmap[ids.ID, processingStart]
 
 	// numProcessing keeps track of the number of processing blocks
 	numProcessing prometheus.Gauge
@@ -46,6 +46,7 @@ type metrics struct {
 	// latAccepted tracks the number of nanoseconds that a block was processing
 	// before being accepted
 	latAccepted          metric.Averager
+	consensusLatencies   prometheus.Histogram
 	buildLatencyAccepted prometheus.Gauge
 
 	blockSizeRejectedSum prometheus.Gauge
@@ -61,96 +62,79 @@ type metrics struct {
 
 	// numSuccessfulPolls keeps track of the number of polls that succeeded
 	numSuccessfulPolls prometheus.Counter
+
+	// avgAcceptanceLatency tracks the average acceptance time
+	avgAcceptanceLatency math.Averager
 }
 
 func newMetrics(
 	log logging.Logger,
-	namespace string,
 	reg prometheus.Registerer,
 	lastAcceptedHeight uint64,
 	lastAcceptedTime time.Time,
 ) (*metrics, error) {
+	acceptanceHalfLife := 5 * time.Minute
 	errs := wrappers.Errs{}
 	m := &metrics{
 		log:                      log,
 		currentMaxVerifiedHeight: lastAcceptedHeight,
 		maxVerifiedHeight: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "max_verified_height",
-			Help:      "highest verified height",
+			Name: "max_verified_height",
+			Help: "highest verified height",
 		}),
 		lastAcceptedHeight: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "last_accepted_height",
-			Help:      "last height accepted",
+			Name: "last_accepted_height",
+			Help: "last height accepted",
 		}),
 		lastAcceptedTimestamp: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "last_accepted_timestamp",
-			Help:      "timestamp of the last accepted block in unix seconds",
+			Name: "last_accepted_timestamp",
+			Help: "timestamp of the last accepted block in unix seconds",
 		}),
 
-		processingBlocks: linkedhashmap.New[ids.ID, processingStart](),
+		processingBlocks: linked.NewHashmap[ids.ID, processingStart](),
 
-		// e.g.,
-		// "avalanche_X_blks_processing" reports how many blocks are currently processing
 		numProcessing: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "blks_processing",
-			Help:      "number of currently processing blocks",
+			Name: "blks_processing",
+			Help: "number of currently processing blocks",
 		}),
 
 		blockSizeAcceptedSum: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "blks_accepted_container_size_sum",
-			Help:      "cumulative size of all accepted blocks",
+			Name: "blks_accepted_container_size_sum",
+			Help: "cumulative size of all accepted blocks",
 		}),
 		pollsAccepted: metric.NewAveragerWithErrs(
-			namespace,
 			"blks_polls_accepted",
 			"number of polls from the issuance of a block to its acceptance",
 			reg,
 			&errs,
 		),
-		// e.g.,
-		// "avalanche_C_blks_accepted_count" reports how many times "Observe" has been called which is the total number of blocks accepted
-		// "avalanche_C_blks_accepted_sum" reports the cumulative sum of all block acceptance latencies in nanoseconds
-		// "avalanche_C_blks_accepted_sum / avalanche_C_blks_accepted_count" is the average block acceptance latency in nanoseconds
-		// "avalanche_C_blks_accepted_container_size_sum" reports the cumulative sum of all accepted blocks' sizes in bytes
-		// "avalanche_C_blks_accepted_container_size_sum / avalanche_C_blks_accepted_count" is the average accepted block size in bytes
 		latAccepted: metric.NewAveragerWithErrs(
-			namespace,
 			"blks_accepted",
 			"time (in ns) from the issuance of a block to its acceptance",
 			reg,
 			&errs,
 		),
+		consensusLatencies: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "consensus_latencies",
+			Help:    "times (in ns) from issuance of a block to acceptance, bucketed",
+			Buckets: prometheus.LinearBuckets(float64(time.Second), float64(time.Second), 4),
+		}),
 		buildLatencyAccepted: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "blks_build_accept_latency",
-			Help:      "time (in ns) from the timestamp of a block to the time it was accepted",
+			Name: "blks_build_accept_latency",
+			Help: "time (in ns) from the timestamp of a block to the time it was accepted",
 		}),
 
 		blockSizeRejectedSum: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "blks_rejected_container_size_sum",
-			Help:      "cumulative size of all rejected blocks",
+			Name: "blks_rejected_container_size_sum",
+			Help: "cumulative size of all rejected blocks",
 		}),
 		pollsRejected: metric.NewAveragerWithErrs(
-			namespace,
 			"blks_polls_rejected",
 			"number of polls from the issuance of a block to its rejection",
 			reg,
 			&errs,
 		),
-		// e.g.,
-		// "avalanche_P_blks_rejected_count" reports how many times "Observe" has been called which is the total number of blocks rejected
-		// "avalanche_P_blks_rejected_sum" reports the cumulative sum of all block rejection latencies in nanoseconds
-		// "avalanche_P_blks_rejected_sum / avalanche_P_blks_rejected_count" is the average block rejection latency in nanoseconds
-		// "avalanche_P_blks_rejected_container_size_sum" reports the cumulative sum of all rejected blocks' sizes in bytes
-		// "avalanche_P_blks_rejected_container_size_sum / avalanche_P_blks_rejected_count" is the average rejected block size in bytes
 		latRejected: metric.NewAveragerWithErrs(
-			namespace,
 			"blks_rejected",
 			"time (in ns) from the issuance of a block to its rejection",
 			reg,
@@ -158,15 +142,17 @@ func newMetrics(
 		),
 
 		numSuccessfulPolls: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "polls_successful",
-			Help:      "number of successful polls",
+			Name: "polls_successful",
+			Help: "number of successful polls",
 		}),
 		numFailedPolls: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "polls_failed",
-			Help:      "number of failed polls",
+			Name: "polls_failed",
+			Help: "number of failed polls",
 		}),
+		avgAcceptanceLatency: math.NewMaturedAverager(
+			acceptanceHalfLife,
+			math.NewUninitializedAverager(acceptanceHalfLife),
+		),
 	}
 
 	// Initially set the metrics for the last accepted block.
@@ -181,6 +167,7 @@ func newMetrics(
 		reg.Register(m.numProcessing),
 		reg.Register(m.blockSizeAcceptedSum),
 		reg.Register(m.buildLatencyAccepted),
+		reg.Register(m.consensusLatencies),
 		reg.Register(m.blockSizeRejectedSum),
 		reg.Register(m.numSuccessfulPolls),
 		reg.Register(m.numFailedPolls),
@@ -212,7 +199,7 @@ func (m *metrics) Accepted(
 	if !ok {
 		m.log.Error("unable to measure latency",
 			zap.Stringer("blkID", blkID),
-			zap.Stringer("status", choices.Accepted),
+			zap.String("status", "accepted"),
 		)
 		return
 	}
@@ -231,6 +218,8 @@ func (m *metrics) Accepted(
 
 	builtDuration := now.Sub(timestamp)
 	m.buildLatencyAccepted.Add(float64(builtDuration))
+	m.avgAcceptanceLatency.Observe(float64(builtDuration), now)
+	m.consensusLatencies.Observe(float64(processingDuration))
 }
 
 func (m *metrics) Rejected(blkID ids.ID, pollNumber uint64, blockSize int) {
@@ -238,7 +227,7 @@ func (m *metrics) Rejected(blkID ids.ID, pollNumber uint64, blockSize int) {
 	if !ok {
 		m.log.Error("unable to measure latency",
 			zap.Stringer("blkID", blkID),
-			zap.Stringer("status", choices.Rejected),
+			zap.String("status", "rejected"),
 		)
 		return
 	}
@@ -267,4 +256,8 @@ func (m *metrics) SuccessfulPoll() {
 
 func (m *metrics) FailedPoll() {
 	m.numFailedPolls.Inc()
+}
+
+func (m *metrics) GetAverageAcceptanceTime() time.Duration {
+	return time.Duration(m.avgAcceptanceLatency.Read())
 }

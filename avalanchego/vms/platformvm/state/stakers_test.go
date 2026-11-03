@@ -1,9 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package state
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -11,6 +12,9 @@ import (
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils/crypto/bls/signer/localsigner"
+	"github.com/ava-labs/avalanchego/utils/iterator"
+	"github.com/ava-labs/avalanchego/vms/platformvm/genesis/genesistest"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
 )
 
@@ -84,7 +88,10 @@ func TestBaseStakersValidator(t *testing.T) {
 	require.ErrorIs(err, database.ErrNotFound)
 
 	stakerIterator := v.GetStakerIterator()
-	assertIteratorsEqual(t, NewSliceIterator(delegator), stakerIterator)
+	require.Equal(
+		[]*Staker{delegator},
+		iterator.ToSlice(stakerIterator),
+	)
 
 	v.PutValidator(staker)
 
@@ -95,7 +102,10 @@ func TestBaseStakersValidator(t *testing.T) {
 	v.DeleteDelegator(delegator)
 
 	stakerIterator = v.GetStakerIterator()
-	assertIteratorsEqual(t, NewSliceIterator(staker), stakerIterator)
+	require.Equal(
+		[]*Staker{staker},
+		iterator.ToSlice(stakerIterator),
+	)
 
 	v.DeleteValidator(staker)
 
@@ -103,30 +113,42 @@ func TestBaseStakersValidator(t *testing.T) {
 	require.ErrorIs(err, database.ErrNotFound)
 
 	stakerIterator = v.GetStakerIterator()
-	assertIteratorsEqual(t, EmptyIterator, stakerIterator)
+	require.Empty(
+		iterator.ToSlice(stakerIterator),
+	)
 }
 
 func TestBaseStakersDelegator(t *testing.T) {
+	require := require.New(t)
 	staker := newTestStaker()
 	delegator := newTestStaker()
 
 	v := newBaseStakers()
 
 	delegatorIterator := v.GetDelegatorIterator(delegator.SubnetID, delegator.NodeID)
-	assertIteratorsEqual(t, EmptyIterator, delegatorIterator)
+	require.Empty(
+		iterator.ToSlice(delegatorIterator),
+	)
 
 	v.PutDelegator(delegator)
 
 	delegatorIterator = v.GetDelegatorIterator(delegator.SubnetID, ids.GenerateTestNodeID())
-	assertIteratorsEqual(t, EmptyIterator, delegatorIterator)
+	require.Empty(
+		iterator.ToSlice(delegatorIterator),
+	)
 
 	delegatorIterator = v.GetDelegatorIterator(delegator.SubnetID, delegator.NodeID)
-	assertIteratorsEqual(t, NewSliceIterator(delegator), delegatorIterator)
+	require.Equal(
+		[]*Staker{delegator},
+		iterator.ToSlice(delegatorIterator),
+	)
 
 	v.DeleteDelegator(delegator)
 
 	delegatorIterator = v.GetDelegatorIterator(delegator.SubnetID, delegator.NodeID)
-	assertIteratorsEqual(t, EmptyIterator, delegatorIterator)
+	require.Empty(
+		iterator.ToSlice(delegatorIterator),
+	)
 
 	v.PutValidator(staker)
 
@@ -134,7 +156,171 @@ func TestBaseStakersDelegator(t *testing.T) {
 	v.DeleteDelegator(delegator)
 
 	delegatorIterator = v.GetDelegatorIterator(staker.SubnetID, staker.NodeID)
-	assertIteratorsEqual(t, EmptyIterator, delegatorIterator)
+	require.Empty(
+		iterator.ToSlice(delegatorIterator),
+	)
+}
+
+func TestDiffStakersAddDeleteAddDeleteValidator(t *testing.T) {
+	require := require.New(t)
+	staker := newTestStaker()
+
+	diff := diffStakers{}
+	require.False(existsInDiff(&diff, staker))
+
+	// Add the validator
+	require.NoError(diff.PutValidator(staker))
+
+	// Ensure it exists in the diff
+	require.True(existsInDiff(&diff, staker))
+	returnedStaker, status := diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(added, status)
+	require.Equal(staker, returnedStaker)
+
+	// Next, delete the validator
+	diff.DeleteValidator(staker)
+
+	// Validators created and deleted in the same diff are marked as unmodified.
+	_, status = diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(unmodified, status)
+	require.False(existsInDiff(&diff, staker))
+
+	// Add it back to the diff
+	require.NoError(diff.PutValidator(staker))
+
+	// Ensure it exists in the diff again
+	require.True(existsInDiff(&diff, staker))
+	returnedStaker, status = diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(added, status)
+	require.Equal(staker, returnedStaker)
+
+	// Delete it again
+	diff.DeleteValidator(staker)
+
+	// Ensure it doesn't exist in the diff again
+	_, status = diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(unmodified, status)
+	require.False(existsInDiff(&diff, staker))
+}
+
+func TestDiffStakersUpdateValidator(t *testing.T) {
+	require := require.New(t)
+	staker := newTestStaker()
+
+	endTime := staker.EndTime.Add(genesistest.DefaultValidatorDuration)
+
+	modifiedStaker := *staker
+	modifiedStaker.Weight++
+	modifiedStaker.EndTime = endTime
+
+	diff := diffStakers{isAdditionAfterDeletionAllowed: StakerAdditionAfterDeletionAllowed}
+	require.False(existsInDiff(&diff, staker))
+
+	diff.DeleteValidator(staker)
+	require.False(existsInDiff(&diff, staker))
+	_, status := diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(deleted, status)
+
+	require.NoError(diff.PutValidator(&modifiedStaker))
+
+	returnedStaker, status := diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(added, status)
+	require.Equal(&modifiedStaker, returnedStaker)
+	require.True(existsInDiff(&diff, &modifiedStaker))
+}
+
+func TestDiffStakersDeleteAddDeleteValidator(t *testing.T) {
+	require := require.New(t)
+	v1 := newTestStaker()
+
+	v1Prime := *v1
+	v1Prime.Weight++
+
+	diff := diffStakers{isAdditionAfterDeletionAllowed: StakerAdditionAfterDeletionAllowed}
+
+	// Delete v1 (simulating removal of an existing validator from base state)
+	diff.DeleteValidator(v1)
+	_, status := diff.GetValidator(v1.SubnetID, v1.NodeID)
+	require.Equal(deleted, status)
+	require.False(existsInDiff(&diff, v1))
+
+	// Add v1' (a modified replacement validator for the same node)
+	require.NoError(diff.PutValidator(&v1Prime))
+	_, status = diff.GetValidator(v1.SubnetID, v1.NodeID)
+	require.Equal(added, status)
+
+	// Delete v1' (undo the replacement)
+	diff.DeleteValidator(&v1Prime)
+
+	// The net effect should be: v1 is still deleted from the base state.
+	// The add-then-delete of v1' should not erase v1's deletion.
+	_, status = diff.GetValidator(v1.SubnetID, v1.NodeID)
+	require.Equal(deleted, status, "original deletion of v1 was lost")
+	require.False(existsInDiff(&diff, v1))
+
+	// Verify that v1 is filtered out from a parent iterator that contains it.
+	// This ensures the deletion is tracked in deletedStakers, not just in the
+	// validator diff's removed field.
+	parentIterator := iterator.FromSlice(v1)
+	stakers := iterator.ToSlice(diff.GetStakerIterator(parentIterator))
+	require.Empty(stakers, "v1 should be filtered from parent after delete-add-delete")
+}
+
+func TestDiffStakersDeleteThenReAddSameValidator(t *testing.T) {
+	require := require.New(t)
+	v1 := newTestStaker()
+
+	diff := diffStakers{isAdditionAfterDeletionAllowed: StakerAdditionAfterDeletionAllowed}
+
+	// Delete v1 (simulating removal of an existing validator from base state)
+	diff.DeleteValidator(v1)
+	_, status := diff.GetValidator(v1.SubnetID, v1.NodeID)
+	require.Equal(deleted, status)
+
+	// Re-add the exact same validator. The delete and add should cancel out.
+	require.NoError(diff.PutValidator(v1))
+
+	// The net effect should be: the validator is unmodified.
+	_, status = diff.GetValidator(v1.SubnetID, v1.NodeID)
+	require.Equal(unmodified, status, "delete then re-add of same validator should cancel out")
+
+	// The validator should not appear in addedStakers.
+	require.False(existsInDiff(&diff, v1), "validator should not be in addedStakers after cancellation")
+
+	// The validator should not be filtered from the parent iterator either,
+	// since the deletion was cancelled.
+	parentIterator := iterator.FromSlice(v1)
+	stakers := iterator.ToSlice(diff.GetStakerIterator(parentIterator))
+	require.Equal([]*Staker{v1}, stakers, "validator should still come through from parent")
+}
+
+func TestDiffValidatorWeightDiffAfterDeleteAndAdd(t *testing.T) {
+	require := require.New(t)
+	staker := newTestStaker()
+	staker.Weight = 5
+
+	modifiedStaker := *staker
+	modifiedStaker.Weight = 10
+
+	diff := diffStakers{isAdditionAfterDeletionAllowed: StakerAdditionAfterDeletionAllowed}
+
+	// Delete the original validator (weight 5)
+	diff.DeleteValidator(staker)
+
+	// Add a replacement validator (weight 10) for the same node
+	require.NoError(diff.PutValidator(&modifiedStaker))
+
+	// Verify the validator was replaced
+	returnedStaker, status := diff.GetValidator(staker.SubnetID, staker.NodeID)
+	require.Equal(added, status)
+	require.Equal(uint64(10), returnedStaker.Weight)
+
+	// WeightDiff should reflect the net change: +10 - 5 = +5
+	validatorDiff := diff.getOrCreateDiff(staker.SubnetID, staker.NodeID)
+	weightDiff, err := validatorDiff.WeightDiff()
+	require.NoError(err)
+	require.False(weightDiff.Decrease)
+	require.Equal(uint64(5), weightDiff.Amount, "expected net weight change of +5 (new 10 minus old 5)")
 }
 
 func TestDiffStakersValidator(t *testing.T) {
@@ -157,10 +343,13 @@ func TestDiffStakersValidator(t *testing.T) {
 	_, status = v.GetValidator(delegator.SubnetID, delegator.NodeID)
 	require.Equal(unmodified, status)
 
-	stakerIterator := v.GetStakerIterator(EmptyIterator)
-	assertIteratorsEqual(t, NewSliceIterator(delegator), stakerIterator)
+	stakerIterator := v.GetStakerIterator(iterator.Empty[*Staker]{})
+	require.Equal(
+		[]*Staker{delegator},
+		iterator.ToSlice(stakerIterator),
+	)
 
-	v.PutValidator(staker)
+	require.NoError(v.PutValidator(staker))
 
 	returnedStaker, status := v.GetValidator(staker.SubnetID, staker.NodeID)
 	require.Equal(added, status)
@@ -174,8 +363,11 @@ func TestDiffStakersValidator(t *testing.T) {
 	_, status = v.GetValidator(staker.SubnetID, staker.NodeID)
 	require.Equal(unmodified, status)
 
-	stakerIterator = v.GetStakerIterator(EmptyIterator)
-	assertIteratorsEqual(t, NewSliceIterator(delegator), stakerIterator)
+	stakerIterator = v.GetStakerIterator(iterator.Empty[*Staker]{})
+	require.Equal(
+		[]*Staker{delegator},
+		iterator.ToSlice(stakerIterator),
+	)
 }
 
 func TestDiffStakersDeleteValidator(t *testing.T) {
@@ -196,30 +388,38 @@ func TestDiffStakersDeleteValidator(t *testing.T) {
 }
 
 func TestDiffStakersDelegator(t *testing.T) {
+	require := require.New(t)
 	staker := newTestStaker()
 	delegator := newTestStaker()
 
 	v := diffStakers{}
 
-	v.PutValidator(staker)
+	require.NoError(v.PutValidator(staker))
 
-	delegatorIterator := v.GetDelegatorIterator(EmptyIterator, ids.GenerateTestID(), delegator.NodeID)
-	assertIteratorsEqual(t, EmptyIterator, delegatorIterator)
+	delegatorIterator := v.GetDelegatorIterator(iterator.Empty[*Staker]{}, ids.GenerateTestID(), delegator.NodeID)
+	require.Empty(
+		iterator.ToSlice(delegatorIterator),
+	)
 
 	v.PutDelegator(delegator)
 
-	delegatorIterator = v.GetDelegatorIterator(EmptyIterator, delegator.SubnetID, delegator.NodeID)
-	assertIteratorsEqual(t, NewSliceIterator(delegator), delegatorIterator)
+	delegatorIterator = v.GetDelegatorIterator(iterator.Empty[*Staker]{}, delegator.SubnetID, delegator.NodeID)
+	require.Equal(
+		[]*Staker{delegator},
+		iterator.ToSlice(delegatorIterator),
+	)
 
 	v.DeleteDelegator(delegator)
 
-	delegatorIterator = v.GetDelegatorIterator(EmptyIterator, ids.GenerateTestID(), delegator.NodeID)
-	assertIteratorsEqual(t, EmptyIterator, delegatorIterator)
+	delegatorIterator = v.GetDelegatorIterator(iterator.Empty[*Staker]{}, ids.GenerateTestID(), delegator.NodeID)
+	require.Empty(
+		iterator.ToSlice(delegatorIterator),
+	)
 }
 
 func newTestStaker() *Staker {
 	startTime := time.Now().Round(time.Second)
-	endTime := startTime.Add(28 * 24 * time.Hour)
+	endTime := startTime.Add(genesistest.DefaultValidatorDuration)
 	return &Staker{
 		TxID:            ids.GenerateTestID(),
 		NodeID:          ids.GenerateTestNodeID(),
@@ -234,21 +434,151 @@ func newTestStaker() *Staker {
 	}
 }
 
-func assertIteratorsEqual(t *testing.T, expected, actual StakerIterator) {
-	require := require.New(t)
+func TestStakerEquals(t *testing.T) {
+	// If this constant is wrong, a field was likely added to Staker without
+	// updating the Equals method. Update Equals to compare the new field,
+	// then fix this constant.
+	const expectedStakerFieldCount = 10
 
-	t.Helper()
+	require.Equal(t,
+		expectedStakerFieldCount,
+		reflect.TypeOf(Staker{}).NumField(),
+		"Staker struct field count changed; update Staker.Equals and this test",
+	)
 
-	for expected.Next() {
-		require.True(actual.Next())
+	signer1, err := localsigner.New()
+	require.NoError(t, err)
+	signer2, err := localsigner.New()
+	require.NoError(t, err)
 
-		expectedStaker := expected.Value()
-		actualStaker := actual.Value()
+	pk1 := signer1.PublicKey()
+	pk2 := signer2.PublicKey()
 
-		require.Equal(expectedStaker, actualStaker)
+	now := time.Now().Round(time.Second)
+	staker := &Staker{
+		TxID:            ids.GenerateTestID(),
+		NodeID:          ids.GenerateTestNodeID(),
+		PublicKey:       pk1,
+		SubnetID:        ids.GenerateTestID(),
+		Weight:          100,
+		StartTime:       now,
+		EndTime:         now.Add(time.Hour),
+		PotentialReward: 50,
+		NextTime:        now.Add(time.Hour),
+		Priority:        txs.PrimaryNetworkValidatorCurrentPriority,
 	}
-	require.False(actual.Next())
 
-	expected.Release()
-	actual.Release()
+	// Test nil handling
+	var nilStaker *Staker
+	require.True(t, nilStaker.Equals(nil))
+	require.False(t, nilStaker.Equals(staker))
+	require.False(t, staker.Equals(nil))
+
+	// Test identical stakers
+	identical := *staker
+	require.True(t, staker.Equals(&identical))
+
+	// Test both public keys nil
+	noPK1 := *staker
+	noPK2 := *staker
+	noPK1.PublicKey = nil
+	noPK2.PublicKey = nil
+	require.True(t, noPK1.Equals(&noPK2))
+
+	// Test one public key nil
+	onePKNil := *staker
+	onePKNil.PublicKey = nil
+	require.False(t, staker.Equals(&onePKNil))
+	require.False(t, onePKNil.Equals(staker))
+
+	// Test that each field is actually compared by Equals.
+	type fieldMutation struct {
+		name   string
+		mutate func(s *Staker)
+	}
+	mutations := []fieldMutation{
+		{"TxID", func(s *Staker) { s.TxID = ids.GenerateTestID() }},
+		{"NodeID", func(s *Staker) { s.NodeID = ids.GenerateTestNodeID() }},
+		{"PublicKey", func(s *Staker) { s.PublicKey = pk2 }},
+		{"SubnetID", func(s *Staker) { s.SubnetID = ids.GenerateTestID() }},
+		{"Weight", func(s *Staker) { s.Weight++ }},
+		{"StartTime", func(s *Staker) { s.StartTime = s.StartTime.Add(time.Second) }},
+		{"EndTime", func(s *Staker) { s.EndTime = s.EndTime.Add(time.Second) }},
+		{"PotentialReward", func(s *Staker) { s.PotentialReward++ }},
+		{"NextTime", func(s *Staker) { s.NextTime = s.NextTime.Add(time.Second) }},
+		{"Priority", func(s *Staker) { s.Priority++ }},
+	}
+
+	require.Len(t, mutations, expectedStakerFieldCount,
+		"each Staker field must have a corresponding mutation entry in this test",
+	)
+
+	for _, m := range mutations {
+		t.Run("different "+m.name, func(t *testing.T) {
+			other := *staker
+			m.mutate(&other)
+			require.False(t, staker.Equals(&other))
+		})
+	}
+}
+
+func TestGetStakerIteratorDeleteAndPut(t *testing.T) {
+	// When a validator from the parent state is deleted and then replaced,
+	// GetStakerIterator returns only the replacement — not both.
+	tests := []struct {
+		name            string
+		makeReplacement func(*Staker) *Staker
+	}{
+		{
+			name: "same TxID",
+			makeReplacement: func(original *Staker) *Staker {
+				replacement := *original
+				replacement.Weight = 2
+				return &replacement
+			},
+		},
+		{
+			name: "different TxID",
+			makeReplacement: func(original *Staker) *Staker {
+				replacement := *original
+				replacement.TxID = ids.GenerateTestID()
+				replacement.Weight = original.Weight + 10
+				replacement.EndTime = original.EndTime.Add(time.Hour)
+				replacement.NextTime = replacement.EndTime
+				return &replacement
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			staker := newTestStaker()
+
+			base := newBaseStakers()
+			base.PutValidator(staker)
+
+			diff := diffStakers{isAdditionAfterDeletionAllowed: StakerAdditionAfterDeletionAllowed}
+			replacement := tt.makeReplacement(staker)
+
+			diff.DeleteValidator(staker)
+			require.NoError(diff.PutValidator(replacement))
+
+			stakers := iterator.ToSlice(diff.GetStakerIterator(base.GetStakerIterator()))
+			require.Equal([]*Staker{replacement}, stakers)
+		})
+	}
+}
+
+func existsInDiff(bs *diffStakers, staker *Staker) bool {
+	it := bs.GetStakerIterator(iterator.Empty[*Staker]{})
+	defer it.Release()
+
+	for it.Next() {
+		if it.Value().Equals(staker) {
+			return true
+		}
+	}
+	return false
 }

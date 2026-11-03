@@ -1,37 +1,41 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package handler
 
 import (
-	"context"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
-	"github.com/ava-labs/avalanchego/snow/networking/tracker"
-	"github.com/ava-labs/avalanchego/snow/snowtest"
+	"github.com/ava-labs/avalanchego/snow/networking/tracker/trackermock"
 	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/utils/logging"
 )
-
-const engineType = p2p.EngineType_ENGINE_TYPE_SNOWMAN
 
 func TestQueue(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	require := require.New(t)
-	cpuTracker := tracker.NewMockTracker(ctrl)
-	snowCtx := snowtest.Context(t, snowtest.CChainID)
-	ctx := snowtest.ConsensusContext(snowCtx)
+	cpuTracker := trackermock.NewTracker(ctrl)
 	vdrs := validators.NewManager()
 	vdr1ID, vdr2ID := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
-	require.NoError(vdrs.AddStaker(ctx.SubnetID, vdr1ID, nil, ids.Empty, 1))
-	require.NoError(vdrs.AddStaker(ctx.SubnetID, vdr2ID, nil, ids.Empty, 1))
-	mIntf, err := NewMessageQueue(ctx, vdrs, cpuTracker, "", message.SynchronousOps)
+	require.NoError(vdrs.AddStaker(constants.PrimaryNetworkID, vdr1ID, nil, ids.Empty, 1))
+	require.NoError(vdrs.AddStaker(constants.PrimaryNetworkID, vdr2ID, nil, ids.Empty, 1))
+	mIntf, err := NewMessageQueue(
+		logging.NoLog{},
+		constants.PrimaryNetworkID,
+		vdrs,
+		cpuTracker,
+		"",
+		prometheus.NewRegistry(),
+	)
 	require.NoError(err)
 	u := mIntf.(*messageQueue)
 	currentTime := time.Now()
@@ -45,15 +49,14 @@ func TestQueue(t *testing.T) {
 			ids.GenerateTestID(),
 			0,
 			vdr1ID,
-			engineType,
 		),
-		EngineType: engineType,
+		EngineType: p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
 	}
 
 	// Push then pop should work regardless of usage when there are no other
 	// messages on [u.msgs]
 	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.1).Times(1)
-	u.Push(context.Background(), msg1)
+	u.Push(t.Context(), msg1)
 	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
 	require.Equal(1, u.Len())
 	_, gotMsg1, ok := u.Pop()
@@ -63,7 +66,7 @@ func TestQueue(t *testing.T) {
 	require.Equal(msg1, gotMsg1)
 
 	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.0).Times(1)
-	u.Push(context.Background(), msg1)
+	u.Push(t.Context(), msg1)
 	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
 	require.Equal(1, u.Len())
 	_, gotMsg1, ok = u.Pop()
@@ -73,7 +76,7 @@ func TestQueue(t *testing.T) {
 	require.Equal(msg1, gotMsg1)
 
 	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(1.0).Times(1)
-	u.Push(context.Background(), msg1)
+	u.Push(t.Context(), msg1)
 	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
 	require.Equal(1, u.Len())
 	_, gotMsg1, ok = u.Pop()
@@ -83,7 +86,7 @@ func TestQueue(t *testing.T) {
 	require.Equal(msg1, gotMsg1)
 
 	cpuTracker.EXPECT().Usage(vdr1ID, gomock.Any()).Return(0.0).Times(1)
-	u.Push(context.Background(), msg1)
+	u.Push(t.Context(), msg1)
 	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
 	require.Equal(1, u.Len())
 	_, gotMsg1, ok = u.Pop()
@@ -93,7 +96,7 @@ func TestQueue(t *testing.T) {
 	require.Equal(msg1, gotMsg1)
 
 	// Push msg1 from vdr1ID
-	u.Push(context.Background(), msg1)
+	u.Push(t.Context(), msg1)
 	require.Equal(1, u.nodeToUnprocessedMsgs[vdr1ID])
 	require.Equal(1, u.Len())
 
@@ -105,13 +108,12 @@ func TestQueue(t *testing.T) {
 			ids.GenerateTestID(),
 			0,
 			vdr2ID,
-			engineType,
 		),
-		EngineType: engineType,
+		EngineType: p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
 	}
 
 	// Push msg2 from vdr2ID
-	u.Push(context.Background(), msg2)
+	u.Push(t.Context(), msg2)
 	require.Equal(2, u.Len())
 	require.Equal(1, u.nodeToUnprocessedMsgs[vdr2ID])
 	// Set vdr1's usage to 99% and vdr2's to .01
@@ -132,16 +134,16 @@ func TestQueue(t *testing.T) {
 	// Non-validators should be able to put messages onto [u]
 	nonVdrNodeID1, nonVdrNodeID2 := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
 	msg3 := Message{
-		InboundMessage: message.InboundPullQuery(ids.Empty, 0, 0, ids.Empty, 0, nonVdrNodeID1, engineType),
-		EngineType:     engineType,
+		InboundMessage: message.InboundPullQuery(ids.Empty, 0, 0, ids.Empty, 0, nonVdrNodeID1),
+		EngineType:     p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
 	}
 	msg4 := Message{
-		InboundMessage: message.InboundPushQuery(ids.Empty, 0, 0, nil, 0, nonVdrNodeID2, engineType),
-		EngineType:     engineType,
+		InboundMessage: message.InboundPushQuery(ids.Empty, 0, 0, nil, 0, nonVdrNodeID2),
+		EngineType:     p2p.EngineType_ENGINE_TYPE_UNSPECIFIED,
 	}
-	u.Push(context.Background(), msg3)
-	u.Push(context.Background(), msg4)
-	u.Push(context.Background(), msg1)
+	u.Push(t.Context(), msg3)
+	u.Push(t.Context(), msg4)
+	u.Push(t.Context(), msg1)
 	require.Equal(3, u.Len())
 
 	// msg1 should get popped first because nonVdrNodeID1 and nonVdrNodeID2

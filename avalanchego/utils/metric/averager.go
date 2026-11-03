@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package metric
@@ -23,23 +23,21 @@ type averager struct {
 	sum   prometheus.Gauge
 }
 
-func NewAverager(namespace, name, desc string, reg prometheus.Registerer) (Averager, error) {
+func NewAverager(name, desc string, reg prometheus.Registerer) (Averager, error) {
 	errs := wrappers.Errs{}
-	a := NewAveragerWithErrs(namespace, name, desc, reg, &errs)
+	a := NewAveragerWithErrs(name, desc, reg, &errs)
 	return a, errs.Err
 }
 
-func NewAveragerWithErrs(namespace, name, desc string, reg prometheus.Registerer, errs *wrappers.Errs) Averager {
+func NewAveragerWithErrs(name, desc string, reg prometheus.Registerer, errs *wrappers.Errs) Averager {
 	a := averager{
 		count: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      name + "_count",
-			Help:      "Total # of observations of " + desc,
+			Name: AppendNamespace(name, "count"),
+			Help: "Total # of observations of " + desc,
 		}),
 		sum: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      name + "_sum",
-			Help:      "Sum of " + desc,
+			Name: AppendNamespace(name, "sum"),
+			Help: "Sum of " + desc,
 		}),
 	}
 
@@ -56,11 +54,3 @@ func (a *averager) Observe(v float64) {
 	a.count.Inc()
 	a.sum.Add(v)
 }
-
-type noAverager struct{}
-
-func NewNoAverager() Averager {
-	return noAverager{}
-}
-
-func (noAverager) Observe(float64) {}

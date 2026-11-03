@@ -1,9 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package tracker
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,8 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/utils"
-	"github.com/ava-labs/avalanchego/utils/linkedhashmap"
+	"github.com/ava-labs/avalanchego/utils/linked"
 	"github.com/ava-labs/avalanchego/utils/math/meter"
 	"github.com/ava-labs/avalanchego/utils/resource"
 )
@@ -36,6 +36,7 @@ type Tracker interface {
 type DiskTracker interface {
 	Tracker
 	AvailableDiskBytes() uint64
+	AvailableDiskPercentage() uint64
 }
 
 // ResourceTracker is an interface for tracking peers' usage of resources
@@ -150,6 +151,16 @@ func (t *diskResourceTracker) AvailableDiskBytes() uint64 {
 	return bytesAvailable
 }
 
+func (t *diskResourceTracker) AvailableDiskPercentage() uint64 {
+	rt := t.t
+	rt.lock.Lock()
+	defer rt.lock.Unlock()
+
+	percentageAvailable := rt.resources.AvailableDiskPercentage()
+	rt.metrics.diskPercentageAvailable.Set(float64(percentageAvailable))
+	return percentageAvailable
+}
+
 func (t *diskResourceTracker) TotalUsage() float64 {
 	realReadUsage, _ := t.t.resources.DiskUsage()
 	return realReadUsage
@@ -200,7 +211,7 @@ type resourceTracker struct {
 	// utilized. This doesn't necessarily result in the meters being sorted
 	// based on their usage. However, in practice the nodes that are not being
 	// utilized will move towards the oldest elements where they can be deleted.
-	meters  linkedhashmap.LinkedHashmap[ids.NodeID, meter.Meter]
+	meters  *linked.Hashmap[ids.NodeID, meter.Meter]
 	metrics *trackerMetrics
 }
 
@@ -215,10 +226,10 @@ func NewResourceTracker(
 		resources:       resources,
 		processingMeter: factory.New(halflife),
 		halflife:        halflife,
-		meters:          linkedhashmap.New[ids.NodeID, meter.Meter](),
+		meters:          linked.NewHashmap[ids.NodeID, meter.Meter](),
 	}
 	var err error
-	t.metrics, err = newCPUTrackerMetrics("resource_tracker", reg)
+	t.metrics, err = newCPUTrackerMetrics(reg)
 	if err != nil {
 		return nil, fmt.Errorf("initializing resourceTracker metrics errored with: %w", err)
 	}
@@ -286,47 +297,48 @@ func (rt *resourceTracker) prune(now time.Time) {
 }
 
 type trackerMetrics struct {
-	processingTimeMetric prometheus.Gauge
-	cpuMetric            prometheus.Gauge
-	diskReadsMetric      prometheus.Gauge
-	diskWritesMetric     prometheus.Gauge
-	diskSpaceAvailable   prometheus.Gauge
+	processingTimeMetric    prometheus.Gauge
+	cpuMetric               prometheus.Gauge
+	diskReadsMetric         prometheus.Gauge
+	diskWritesMetric        prometheus.Gauge
+	diskSpaceAvailable      prometheus.Gauge
+	diskPercentageAvailable prometheus.Gauge
 }
 
-func newCPUTrackerMetrics(namespace string, reg prometheus.Registerer) (*trackerMetrics, error) {
+func newCPUTrackerMetrics(reg prometheus.Registerer) (*trackerMetrics, error) {
 	m := &trackerMetrics{
 		processingTimeMetric: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "processing_time",
-			Help:      "Tracked processing time over all nodes. Value expected to be in [0, number of CPU cores], but can go higher due to IO bound processes and thread multiplexing",
+			Name: "processing_time",
+			Help: "Tracked processing time over all nodes. Value expected to be in [0, number of CPU cores], but can go higher due to IO bound processes and thread multiplexing",
 		}),
 		cpuMetric: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "cpu_usage",
-			Help:      "CPU usage tracked by the resource manager. Value should be in [0, number of CPU cores]",
+			Name: "cpu_usage",
+			Help: "CPU usage tracked by the resource manager. Value should be in [0, number of CPU cores]",
 		}),
 		diskReadsMetric: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "disk_reads",
-			Help:      "Disk reads (bytes/sec) tracked by the resource manager",
+			Name: "disk_reads",
+			Help: "Disk reads (bytes/sec) tracked by the resource manager",
 		}),
 		diskWritesMetric: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "disk_writes",
-			Help:      "Disk writes (bytes/sec) tracked by the resource manager",
+			Name: "disk_writes",
+			Help: "Disk writes (bytes/sec) tracked by the resource manager",
 		}),
 		diskSpaceAvailable: prometheus.NewGauge(prometheus.GaugeOpts{
-			Namespace: namespace,
-			Name:      "disk_available_space",
-			Help:      "Available space remaining (bytes) on the database volume",
+			Name: "disk_available_space",
+			Help: "Available space remaining (bytes) on the database volume",
+		}),
+		diskPercentageAvailable: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "disk_available_percentage",
+			Help: "Percentage of database volume available",
 		}),
 	}
-	err := utils.Err(
+	err := errors.Join(
 		reg.Register(m.processingTimeMetric),
 		reg.Register(m.cpuMetric),
 		reg.Register(m.diskReadsMetric),
 		reg.Register(m.diskWritesMetric),
 		reg.Register(m.diskSpaceAvailable),
+		reg.Register(m.diskPercentageAvailable),
 	)
 	return m, err
 }

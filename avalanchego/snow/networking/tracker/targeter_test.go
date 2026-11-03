@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package tracker
@@ -10,6 +10,7 @@ import (
 	"go.uber.org/mock/gomock"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/snow/networking/tracker/trackermock"
 	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/logging"
@@ -26,7 +27,7 @@ func TestNewTargeter(t *testing.T) {
 		MaxNonVdrNodeUsage: 10,
 	}
 	vdrs := validators.NewManager()
-	tracker := NewMockTracker(ctrl)
+	tracker := trackermock.NewTracker(ctrl)
 
 	targeterIntf := NewTargeter(
 		logging.NoLog{},
@@ -53,7 +54,7 @@ func TestTarget(t *testing.T) {
 	require.NoError(t, vdrs.AddStaker(constants.PrimaryNetworkID, vdr, nil, ids.Empty, 1))
 	require.NoError(t, vdrs.AddStaker(constants.PrimaryNetworkID, ids.GenerateTestNodeID(), nil, ids.Empty, totalVdrWeight-vdrWeight))
 
-	tracker := NewMockTracker(ctrl)
+	tracker := trackermock.NewTracker(ctrl)
 	config := &TargeterConfig{
 		VdrAlloc:           20,
 		MaxNonVdrUsage:     10,

@@ -3,9 +3,9 @@
 set -euo pipefail
 
 # e.g.,
-# ./scripts/tests.upgrade.sh                                                # Use default version
-# ./scripts/tests.upgrade.sh 1.10.18                                        # Specify a version
-# AVALANCHEGO_PATH=./path/to/avalanchego ./scripts/tests.upgrade.sh 1.10.18 # Customization of avalanchego path
+# ./scripts/tests.upgrade.sh                                               # Use default version
+# ./scripts/tests.upgrade.sh 1.11.0                                        # Specify a version
+# AVALANCHEGO_PATH=./path/to/avalanchego ./scripts/tests.upgrade.sh 1.11.0 # Customization of avalanchego path
 if ! [[ "$0" =~ scripts/tests.upgrade.sh ]]; then
   echo "must be run from repository root"
   exit 255
@@ -16,9 +16,8 @@ fi
 # local network, this flag must be updated to the last compatible
 # version with the latest code.
 #
-# v1.10.18 includes restrictions on ports sent over the p2p network along with
-# proposervm and P-chain rule changes on the local network.
-DEFAULT_VERSION="1.10.18"
+# v1.14.0 is the earliest version that supports Granite.
+DEFAULT_VERSION="1.14.0"
 
 VERSION="${1:-${DEFAULT_VERSION}}"
 if [[ -z "${VERSION}" ]]; then
@@ -64,16 +63,8 @@ find "/tmp/avalanchego-v${VERSION}"
 source ./scripts/constants.sh
 
 #################################
-echo "building upgrade.test"
-# to install the ginkgo binary (required for test build and run)
-go install -modcacherw -v github.com/onsi/ginkgo/v2/ginkgo@v2.13.1
-ACK_GINKGO_RC=true ginkgo build ./tests/upgrade
-./tests/upgrade/upgrade.test --help
-
-#################################
 # By default, it runs all upgrade test cases!
 echo "running upgrade tests against the local cluster with ${AVALANCHEGO_PATH}"
-./tests/upgrade/upgrade.test \
-  --ginkgo.v \
+./bin/ginkgo -v ./tests/upgrade -- \
   --avalanchego-path="/tmp/avalanchego-v${VERSION}/avalanchego" \
   --avalanchego-path-to-upgrade-to="${AVALANCHEGO_PATH}"

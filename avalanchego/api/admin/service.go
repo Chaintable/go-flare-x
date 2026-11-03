@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package admin
@@ -292,11 +292,11 @@ type GetLoggerLevelArgs struct {
 	LoggerName string `json:"loggerName"`
 }
 
-// GetLogLevel returns the log level and display level of all loggers.
+// GetLoggerLevel returns the log level and display level of all loggers.
 func (a *Admin) GetLoggerLevel(_ *http.Request, args *GetLoggerLevelArgs, reply *LoggerLevelReply) error {
 	a.Log.Debug("API called",
 		zap.String("service", "admin"),
-		zap.String("method", "getLoggerLevels"),
+		zap.String("method", "getLoggerLevel"),
 		logging.UserString("loggerName", args.LoggerName),
 	)
 
@@ -391,7 +391,7 @@ type DBGetReply struct {
 	ErrorCode rpcdbpb.Error `json:"errorCode"`
 }
 
-//nolint:stylecheck // renaming this method to DBGet would change the API method from "dbGet" to "dBGet"
+//nolint:staticcheck // renaming this method to DBGet would change the API method from "dbGet" to "dBGet"
 func (a *Admin) DbGet(_ *http.Request, args *DBGetArgs, reply *DBGetReply) error {
 	a.Log.Debug("API called",
 		zap.String("service", "admin"),

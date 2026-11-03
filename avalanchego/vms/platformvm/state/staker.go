@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package state
@@ -15,21 +15,6 @@ import (
 )
 
 var _ btree.LessFunc[*Staker] = (*Staker).Less
-
-// StakerIterator defines an interface for iterating over a set of stakers.
-type StakerIterator interface {
-	// Next attempts to move the iterator to the next staker. It returns false
-	// once there are no more stakers to return.
-	Next() bool
-
-	// Value returns the current staker. Value should only be called after a
-	// call to Next which returned true.
-	Value() *Staker
-
-	// Release any resources associated with the iterator. This must be called
-	// after the interator is no longer needed.
-	Release()
-}
 
 // Staker contains all information required to represent a validator or
 // delegator in the current and pending validator sets.
@@ -56,6 +41,32 @@ type Staker struct {
 	// [priorities.go] and depends on if the stakers are in the pending or
 	// current validator set.
 	Priority txs.Priority
+}
+
+// Equals returns true if this staker is equal to the provided staker.
+// If s.Less(other) and other.Less(s) are both false, then it doesn't mean that s.Equals(other) is true.
+func (s *Staker) Equals(other *Staker) bool {
+	if s == nil && other == nil {
+		return true
+	}
+
+	if other == nil || s == nil {
+		return false
+	}
+
+	equalPKs := (s.PublicKey == nil && other.PublicKey == nil) ||
+		(s.PublicKey != nil && other.PublicKey != nil && s.PublicKey.Equals(other.PublicKey))
+
+	return s.TxID == other.TxID &&
+		s.NodeID == other.NodeID &&
+		equalPKs &&
+		s.SubnetID == other.SubnetID &&
+		s.Weight == other.Weight &&
+		s.StartTime.Equal(other.StartTime) &&
+		s.EndTime.Equal(other.EndTime) &&
+		s.PotentialReward == other.PotentialReward &&
+		s.NextTime.Equal(other.NextTime) &&
+		s.Priority == other.Priority
 }
 
 // A *Staker is considered to be less than another *Staker when:

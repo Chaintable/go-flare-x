@@ -1,10 +1,9 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package throttling
 
 import (
-	"context"
 	"sync"
 	"testing"
 
@@ -22,7 +21,7 @@ func TestBandwidthThrottler(t *testing.T) {
 		RefillRate:   8,
 		MaxBurstSize: 10,
 	}
-	throttlerIntf, err := newBandwidthThrottler(logging.NoLog{}, "", prometheus.NewRegistry(), config)
+	throttlerIntf, err := newBandwidthThrottler(logging.NoLog{}, prometheus.NewRegistry(), config)
 	require.NoError(err)
 	require.IsType(&bandwidthThrottlerImpl{}, throttlerIntf)
 	throttler := throttlerIntf.(*bandwidthThrottlerImpl)
@@ -46,14 +45,14 @@ func TestBandwidthThrottler(t *testing.T) {
 	require.Len(throttler.limiters, 1)
 
 	// Should be able to acquire 8
-	throttler.Acquire(context.Background(), 8, nodeID1)
+	throttler.Acquire(t.Context(), 8, nodeID1)
 
 	// Make several goroutines that acquire bytes.
 	wg := sync.WaitGroup{}
 	wg.Add(int(config.MaxBurstSize) + 5)
 	for i := uint64(0); i < config.MaxBurstSize+5; i++ {
 		go func() {
-			throttler.Acquire(context.Background(), 1, nodeID1)
+			throttler.Acquire(t.Context(), 1, nodeID1)
 			wg.Done()
 		}()
 	}

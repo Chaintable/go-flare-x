@@ -1,10 +1,11 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package state
 
 import (
 	"github.com/ava-labs/avalanchego/cache"
+	"github.com/ava-labs/avalanchego/cache/lru"
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/database/prefixdb"
 	"github.com/ava-labs/avalanchego/database/versiondb"
@@ -19,8 +20,7 @@ var (
 	heightPrefix   = []byte("height")
 	metadataPrefix = []byte("metadata")
 
-	forkKey       = []byte("fork")
-	checkpointKey = []byte("checkpoint")
+	forkKey = []byte("fork")
 )
 
 type HeightIndexGetter interface {
@@ -40,23 +40,11 @@ type HeightIndexWriter interface {
 	DeleteBlockIDAtHeight(height uint64) error
 }
 
-// A checkpoint is the blockID of the next block to be considered
-// for height indexing. We store checkpoints to be able to duly resume
-// long-running re-indexing ops.
-type HeightIndexBatchSupport interface {
-	versiondb.Commitable
-
-	GetCheckpoint() (ids.ID, error)
-	SetCheckpoint(blkID ids.ID) error
-	DeleteCheckpoint() error
-}
-
 // HeightIndex contains mapping of blockHeights to accepted proposer block IDs
 // along with some metadata (fork height and checkpoint).
 type HeightIndex interface {
 	HeightIndexWriter
 	HeightIndexGetter
-	HeightIndexBatchSupport
 }
 
 type heightIndex struct {
@@ -73,7 +61,7 @@ func NewHeightIndex(db database.Database, commitable versiondb.Commitable) Heigh
 	return &heightIndex{
 		Commitable: commitable,
 
-		heightsCache: &cache.LRU[uint64, ids.ID]{Size: cacheSize},
+		heightsCache: lru.NewCache[uint64, ids.ID](cacheSize),
 		heightDB:     prefixdb.New(heightPrefix, db),
 		metadataDB:   prefixdb.New(metadataPrefix, db),
 	}
@@ -126,16 +114,4 @@ func (hi *heightIndex) GetForkHeight() (uint64, error) {
 
 func (hi *heightIndex) SetForkHeight(height uint64) error {
 	return database.PutUInt64(hi.metadataDB, forkKey, height)
-}
-
-func (hi *heightIndex) GetCheckpoint() (ids.ID, error) {
-	return database.GetID(hi.metadataDB, checkpointKey)
-}
-
-func (hi *heightIndex) SetCheckpoint(blkID ids.ID) error {
-	return database.PutID(hi.metadataDB, checkpointKey, blkID)
-}
-
-func (hi *heightIndex) DeleteCheckpoint() error {
-	return hi.metadataDB.Delete(checkpointKey)
 }

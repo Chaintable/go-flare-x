@@ -1,9 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package secp256k1fx
 
 import (
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -13,7 +14,9 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/cb58"
 	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
+	"github.com/ava-labs/avalanchego/utils/hashing"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/libevm/accounts"
 )
 
 var (
@@ -53,7 +56,7 @@ func init() {
 
 func TestFxInitialize(t *testing.T) {
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	fx := Fx{}
@@ -69,7 +72,7 @@ func TestFxInitializeInvalid(t *testing.T) {
 func TestFxVerifyTransfer(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -104,10 +107,102 @@ func TestFxVerifyTransfer(t *testing.T) {
 	require.NoError(fx.VerifyTransfer(tx, in, cred, out))
 }
 
+// Flare-specific: VerifyCredentials must accept signatures produced over the
+// EIP-191-prefixed hash of the hex-encoded tx hash (fx.go:210-218).
+func TestFxVerifyTransferEthSignature(t *testing.T) {
+	require := require.New(t)
+	vm := TestVM{
+		Codec: linearcodec.NewDefault(),
+		Log:   logging.NoLog{},
+	}
+	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
+	vm.Clk.Set(date)
+	fx := Fx{}
+	require.NoError(fx.Initialize(&vm))
+	require.NoError(fx.Bootstrapping())
+	require.NoError(fx.Bootstrapped())
+
+	key := secp256k1.TestKeys()[0]
+	tx := &TestTx{UnsignedBytes: txBytes}
+
+	txHash := hashing.ComputeHash256(tx.Bytes())
+	txHashEth := accounts.TextHash([]byte(hex.EncodeToString(txHash)))
+	sigSlice, err := key.SignHash(txHashEth)
+	require.NoError(err)
+	var sig [secp256k1.SignatureLen]byte
+	copy(sig[:], sigSlice)
+
+	out := &TransferOutput{
+		Amt: 1,
+		OutputOwners: OutputOwners{
+			Threshold: 1,
+			Addrs:     []ids.ShortID{key.Address()},
+		},
+	}
+	in := &TransferInput{
+		Amt: 1,
+		Input: Input{
+			SigIndices: []uint32{0},
+		},
+	}
+	cred := &Credential{
+		Sigs: [][secp256k1.SignatureLen]byte{sig},
+	}
+
+	require.NoError(fx.VerifyTransfer(tx, in, cred, out))
+}
+
+// Flare-specific: an eth-prefixed signature from the wrong signer must still
+// be rejected — both recovery branches in VerifyCredentials should miss.
+func TestFxVerifyTransferEthSignatureWrongSigner(t *testing.T) {
+	require := require.New(t)
+	vm := TestVM{
+		Codec: linearcodec.NewDefault(),
+		Log:   logging.NoLog{},
+	}
+	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
+	vm.Clk.Set(date)
+	fx := Fx{}
+	require.NoError(fx.Initialize(&vm))
+	require.NoError(fx.Bootstrapping())
+	require.NoError(fx.Bootstrapped())
+
+	keys := secp256k1.TestKeys()
+	signer, expected := keys[0], keys[1]
+	tx := &TestTx{UnsignedBytes: txBytes}
+
+	txHash := hashing.ComputeHash256(tx.Bytes())
+	txHashEth := accounts.TextHash([]byte(hex.EncodeToString(txHash)))
+	sigSlice, err := signer.SignHash(txHashEth)
+	require.NoError(err)
+	var sig [secp256k1.SignatureLen]byte
+	copy(sig[:], sigSlice)
+
+	out := &TransferOutput{
+		Amt: 1,
+		OutputOwners: OutputOwners{
+			Threshold: 1,
+			Addrs:     []ids.ShortID{expected.Address()},
+		},
+	}
+	in := &TransferInput{
+		Amt: 1,
+		Input: Input{
+			SigIndices: []uint32{0},
+		},
+	}
+	cred := &Credential{
+		Sigs: [][secp256k1.SignatureLen]byte{sig},
+	}
+
+	err = fx.VerifyTransfer(tx, in, cred, out)
+	require.ErrorIs(err, ErrWrongSig)
+}
+
 func TestFxVerifyTransferNilTx(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -143,7 +238,7 @@ func TestFxVerifyTransferNilTx(t *testing.T) {
 func TestFxVerifyTransferNilOutput(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -170,7 +265,7 @@ func TestFxVerifyTransferNilOutput(t *testing.T) {
 func TestFxVerifyTransferNilInput(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -201,7 +296,7 @@ func TestFxVerifyTransferNilInput(t *testing.T) {
 func TestFxVerifyTransferNilCredential(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -233,7 +328,7 @@ func TestFxVerifyTransferNilCredential(t *testing.T) {
 func TestFxVerifyTransferInvalidOutput(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -270,7 +365,7 @@ func TestFxVerifyTransferInvalidOutput(t *testing.T) {
 func TestFxVerifyTransferWrongAmounts(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -307,7 +402,7 @@ func TestFxVerifyTransferWrongAmounts(t *testing.T) {
 func TestFxVerifyTransferTimelocked(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -344,7 +439,7 @@ func TestFxVerifyTransferTimelocked(t *testing.T) {
 func TestFxVerifyTransferTooManySigners(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -382,7 +477,7 @@ func TestFxVerifyTransferTooManySigners(t *testing.T) {
 func TestFxVerifyTransferTooFewSigners(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -417,7 +512,7 @@ func TestFxVerifyTransferTooFewSigners(t *testing.T) {
 func TestFxVerifyTransferMismatchedSigners(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -455,7 +550,7 @@ func TestFxVerifyTransferMismatchedSigners(t *testing.T) {
 func TestFxVerifyTransferInvalidSignature(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -495,7 +590,7 @@ func TestFxVerifyTransferInvalidSignature(t *testing.T) {
 func TestFxVerifyTransferWrongSigner(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -535,7 +630,7 @@ func TestFxVerifyTransferWrongSigner(t *testing.T) {
 func TestFxVerifyTransferSigIndexOOB(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -575,7 +670,7 @@ func TestFxVerifyTransferSigIndexOOB(t *testing.T) {
 func TestFxVerifyOperation(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -627,7 +722,7 @@ func TestFxVerifyOperation(t *testing.T) {
 func TestFxVerifyOperationUnknownTx(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -679,7 +774,7 @@ func TestFxVerifyOperationUnknownTx(t *testing.T) {
 func TestFxVerifyOperationUnknownOperation(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -709,7 +804,7 @@ func TestFxVerifyOperationUnknownOperation(t *testing.T) {
 func TestFxVerifyOperationUnknownCredential(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -757,7 +852,7 @@ func TestFxVerifyOperationUnknownCredential(t *testing.T) {
 func TestFxVerifyOperationWrongNumberOfUTXOs(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -810,7 +905,7 @@ func TestFxVerifyOperationWrongNumberOfUTXOs(t *testing.T) {
 func TestFxVerifyOperationUnknownUTXOType(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -855,7 +950,7 @@ func TestFxVerifyOperationUnknownUTXOType(t *testing.T) {
 func TestFxVerifyOperationInvalidOperationVerify(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -905,7 +1000,7 @@ func TestFxVerifyOperationInvalidOperationVerify(t *testing.T) {
 func TestFxVerifyOperationMismatchedMintOutputs(t *testing.T) {
 	require := require.New(t)
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	date := time.Date(2019, time.January, 19, 16, 25, 17, 3, time.UTC)
@@ -952,7 +1047,7 @@ func TestFxVerifyOperationMismatchedMintOutputs(t *testing.T) {
 
 func TestVerifyPermission(t *testing.T) {
 	vm := TestVM{
-		Codec: linearcodec.NewDefault(time.Time{}),
+		Codec: linearcodec.NewDefault(),
 		Log:   logging.NoLog{},
 	}
 	fx := Fx{}

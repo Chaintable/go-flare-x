@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package snowball
@@ -28,17 +28,6 @@ type Flat struct {
 
 func (f *Flat) RecordPoll(votes bag.Bag[ids.ID]) bool {
 	pollMode, numVotes := votes.Mode()
-	switch {
-	// AlphaConfidence is guaranteed to be >= AlphaPreference, so we must check
-	// if the poll had enough votes to increase the confidence first.
-	case numVotes >= f.params.AlphaConfidence:
-		f.RecordSuccessfulPoll(pollMode)
-		return true
-	case numVotes >= f.params.AlphaPreference:
-		f.RecordPollPreference(pollMode)
-		return true
-	default:
-		f.RecordUnsuccessfulPoll()
-		return false
-	}
+	f.Nnary.RecordPoll(numVotes, pollMode)
+	return numVotes >= f.params.AlphaPreference
 }

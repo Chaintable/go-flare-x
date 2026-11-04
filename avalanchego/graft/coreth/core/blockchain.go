@@ -1253,7 +1253,7 @@ func (bc *BlockChain) writeBlockAndSetHead(block *types.Block, parentRoot common
 		// Only attempt to publish a block change notification once the pusher
 		// has a known last-pushed block (otherwise we have no ancestor to diff
 		// against, e.g. during early bootstrap before Kafka has any notices).
-		if tracer.NodeXPusher != nil && !tracer.NodeXPusher.IsBackup && lastPushBlock != nil && lastPushBlock.BlockNumber <= block.NumberU64() {
+		if tracer.NodeXPusher != nil && lastPushBlock != nil && lastPushBlock.BlockNumber <= block.NumberU64() {
 			_, dropBlocks, newBlocks := bc.getCommonAncestor(*lastPushBlock, ptypes.BlockContext{
 				BlockNumber: block.NumberU64(),
 				Hash:        block.Hash(),
@@ -2316,7 +2316,11 @@ func (bc *BlockChain) GetHeaderByHash2(blockHash common.Hash) *types.Header {
 	if header == nil {
 		if tracer.NodeXPusher != nil {
 			header := &types.Header{}
-			err := util.DownloadFileFromS3Json(tracer.NodeXPusher.Uploader, tracer.NodeXPusher.Bucket, fmt.Sprintf("%s/%s/block", tracer.BizChainID, blockHash.String()), header)
+			key := fmt.Sprintf("%s/%s/block", tracer.BizChainID, blockHash.String())
+			if tracer.Version != "" {
+				key = fmt.Sprintf("%s/%s/%s/block", tracer.BizChainID, tracer.Version, blockHash.String())
+			}
+			err := util.DownloadFileFromS3Json(tracer.NodeXPusher.Uploader, tracer.NodeXPusher.Bucket, key, header)
 			if err != nil {
 				log.Error("GetHeaderByHash2 DownloadFileFromS3Json error", "err", err)
 				return nil

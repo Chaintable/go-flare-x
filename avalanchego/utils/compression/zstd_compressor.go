@@ -1,10 +1,11 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package compression
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -12,9 +13,19 @@ import (
 	"github.com/DataDog/zstd"
 )
 
-var _ Compressor = (*zstdCompressor)(nil)
+var (
+	_ Compressor = (*zstdCompressor)(nil)
+
+	ErrInvalidMaxSizeCompressor = errors.New("invalid compressor max size")
+	ErrDecompressedMsgTooLarge  = errors.New("decompressed msg too large")
+	ErrMsgTooLarge              = errors.New("msg too large to be compressed")
+)
 
 func NewZstdCompressor(maxSize int64) (Compressor, error) {
+	return NewZstdCompressorWithLevel(maxSize, zstd.DefaultCompression)
+}
+
+func NewZstdCompressorWithLevel(maxSize int64, level int) (Compressor, error) {
 	if maxSize == math.MaxInt64 {
 		// "Decompress" creates "io.LimitReader" with max size + 1:
 		// if the max size + 1 overflows, "io.LimitReader" reads nothing
@@ -22,21 +33,22 @@ func NewZstdCompressor(maxSize int64) (Compressor, error) {
 		// require max size < math.MaxInt64 to prevent int64 overflows
 		return nil, ErrInvalidMaxSizeCompressor
 	}
-
 	return &zstdCompressor{
 		maxSize: maxSize,
+		level:   level,
 	}, nil
 }
 
 type zstdCompressor struct {
 	maxSize int64
+	level   int
 }
 
 func (z *zstdCompressor) Compress(msg []byte) ([]byte, error) {
 	if int64(len(msg)) > z.maxSize {
 		return nil, fmt.Errorf("%w: (%d) > (%d)", ErrMsgTooLarge, len(msg), z.maxSize)
 	}
-	return zstd.Compress(nil, msg)
+	return zstd.CompressLevel(nil, msg, z.level)
 }
 
 func (z *zstdCompressor) Decompress(msg []byte) ([]byte, error) {

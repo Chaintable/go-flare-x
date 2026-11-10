@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package throttling
@@ -17,21 +17,21 @@ import (
 // Test inboundMsgBufferThrottler
 func TestMsgBufferThrottler(t *testing.T) {
 	require := require.New(t)
-	throttler, err := newInboundMsgBufferThrottler("", prometheus.NewRegistry(), 3)
+	throttler, err := newInboundMsgBufferThrottler(prometheus.NewRegistry(), 3)
 	require.NoError(err)
 
 	nodeID1, nodeID2 := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
 	// Acquire shouldn't block for first 3
-	throttler.Acquire(context.Background(), nodeID1)
-	throttler.Acquire(context.Background(), nodeID1)
-	throttler.Acquire(context.Background(), nodeID1)
+	throttler.Acquire(t.Context(), nodeID1)
+	throttler.Acquire(t.Context(), nodeID1)
+	throttler.Acquire(t.Context(), nodeID1)
 	require.Len(throttler.nodeToNumProcessingMsgs, 1)
 	require.Equal(uint64(3), throttler.nodeToNumProcessingMsgs[nodeID1])
 
 	// Acquire shouldn't block for other node
-	throttler.Acquire(context.Background(), nodeID2)
-	throttler.Acquire(context.Background(), nodeID2)
-	throttler.Acquire(context.Background(), nodeID2)
+	throttler.Acquire(t.Context(), nodeID2)
+	throttler.Acquire(t.Context(), nodeID2)
+	throttler.Acquire(t.Context(), nodeID2)
 	require.Len(throttler.nodeToNumProcessingMsgs, 2)
 	require.Equal(uint64(3), throttler.nodeToNumProcessingMsgs[nodeID1])
 	require.Equal(uint64(3), throttler.nodeToNumProcessingMsgs[nodeID2])
@@ -39,7 +39,7 @@ func TestMsgBufferThrottler(t *testing.T) {
 	// Acquire should block for 4th acquire
 	done := make(chan struct{})
 	go func() {
-		throttler.Acquire(context.Background(), nodeID1)
+		throttler.Acquire(t.Context(), nodeID1)
 		done <- struct{}{}
 	}()
 	select {
@@ -69,10 +69,10 @@ func TestMsgBufferThrottler(t *testing.T) {
 // Test inboundMsgBufferThrottler when an acquire is cancelled
 func TestMsgBufferThrottlerContextCancelled(t *testing.T) {
 	require := require.New(t)
-	throttler, err := newInboundMsgBufferThrottler("", prometheus.NewRegistry(), 3)
+	throttler, err := newInboundMsgBufferThrottler(prometheus.NewRegistry(), 3)
 	require.NoError(err)
 
-	vdr1Context, vdr1ContextCancelFunc := context.WithCancel(context.Background())
+	vdr1Context, vdr1ContextCancelFunc := context.WithCancel(t.Context())
 	nodeID1 := ids.GenerateTestNodeID()
 	// Acquire shouldn't block for first 3
 	throttler.Acquire(vdr1Context, nodeID1)

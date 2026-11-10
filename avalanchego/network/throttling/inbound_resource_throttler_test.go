@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package throttling
@@ -14,6 +14,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/networking/tracker"
+	"github.com/ava-labs/avalanchego/snow/networking/tracker/trackermock"
 	"github.com/ava-labs/avalanchego/utils/math/meter"
 	"github.com/ava-labs/avalanchego/utils/resource"
 	"github.com/ava-labs/avalanchego/utils/timer/mockable"
@@ -33,7 +34,7 @@ func TestNewSystemThrottler(t *testing.T) {
 		Clock:           clock,
 		MaxRecheckDelay: time.Second,
 	}
-	targeter := tracker.NewMockTargeter(ctrl)
+	targeter := trackermock.NewTargeter(ctrl)
 	throttlerIntf, err := NewSystemThrottler("", reg, config, cpuTracker, targeter)
 	require.NoError(err)
 	require.IsType(&systemThrottler{}, throttlerIntf)
@@ -49,13 +50,13 @@ func TestSystemThrottler(t *testing.T) {
 	require := require.New(t)
 
 	// Setup
-	mockTracker := tracker.NewMockTracker(ctrl)
+	mockTracker := trackermock.NewTracker(ctrl)
 	maxRecheckDelay := 100 * time.Millisecond
 	config := SystemThrottlerConfig{
 		MaxRecheckDelay: maxRecheckDelay,
 	}
 	vdrID, nonVdrID := ids.GenerateTestNodeID(), ids.GenerateTestNodeID()
-	targeter := tracker.NewMockTargeter(ctrl)
+	targeter := trackermock.NewTargeter(ctrl)
 	throttler, err := NewSystemThrottler("", prometheus.NewRegistry(), config, mockTracker, targeter)
 	require.NoError(err)
 
@@ -64,12 +65,12 @@ func TestSystemThrottler(t *testing.T) {
 	targeter.EXPECT().TargetUsage(vdrID).Return(1.0).Times(1)
 	mockTracker.EXPECT().Usage(vdrID, gomock.Any()).Return(0.9).Times(1)
 
-	throttler.Acquire(context.Background(), vdrID)
+	throttler.Acquire(t.Context(), vdrID)
 
 	targeter.EXPECT().TargetUsage(nonVdrID).Return(1.0).Times(1)
 	mockTracker.EXPECT().Usage(nonVdrID, gomock.Any()).Return(0.9).Times(1)
 
-	throttler.Acquire(context.Background(), nonVdrID)
+	throttler.Acquire(t.Context(), nonVdrID)
 
 	// Case: Actual usage > target usage; we should wait.
 	// In the first loop iteration inside acquire,
@@ -89,7 +90,7 @@ func TestSystemThrottler(t *testing.T) {
 
 	// Check for validator
 	go func() {
-		throttler.Acquire(context.Background(), vdrID)
+		throttler.Acquire(t.Context(), vdrID)
 		onAcquire <- struct{}{}
 	}()
 	// Make sure the min re-check frequency is honored
@@ -112,7 +113,7 @@ func TestSystemThrottler(t *testing.T) {
 
 	// Check for non-validator
 	go func() {
-		throttler.Acquire(context.Background(), nonVdrID)
+		throttler.Acquire(t.Context(), nonVdrID)
 		onAcquire <- struct{}{}
 	}()
 	// Make sure the min re-check frequency is honored
@@ -131,13 +132,13 @@ func TestSystemThrottlerContextCancel(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	// Setup
-	mockTracker := tracker.NewMockTracker(ctrl)
+	mockTracker := trackermock.NewTracker(ctrl)
 	maxRecheckDelay := 10 * time.Second
 	config := SystemThrottlerConfig{
 		MaxRecheckDelay: maxRecheckDelay,
 	}
 	vdrID := ids.GenerateTestNodeID()
-	targeter := tracker.NewMockTargeter(ctrl)
+	targeter := trackermock.NewTargeter(ctrl)
 	throttler, err := NewSystemThrottler("", prometheus.NewRegistry(), config, mockTracker, targeter)
 	require.NoError(err)
 
@@ -150,7 +151,7 @@ func TestSystemThrottlerContextCancel(t *testing.T) {
 	mockTracker.EXPECT().TimeUntilUsage(vdrID, gomock.Any(), gomock.Any()).Return(maxRecheckDelay).Times(1)
 	onAcquire := make(chan struct{})
 	// Pass a canceled context into Acquire so that it returns immediately.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	go func() {
 		throttler.Acquire(ctx, vdrID)

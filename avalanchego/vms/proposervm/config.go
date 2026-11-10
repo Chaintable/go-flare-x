@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package proposervm
@@ -7,18 +7,14 @@ import (
 	"crypto"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/ava-labs/avalanchego/staking"
+	"github.com/ava-labs/avalanchego/upgrade"
 )
 
 type Config struct {
-	// Time at which proposerVM activates its congestion control mechanism
-	ActivationTime time.Time
-
-	// Durango fork activation time
-	DurangoTime time.Time
-
-	// Minimal P-chain height referenced upon block building
-	MinimumPChainHeight uint64
+	Upgrades upgrade.Config
 
 	// Configurable minimal delay among blocks issued consecutively
 	MinBlkDelay time.Duration
@@ -32,8 +28,7 @@ type Config struct {
 
 	// Block certificate
 	StakingCertLeaf *staking.Certificate
-}
 
-func (c *Config) IsDurangoActivated(timestamp time.Time) bool {
-	return !timestamp.Before(c.DurangoTime)
+	// Registerer for prometheus metrics
+	Registerer prometheus.Registerer
 }

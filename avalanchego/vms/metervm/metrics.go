@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package metervm
@@ -10,9 +10,8 @@ import (
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 )
 
-func newAverager(namespace, name string, reg prometheus.Registerer, errs *wrappers.Errs) metric.Averager {
+func newAverager(name string, reg prometheus.Registerer, errs *wrappers.Errs) metric.Averager {
 	return metric.NewAveragerWithErrs(
-		namespace,
 		name,
 		"time (in ns) of a "+name,
 		reg,

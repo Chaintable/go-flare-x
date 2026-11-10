@@ -1,11 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package executor
 
 import (
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -38,8 +37,6 @@ func TestBaseTxExecutor(t *testing.T) {
 
 	secpFx := &secp256k1fx.Fx{}
 	parser, err := block.NewParser(
-		time.Time{},
-		time.Time{},
 		[]fxs.Fx{secpFx},
 	)
 	require.NoError(err)
@@ -147,8 +144,6 @@ func TestCreateAssetTxExecutor(t *testing.T) {
 
 	secpFx := &secp256k1fx.Fx{}
 	parser, err := block.NewParser(
-		time.Time{},
-		time.Time{},
 		[]fxs.Fx{secpFx},
 	)
 	require.NoError(err)
@@ -294,8 +289,6 @@ func TestOperationTxExecutor(t *testing.T) {
 
 	secpFx := &secp256k1fx.Fx{}
 	parser, err := block.NewParser(
-		time.Time{},
-		time.Time{},
 		[]fxs.Fx{secpFx},
 	)
 	require.NoError(err)

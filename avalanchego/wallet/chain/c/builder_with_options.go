@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package c
@@ -6,13 +6,12 @@ package c
 import (
 	"math/big"
 
-	"github.com/ava-labs/coreth/plugin/evm"
-
+	"github.com/ava-labs/avalanchego/graft/coreth/plugin/evm/atomic"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 	"github.com/ava-labs/avalanchego/wallet/subnet/primary/common"
 
-	ethcommon "github.com/ethereum/go-ethereum/common"
+	ethcommon "github.com/ava-labs/libevm/common"
 )
 
 var _ Builder = (*builderWithOptions)(nil)
@@ -59,7 +58,7 @@ func (b *builderWithOptions) NewImportTx(
 	to ethcommon.Address,
 	baseFee *big.Int,
 	options ...common.Option,
-) (*evm.UnsignedImportTx, error) {
+) (*atomic.UnsignedImportTx, error) {
 	return b.Builder.NewImportTx(
 		chainID,
 		to,
@@ -73,7 +72,7 @@ func (b *builderWithOptions) NewExportTx(
 	outputs []*secp256k1fx.TransferOutput,
 	baseFee *big.Int,
 	options ...common.Option,
-) (*evm.UnsignedExportTx, error) {
+) (*atomic.UnsignedExportTx, error) {
 	return b.Builder.NewExportTx(
 		chainID,
 		outputs,

@@ -1,49 +1,56 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package metervm
 
 import (
 	"context"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/ava-labs/avalanchego/api/metrics"
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/snow/engine/snowman/block"
-	"github.com/ava-labs/avalanchego/utils/timer/mockable"
 )
 
 var (
-	_ block.ChainVM                      = (*blockVM)(nil)
-	_ block.BuildBlockWithContextChainVM = (*blockVM)(nil)
-	_ block.BatchedChainVM               = (*blockVM)(nil)
-	_ block.StateSyncableVM              = (*blockVM)(nil)
+	_ block.ChainVM                         = (*blockVM)(nil)
+	_ block.BuildBlockWithContextChainVM    = (*blockVM)(nil)
+	_ block.SetPreferenceWithContextChainVM = (*blockVM)(nil)
+	_ block.BatchedChainVM                  = (*blockVM)(nil)
+	_ block.StateSyncableVM                 = (*blockVM)(nil)
 )
 
 type blockVM struct {
 	block.ChainVM
-	buildBlockVM block.BuildBlockWithContextChainVM
-	batchedVM    block.BatchedChainVM
-	ssVM         block.StateSyncableVM
+	buildBlockVM    block.BuildBlockWithContextChainVM
+	setPreferenceVM block.SetPreferenceWithContextChainVM
+	batchedVM       block.BatchedChainVM
+	ssVM            block.StateSyncableVM
 
 	blockMetrics
-	clock mockable.Clock
+	registry prometheus.Registerer
 }
 
-func NewBlockVM(vm block.ChainVM) block.ChainVM {
+func NewBlockVM(
+	vm block.ChainVM,
+	reg prometheus.Registerer,
+) block.ChainVM {
 	buildBlockVM, _ := vm.(block.BuildBlockWithContextChainVM)
+	setPreferenceVM, _ := vm.(block.SetPreferenceWithContextChainVM)
 	batchedVM, _ := vm.(block.BatchedChainVM)
 	ssVM, _ := vm.(block.StateSyncableVM)
 	return &blockVM{
-		ChainVM:      vm,
-		buildBlockVM: buildBlockVM,
-		batchedVM:    batchedVM,
-		ssVM:         ssVM,
+		ChainVM:         vm,
+		buildBlockVM:    buildBlockVM,
+		setPreferenceVM: setPreferenceVM,
+		batchedVM:       batchedVM,
+		ssVM:            ssVM,
+		registry:        reg,
 	}
 }
 
@@ -54,43 +61,27 @@ func (vm *blockVM) Initialize(
 	genesisBytes,
 	upgradeBytes,
 	configBytes []byte,
-	toEngine chan<- common.Message,
 	fxs []*common.Fx,
 	appSender common.AppSender,
 ) error {
-	registerer := prometheus.NewRegistry()
 	err := vm.blockMetrics.Initialize(
 		vm.buildBlockVM != nil,
+		vm.setPreferenceVM != nil,
 		vm.batchedVM != nil,
 		vm.ssVM != nil,
-		"",
-		registerer,
+		vm.registry,
 	)
 	if err != nil {
 		return err
 	}
 
-	optionalGatherer := metrics.NewOptionalGatherer()
-	multiGatherer := metrics.NewMultiGatherer()
-	if err := multiGatherer.Register("metervm", registerer); err != nil {
-		return err
-	}
-	if err := multiGatherer.Register("", optionalGatherer); err != nil {
-		return err
-	}
-	if err := chainCtx.Metrics.Register(multiGatherer); err != nil {
-		return err
-	}
-	chainCtx.Metrics = optionalGatherer
-
-	return vm.ChainVM.Initialize(ctx, chainCtx, db, genesisBytes, upgradeBytes, configBytes, toEngine, fxs, appSender)
+	return vm.ChainVM.Initialize(ctx, chainCtx, db, genesisBytes, upgradeBytes, configBytes, fxs, appSender)
 }
 
 func (vm *blockVM) BuildBlock(ctx context.Context) (snowman.Block, error) {
-	start := vm.clock.Time()
+	start := time.Now()
 	blk, err := vm.ChainVM.BuildBlock(ctx)
-	end := vm.clock.Time()
-	duration := float64(end.Sub(start))
+	duration := float64(time.Since(start))
 	if err != nil {
 		vm.blockMetrics.buildBlockErr.Observe(duration)
 		return nil, err
@@ -103,10 +94,9 @@ func (vm *blockVM) BuildBlock(ctx context.Context) (snowman.Block, error) {
 }
 
 func (vm *blockVM) ParseBlock(ctx context.Context, b []byte) (snowman.Block, error) {
-	start := vm.clock.Time()
+	start := time.Now()
 	blk, err := vm.ChainVM.ParseBlock(ctx, b)
-	end := vm.clock.Time()
-	duration := float64(end.Sub(start))
+	duration := float64(time.Since(start))
 	if err != nil {
 		vm.blockMetrics.parseBlockErr.Observe(duration)
 		return nil, err
@@ -119,10 +109,9 @@ func (vm *blockVM) ParseBlock(ctx context.Context, b []byte) (snowman.Block, err
 }
 
 func (vm *blockVM) GetBlock(ctx context.Context, id ids.ID) (snowman.Block, error) {
-	start := vm.clock.Time()
+	start := time.Now()
 	blk, err := vm.ChainVM.GetBlock(ctx, id)
-	end := vm.clock.Time()
-	duration := float64(end.Sub(start))
+	duration := float64(time.Since(start))
 	if err != nil {
 		vm.blockMetrics.getBlockErr.Observe(duration)
 		return nil, err
@@ -135,33 +124,22 @@ func (vm *blockVM) GetBlock(ctx context.Context, id ids.ID) (snowman.Block, erro
 }
 
 func (vm *blockVM) SetPreference(ctx context.Context, id ids.ID) error {
-	start := vm.clock.Time()
+	start := time.Now()
 	err := vm.ChainVM.SetPreference(ctx, id)
-	end := vm.clock.Time()
-	vm.blockMetrics.setPreference.Observe(float64(end.Sub(start)))
+	vm.blockMetrics.setPreference.Observe(float64(time.Since(start)))
 	return err
 }
 
 func (vm *blockVM) LastAccepted(ctx context.Context) (ids.ID, error) {
-	start := vm.clock.Time()
+	start := time.Now()
 	lastAcceptedID, err := vm.ChainVM.LastAccepted(ctx)
-	end := vm.clock.Time()
-	vm.blockMetrics.lastAccepted.Observe(float64(end.Sub(start)))
+	vm.blockMetrics.lastAccepted.Observe(float64(time.Since(start)))
 	return lastAcceptedID, err
 }
 
-func (vm *blockVM) VerifyHeightIndex(ctx context.Context) error {
-	start := vm.clock.Time()
-	err := vm.ChainVM.VerifyHeightIndex(ctx)
-	end := vm.clock.Time()
-	vm.blockMetrics.verifyHeightIndex.Observe(float64(end.Sub(start)))
-	return err
-}
-
 func (vm *blockVM) GetBlockIDAtHeight(ctx context.Context, height uint64) (ids.ID, error) {
-	start := vm.clock.Time()
+	start := time.Now()
 	blockID, err := vm.ChainVM.GetBlockIDAtHeight(ctx, height)
-	end := vm.clock.Time()
-	vm.blockMetrics.getBlockIDAtHeight.Observe(float64(end.Sub(start)))
+	vm.blockMetrics.getBlockIDAtHeight.Observe(float64(time.Since(start)))
 	return blockID, err
 }

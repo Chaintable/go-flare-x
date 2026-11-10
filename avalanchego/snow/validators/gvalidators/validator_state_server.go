@@ -1,10 +1,11 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package gvalidators
 
 import (
 	"context"
+	"math/big"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -48,6 +49,34 @@ func (s *Server) GetSubnetID(ctx context.Context, req *pb.GetSubnetIDRequest) (*
 	}, err
 }
 
+func (s *Server) GetWarpValidatorSets(ctx context.Context, req *pb.GetWarpValidatorSetsRequest) (*pb.GetWarpValidatorSetsResponse, error) {
+	validatorSets, err := s.state.GetWarpValidatorSets(ctx, req.Height)
+	if err != nil {
+		return nil, err
+	}
+
+	proto := make([]*pb.WarpValidatorSet, 0, len(validatorSets))
+	for subnetID, vdrs := range validatorSets {
+		proto = append(proto, &pb.WarpValidatorSet{
+			SubnetId:    subnetID[:],
+			TotalWeight: totalWeightBytes(vdrs.TotalWeight),
+			Validators:  warpValidatorsToProto(vdrs.Validators),
+		})
+	}
+	return &pb.GetWarpValidatorSetsResponse{
+		ValidatorSets: proto,
+	}, nil
+}
+
+// totalWeightBytes encodes a *big.Int total weight for the proto wire,
+// treating nil as zero (empty bytes).
+func totalWeightBytes(w *big.Int) []byte {
+	if w == nil {
+		return nil
+	}
+	return w.Bytes()
+}
+
 func (s *Server) GetValidatorSet(ctx context.Context, req *pb.GetValidatorSetRequest) (*pb.GetValidatorSetResponse, error) {
 	subnetID, err := ids.ToID(req.SubnetId)
 	if err != nil {
@@ -70,12 +99,68 @@ func (s *Server) GetValidatorSet(ctx context.Context, req *pb.GetValidatorSetReq
 			Weight: vdr.Weight,
 		}
 		if vdr.PublicKey != nil {
-			// This is a performance optimization to avoid the cost of compression
-			// from PublicKeyToBytes.
-			vdrPB.PublicKey = bls.SerializePublicKey(vdr.PublicKey)
+			// Passing in the uncompressed bytes is a performance optimization
+			// to avoid the cost of calling PublicKeyFromCompressedBytes on the
+			// client side.
+			vdrPB.PublicKey = bls.PublicKeyToUncompressedBytes(vdr.PublicKey)
 		}
 		resp.Validators[i] = vdrPB
 		i++
 	}
 	return resp, nil
+}
+
+func (s *Server) GetCurrentValidatorSet(ctx context.Context, req *pb.GetCurrentValidatorSetRequest) (*pb.GetCurrentValidatorSetResponse, error) {
+	subnetID, err := ids.ToID(req.SubnetId)
+	if err != nil {
+		return nil, err
+	}
+
+	vdrs, currentHeight, err := s.state.GetCurrentValidatorSet(ctx, subnetID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &pb.GetCurrentValidatorSetResponse{
+		Validators:    make([]*pb.Validator, len(vdrs)),
+		CurrentHeight: currentHeight,
+	}
+
+	i := 0
+	for _, vdr := range vdrs {
+		vdrPB := &pb.Validator{
+			NodeId:        vdr.NodeID.Bytes(),
+			StartTime:     vdr.StartTime,
+			IsActive:      vdr.IsActive,
+			ValidationId:  vdr.ValidationID[:],
+			Weight:        vdr.Weight,
+			MinNonce:      vdr.MinNonce,
+			IsL1Validator: vdr.IsL1Validator,
+		}
+		if vdr.PublicKey != nil {
+			// Passing in the uncompressed bytes is a performance optimization
+			// to avoid the cost of calling PublicKeyFromCompressedBytes on the
+			// client side.
+			vdrPB.PublicKey = bls.PublicKeyToUncompressedBytes(vdr.PublicKey)
+		}
+		resp.Validators[i] = vdrPB
+		i++
+	}
+	return resp, nil
+}
+
+func warpValidatorsToProto(vdrs []*validators.Warp) []*pb.WarpValidator {
+	proto := make([]*pb.WarpValidator, len(vdrs))
+	for i, vdr := range vdrs {
+		nodeIDs := make([][]byte, len(vdr.NodeIDs))
+		for j, nodeID := range vdr.NodeIDs {
+			nodeIDs[j] = nodeID.Bytes()
+		}
+		proto[i] = &pb.WarpValidator{
+			PublicKey: vdr.PublicKeyBytes,
+			Weight:    vdr.Weight,
+			NodeIds:   nodeIDs,
+		}
+	}
+	return proto
 }

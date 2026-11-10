@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package staking
@@ -21,11 +21,18 @@ func TestMakeKeys(t *testing.T) {
 	cert, err := NewTLSCert()
 	require.NoError(err)
 
-	msg := []byte(fmt.Sprintf("msg %d", time.Now().Unix()))
+	msg := fmt.Appendf(nil, "msg %d", time.Now().Unix())
 	msgHash := hashing.ComputeHash256(msg)
 
 	sig, err := cert.PrivateKey.(crypto.Signer).Sign(rand.Reader, msgHash, crypto.SHA256)
 	require.NoError(err)
 
 	require.NoError(cert.Leaf.CheckSignature(cert.Leaf.SignatureAlgorithm, msg, sig))
+}
+
+func BenchmarkNewCertAndKeyBytes(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, _, err := NewCertAndKeyBytes()
+		require.NoError(b, err)
+	}
 }

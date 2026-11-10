@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package api
@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/constants"
@@ -16,75 +17,30 @@ import (
 	"github.com/ava-labs/avalanchego/vms/platformvm/warp"
 )
 
-// Client defines the xsvm API client.
-type Client interface {
-	Network(
-		ctx context.Context,
-		options ...rpc.Option,
-	) (uint32, ids.ID, ids.ID, error)
-	Genesis(
-		ctx context.Context,
-		options ...rpc.Option,
-	) (*genesis.Genesis, error)
-	Nonce(
-		ctx context.Context,
-		address ids.ShortID,
-		options ...rpc.Option,
-	) (uint64, error)
-	Balance(
-		ctx context.Context,
-		address ids.ShortID,
-		assetID ids.ID,
-		options ...rpc.Option,
-	) (uint64, error)
-	Loan(
-		ctx context.Context,
-		chainID ids.ID,
-		options ...rpc.Option,
-	) (uint64, error)
-	IssueTx(
-		ctx context.Context,
-		tx *tx.Tx,
-		options ...rpc.Option,
-	) (ids.ID, error)
-	LastAccepted(
-		ctx context.Context,
-		options ...rpc.Option,
-	) (ids.ID, *block.Stateless, error)
-	Block(
-		ctx context.Context,
-		blkID ids.ID,
-		options ...rpc.Option,
-	) (*block.Stateless, error)
-	Message(
-		ctx context.Context,
-		txID ids.ID,
-		options ...rpc.Option,
-	) (*warp.UnsignedMessage, []byte, error)
-}
+const DefaultPollingInterval = 50 * time.Millisecond
 
-func NewClient(uri, chain string) Client {
+func NewClient(uri, chain string) *Client {
 	path := fmt.Sprintf(
 		"%s/ext/%s/%s",
 		uri,
 		constants.ChainAliasPrefix,
 		chain,
 	)
-	return &client{
-		req: rpc.NewEndpointRequester(path),
+	return &Client{
+		Req: rpc.NewEndpointRequester(path),
 	}
 }
 
-type client struct {
-	req rpc.EndpointRequester
+type Client struct {
+	Req rpc.EndpointRequester
 }
 
-func (c *client) Network(
+func (c *Client) Network(
 	ctx context.Context,
 	options ...rpc.Option,
 ) (uint32, ids.ID, ids.ID, error) {
 	resp := new(NetworkReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.network",
 		nil,
@@ -94,12 +50,12 @@ func (c *client) Network(
 	return resp.NetworkID, resp.SubnetID, resp.ChainID, err
 }
 
-func (c *client) Genesis(
+func (c *Client) Genesis(
 	ctx context.Context,
 	options ...rpc.Option,
 ) (*genesis.Genesis, error) {
 	resp := new(GenesisReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.genesis",
 		nil,
@@ -109,13 +65,13 @@ func (c *client) Genesis(
 	return resp.Genesis, err
 }
 
-func (c *client) Nonce(
+func (c *Client) Nonce(
 	ctx context.Context,
 	address ids.ShortID,
 	options ...rpc.Option,
 ) (uint64, error) {
 	resp := new(NonceReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.nonce",
 		&NonceArgs{
@@ -127,14 +83,14 @@ func (c *client) Nonce(
 	return resp.Nonce, err
 }
 
-func (c *client) Balance(
+func (c *Client) Balance(
 	ctx context.Context,
 	address ids.ShortID,
 	assetID ids.ID,
 	options ...rpc.Option,
 ) (uint64, error) {
 	resp := new(BalanceReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.balance",
 		&BalanceArgs{
@@ -147,13 +103,13 @@ func (c *client) Balance(
 	return resp.Balance, err
 }
 
-func (c *client) Loan(
+func (c *Client) Loan(
 	ctx context.Context,
 	chainID ids.ID,
 	options ...rpc.Option,
 ) (uint64, error) {
 	resp := new(LoanReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.loan",
 		&LoanArgs{
@@ -165,7 +121,7 @@ func (c *client) Loan(
 	return resp.Amount, err
 }
 
-func (c *client) IssueTx(
+func (c *Client) IssueTx(
 	ctx context.Context,
 	newTx *tx.Tx,
 	options ...rpc.Option,
@@ -176,7 +132,7 @@ func (c *client) IssueTx(
 	}
 
 	resp := new(IssueTxReply)
-	err = c.req.SendRequest(
+	err = c.Req.SendRequest(
 		ctx,
 		"xsvm.issueTx",
 		&IssueTxArgs{
@@ -188,28 +144,33 @@ func (c *client) IssueTx(
 	return resp.TxID, err
 }
 
-func (c *client) LastAccepted(
+func (c *Client) LastAccepted(
 	ctx context.Context,
 	options ...rpc.Option,
 ) (ids.ID, *block.Stateless, error) {
 	resp := new(LastAcceptedReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.lastAccepted",
 		nil,
 		resp,
 		options...,
 	)
-	return resp.BlockID, resp.Block, err
+	if err != nil {
+		return ids.Empty, nil, err
+	}
+
+	block, err := block.Parse(resp.BlockBytes)
+	return resp.BlockID, block, err
 }
 
-func (c *client) Block(
+func (c *Client) Block(
 	ctx context.Context,
 	blkID ids.ID,
 	options ...rpc.Option,
 ) (*block.Stateless, error) {
 	resp := new(BlockReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.lastAccepted",
 		&BlockArgs{
@@ -218,16 +179,21 @@ func (c *client) Block(
 		resp,
 		options...,
 	)
-	return resp.Block, err
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := block.Parse(resp.BlockBytes)
+	return block, err
 }
 
-func (c *client) Message(
+func (c *Client) Message(
 	ctx context.Context,
 	txID ids.ID,
 	options ...rpc.Option,
 ) (*warp.UnsignedMessage, []byte, error) {
 	resp := new(MessageReply)
-	err := c.req.SendRequest(
+	err := c.Req.SendRequest(
 		ctx,
 		"xsvm.message",
 		&MessageArgs{
@@ -240,4 +206,35 @@ func (c *client) Message(
 		return nil, nil, err
 	}
 	return resp.Message, resp.Signature, resp.Message.Initialize()
+}
+
+func AwaitTxAccepted(
+	ctx context.Context,
+	c *Client,
+	address ids.ShortID,
+	nonce uint64,
+	freq time.Duration,
+	options ...rpc.Option,
+) error {
+	ticker := time.NewTicker(freq)
+	defer ticker.Stop()
+
+	for {
+		currentNonce, err := c.Nonce(ctx, address, options...)
+		if err != nil {
+			return err
+		}
+
+		if currentNonce > nonce {
+			// The nonce increasing indicates the acceptance of a transaction
+			// issued with the specified nonce.
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }

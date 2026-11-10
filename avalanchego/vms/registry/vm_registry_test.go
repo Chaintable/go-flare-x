@@ -1,10 +1,9 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package registry
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -12,6 +11,8 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/vms"
+	"github.com/ava-labs/avalanchego/vms/registry/registrymock"
+	"github.com/ava-labs/avalanchego/vms/vmsmock"
 )
 
 var (
@@ -27,10 +28,10 @@ func TestReload_Success(t *testing.T) {
 
 	resources := initVMRegistryTest(t)
 
-	factory1 := vms.NewMockFactory(resources.ctrl)
-	factory2 := vms.NewMockFactory(resources.ctrl)
-	factory3 := vms.NewMockFactory(resources.ctrl)
-	factory4 := vms.NewMockFactory(resources.ctrl)
+	factory1 := vmsmock.NewFactory(resources.ctrl)
+	factory2 := vmsmock.NewFactory(resources.ctrl)
+	factory3 := vmsmock.NewFactory(resources.ctrl)
+	factory4 := vmsmock.NewFactory(resources.ctrl)
 
 	registeredVms := map[ids.ID]vms.Factory{
 		id1: factory1,
@@ -55,7 +56,7 @@ func TestReload_Success(t *testing.T) {
 		Times(1).
 		Return(nil)
 
-	installedVMs, failedVMs, err := resources.vmRegistry.Reload(context.Background())
+	installedVMs, failedVMs, err := resources.vmRegistry.Reload(t.Context())
 	require.NoError(err)
 	require.ElementsMatch([]ids.ID{id3, id4}, installedVMs)
 	require.Empty(failedVMs)
@@ -69,7 +70,7 @@ func TestReload_GetNewVMsFails(t *testing.T) {
 
 	resources.mockVMGetter.EXPECT().Get().Times(1).Return(nil, nil, errTest)
 
-	installedVMs, failedVMs, err := resources.vmRegistry.Reload(context.Background())
+	installedVMs, failedVMs, err := resources.vmRegistry.Reload(t.Context())
 	require.ErrorIs(err, errTest)
 	require.Empty(installedVMs)
 	require.Empty(failedVMs)
@@ -81,10 +82,10 @@ func TestReload_PartialRegisterFailure(t *testing.T) {
 
 	resources := initVMRegistryTest(t)
 
-	factory1 := vms.NewMockFactory(resources.ctrl)
-	factory2 := vms.NewMockFactory(resources.ctrl)
-	factory3 := vms.NewMockFactory(resources.ctrl)
-	factory4 := vms.NewMockFactory(resources.ctrl)
+	factory1 := vmsmock.NewFactory(resources.ctrl)
+	factory2 := vmsmock.NewFactory(resources.ctrl)
+	factory3 := vmsmock.NewFactory(resources.ctrl)
+	factory4 := vmsmock.NewFactory(resources.ctrl)
 
 	registeredVms := map[ids.ID]vms.Factory{
 		id1: factory1,
@@ -109,7 +110,7 @@ func TestReload_PartialRegisterFailure(t *testing.T) {
 		Times(1).
 		Return(nil)
 
-	installedVMs, failedVMs, err := resources.vmRegistry.Reload(context.Background())
+	installedVMs, failedVMs, err := resources.vmRegistry.Reload(t.Context())
 	require.NoError(err)
 	require.Len(failedVMs, 1)
 	require.ErrorIs(failedVMs[id3], errTest)
@@ -119,16 +120,16 @@ func TestReload_PartialRegisterFailure(t *testing.T) {
 
 type registryTestResources struct {
 	ctrl          *gomock.Controller
-	mockVMGetter  *MockVMGetter
-	mockVMManager *vms.MockManager
+	mockVMGetter  *registrymock.VMGetter
+	mockVMManager *vmsmock.Manager
 	vmRegistry    VMRegistry
 }
 
 func initVMRegistryTest(t *testing.T) *registryTestResources {
 	ctrl := gomock.NewController(t)
 
-	mockVMGetter := NewMockVMGetter(ctrl)
-	mockVMManager := vms.NewMockManager(ctrl)
+	mockVMGetter := registrymock.NewVMGetter(ctrl)
+	mockVMManager := vmsmock.NewManager(ctrl)
 
 	vmRegistry := NewVMRegistry(
 		VMRegistryConfig{

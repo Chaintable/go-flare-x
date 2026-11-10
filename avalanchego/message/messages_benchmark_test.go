@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package message
@@ -16,7 +16,6 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	"github.com/ava-labs/avalanchego/utils/compression"
-	"github.com/ava-labs/avalanchego/utils/logging"
 )
 
 var (
@@ -51,7 +50,6 @@ func BenchmarkMarshalHandshake(b *testing.B) {
 				MyTime:         uint64(time.Now().Unix()),
 				IpAddr:         []byte(net.IPv4(1, 2, 3, 4).To16()),
 				IpPort:         0,
-				MyVersion:      "v1.2.3",
 				IpSigningTime:  uint64(time.Now().Unix()),
 				IpNodeIdSig:    []byte{'y', 'e', 'e', 't'},
 				TrackedSubnets: [][]byte{id[:]},
@@ -63,7 +61,7 @@ func BenchmarkMarshalHandshake(b *testing.B) {
 
 	useBuilder := os.Getenv("USE_BUILDER") != ""
 
-	codec, err := newMsgBuilder(logging.NoLog{}, "", prometheus.NewRegistry(), 10*time.Second)
+	codec, err := newMsgBuilder(prometheus.NewRegistry(), 10*time.Second)
 	require.NoError(err)
 
 	b.Logf("proto length %d-byte (use builder %v)", msgLen, useBuilder)
@@ -108,7 +106,6 @@ func BenchmarkUnmarshalHandshake(b *testing.B) {
 				MyTime:         uint64(time.Now().Unix()),
 				IpAddr:         []byte(net.IPv4(1, 2, 3, 4).To16()),
 				IpPort:         0,
-				MyVersion:      "v1.2.3",
 				IpSigningTime:  uint64(time.Now().Unix()),
 				IpNodeIdSig:    []byte{'y', 'e', 'e', 't'},
 				TrackedSubnets: [][]byte{id[:]},
@@ -121,7 +118,7 @@ func BenchmarkUnmarshalHandshake(b *testing.B) {
 	require.NoError(err)
 
 	useBuilder := os.Getenv("USE_BUILDER") != ""
-	codec, err := newMsgBuilder(logging.NoLog{}, "", prometheus.NewRegistry(), 10*time.Second)
+	codec, err := newMsgBuilder(prometheus.NewRegistry(), 10*time.Second)
 	require.NoError(err)
 
 	b.StartTimer()

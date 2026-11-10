@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package admin
@@ -14,24 +14,23 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/formatting"
 	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/ava-labs/avalanchego/vms"
-	"github.com/ava-labs/avalanchego/vms/registry"
+	"github.com/ava-labs/avalanchego/vms/registry/registrymock"
+	"github.com/ava-labs/avalanchego/vms/vmsmock"
 
 	rpcdbpb "github.com/ava-labs/avalanchego/proto/pb/rpcdb"
 )
 
 type loadVMsTest struct {
 	admin          *Admin
-	ctrl           *gomock.Controller
-	mockVMManager  *vms.MockManager
-	mockVMRegistry *registry.MockVMRegistry
+	mockVMManager  *vmsmock.Manager
+	mockVMRegistry *registrymock.VMRegistry
 }
 
 func initLoadVMsTest(t *testing.T) *loadVMsTest {
 	ctrl := gomock.NewController(t)
 
-	mockVMRegistry := registry.NewMockVMRegistry(ctrl)
-	mockVMManager := vms.NewMockManager(ctrl)
+	mockVMRegistry := registrymock.NewVMRegistry(ctrl)
+	mockVMManager := vmsmock.NewManager(ctrl)
 
 	return &loadVMsTest{
 		admin: &Admin{Config: Config{
@@ -39,7 +38,6 @@ func initLoadVMsTest(t *testing.T) *loadVMsTest {
 			VMRegistry: mockVMRegistry,
 			VMManager:  mockVMManager,
 		}},
-		ctrl:           ctrl,
 		mockVMManager:  mockVMManager,
 		mockVMRegistry: mockVMRegistry,
 	}

@@ -13,23 +13,6 @@ AVALANCHE_PATH=$( cd "$( dirname "${BASH_SOURCE[0]}" )"; cd .. && pwd ) # Direct
 # Where AvalancheGo binary goes
 avalanchego_path="$AVALANCHE_PATH/build/avalanchego"
 
-# Settings for coreth
-coreth_version=${CORETH_VERSION:-'v0.13.0-rc.0'}
-plugin_dir=${PLUGIN_DIR:-$HOME/.avalanchego/plugins}
-evm_path=${EVM_PATH:-$plugin_dir/evm}
-coreth_path="$AVALANCHE_PATH/../coreth"
-
-# Avalabs docker hub
-# avaplatform/avalanchego - defaults to local as to avoid unintentional pushes
-# You should probably set it - export DOCKER_REPO='avaplatform/avalanchego'
-avalanchego_dockerhub_repo=${DOCKER_REPO:-"avalanchego"}
-
-# Current branch
-# TODO: fix "fatal: No names found, cannot describe anything" in github CI
-current_branch=$(git symbolic-ref -q --short HEAD || git describe --tags --exact-match || true)
-
-git_commit=${AVALANCHEGO_COMMIT:-$( git rev-list -1 HEAD )}
-
 # Static compilation
 static_ld_flags=''
 if [ "${STATIC_COMPILATION:-}" = 1 ]
@@ -44,9 +27,7 @@ fi
 # We use "export" here instead of just setting a bash variable because we need
 # to pass this flag to all child processes spawned by the shell.
 export CGO_CFLAGS="-O2 -D__BLST_PORTABLE__"
-# While CGO_ENABLED doesn't need to be explicitly set, it produces a much more
-# clear error due to the default value change in go1.20.
-export CGO_ENABLED=1
+export CGO_ENABLED=1 # Required for cross-compilation
 
 # Disable version control fallbacks
-export GOPROXY="https://proxy.golang.org"
+export GOPROXY="${GOPROXY:-https://proxy.golang.org}"

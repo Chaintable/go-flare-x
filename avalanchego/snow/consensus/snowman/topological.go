@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package snowman
@@ -13,7 +13,6 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
-	"github.com/ava-labs/avalanchego/snow/choices"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowball"
 	"github.com/ava-labs/avalanchego/utils/bag"
 	"github.com/ava-labs/avalanchego/utils/set"
@@ -21,24 +20,32 @@ import (
 
 var (
 	errDuplicateAdd            = errors.New("duplicate block add")
+	errUnknownParentBlock      = errors.New("unknown parent block")
 	errTooManyProcessingBlocks = errors.New("too many processing blocks")
 	errBlockProcessingTooLong  = errors.New("block processing too long")
+	errAcceptanceTimeTooHigh   = errors.New("acceptance time too high")
+
+	maxAcceptanceTime = 15 * time.Second
 
 	_ Factory   = (*TopologicalFactory)(nil)
 	_ Consensus = (*Topological)(nil)
 )
 
 // TopologicalFactory implements Factory by returning a topological struct
-type TopologicalFactory struct{}
+type TopologicalFactory struct {
+	factory snowball.Factory
+}
 
-func (TopologicalFactory) New() Consensus {
-	return &Topological{}
+func (tf TopologicalFactory) New() Consensus {
+	return &Topological{Factory: tf.factory}
 }
 
 // Topological implements the Snowman interface by using a tree tracking the
 // strongly preferred branch. This tree structure amortizes network polls to
 // vote on more than just the next block.
 type Topological struct {
+	Factory snowball.Factory
+
 	metrics *metrics
 
 	// pollNumber is the number of times RecordPolls has been called
@@ -111,7 +118,6 @@ func (ts *Topological) Initialize(
 
 	ts.metrics, err = newMetrics(
 		ctx.Log,
-		"",
 		ctx.Registerer,
 		lastAcceptedHeight,
 		lastAcceptedTime,
@@ -127,7 +133,7 @@ func (ts *Topological) Initialize(
 	ts.lastAcceptedID = lastAcceptedID
 	ts.lastAcceptedHeight = lastAcceptedHeight
 	ts.blocks = map[ids.ID]*snowmanBlock{
-		lastAcceptedID: {params: ts.params},
+		lastAcceptedID: {t: ts},
 	}
 	ts.preferredHeights = make(map[uint64]ids.ID)
 	ts.preference = lastAcceptedID
@@ -138,50 +144,35 @@ func (ts *Topological) NumProcessing() int {
 	return len(ts.blocks) - 1
 }
 
-func (ts *Topological) Add(ctx context.Context, blk Block) error {
+func (ts *Topological) Add(blk Block) error {
 	blkID := blk.ID()
 	height := blk.Height()
-	ts.ctx.Log.Verbo("adding block",
+	parentID := blk.Parent()
+	ts.ctx.Log.Trace("adding block",
 		zap.Stringer("blkID", blkID),
 		zap.Uint64("height", height),
+		zap.Time("timestamp", blk.Timestamp()),
+		zap.Stringer("parentID", parentID),
 	)
 
-	// Make sure a block is not inserted twice. This enforces the invariant that
-	// blocks are always added in topological order. Essentially, a block that
-	// is being added should never have a child that was already added.
-	// Additionally, this prevents any edge cases that may occur due to adding
-	// different blocks with the same ID.
-	if ts.Decided(blk) || ts.Processing(blkID) {
+	// Make sure a block is not inserted twice.
+	if ts.Processing(blkID) {
 		return errDuplicateAdd
 	}
 
 	ts.metrics.Verified(height)
 	ts.metrics.Issued(blkID, ts.pollNumber)
 
-	parentID := blk.Parent()
 	parentNode, ok := ts.blocks[parentID]
 	if !ok {
-		ts.ctx.Log.Verbo("block ancestor is missing, being rejected",
-			zap.Stringer("blkID", blkID),
-			zap.Uint64("height", height),
-			zap.Stringer("parentID", parentID),
-		)
-
-		// If the ancestor is missing, this means the ancestor must have already
-		// been pruned. Therefore, the dependent should be transitively
-		// rejected.
-		if err := blk.Reject(ctx); err != nil {
-			return err
-		}
-		ts.metrics.Rejected(blkID, ts.pollNumber, len(blk.Bytes()))
-		return nil
+		return errUnknownParentBlock
 	}
 
 	// add the block as a child of its parent, and add the block to the tree
 	parentNode.AddChild(blk)
 	ts.blocks[blkID] = &snowmanBlock{
-		params: ts.params,
-		blk:    blk,
+		t:   ts,
+		blk: blk,
 	}
 
 	// If we are extending the preference, this is the new preference
@@ -199,16 +190,6 @@ func (ts *Topological) Add(ctx context.Context, blk Block) error {
 	return nil
 }
 
-func (ts *Topological) Decided(blk Block) bool {
-	// If the block is decided, then it must have been previously issued.
-	if blk.Status().Decided() {
-		return true
-	}
-	// If the block is marked as fetched, we can check if it has been
-	// transitively rejected.
-	return blk.Status() == choices.Processing && blk.Height() <= ts.lastAcceptedHeight
-}
-
 func (ts *Topological) Processing(blkID ids.ID) bool {
 	// The last accepted block is in the blocks map, so we first must ensure the
 	// requested block isn't the last accepted block.
@@ -221,12 +202,8 @@ func (ts *Topological) Processing(blkID ids.ID) bool {
 	return ok
 }
 
-func (ts *Topological) IsPreferred(blk Block) bool {
-	// If the block is accepted, then it must be transitively preferred.
-	if blk.Status() == choices.Accepted {
-		return true
-	}
-	return ts.preferredIDs.Contains(blk.ID())
+func (ts *Topological) IsPreferred(blkID ids.ID) bool {
+	return blkID == ts.lastAcceptedID || ts.preferredIDs.Contains(blkID)
 }
 
 func (ts *Topological) LastAccepted() (ids.ID, uint64) {
@@ -258,7 +235,7 @@ func (ts *Topological) PreferenceAtHeight(height uint64) (ids.ID, bool) {
 //
 // To optimize the theoretical complexity of the vote propagation, a topological
 // sort is done over the blocks that are reachable from the provided votes.
-// During the sort, votes are pushed towards the genesis. To prevent interating
+// During the sort, votes are pushed towards the genesis. To prevent iterating
 // over all blocks that had unsuccessful polls, we set a flag on the block to
 // know that any future traversal through that block should register an
 // unsuccessful poll on that block and every descendant block.
@@ -310,7 +287,12 @@ func (ts *Topological) RecordPoll(ctx context.Context, voteBag bag.Bag[ids.ID]) 
 
 	// Runtime = |live set| ; Space = Constant
 	// Traverse from the preferred ID to the last accepted ancestor.
-	for block := startBlock; !block.Accepted(); {
+	//
+	// It is guaranteed that the first decided block we encounter is the last
+	// accepted block because the startBlock is the preferred block. The
+	// preferred block is guaranteed to either be the last accepted block or
+	// extend the accepted chain.
+	for block := startBlock; !block.Decided(); {
 		blkID := block.blk.ID()
 		ts.preferredIDs.Add(blkID)
 		ts.preferredHeights[block.blk.Height()] = blkID
@@ -354,9 +336,21 @@ func (ts *Topological) HealthCheck(context.Context) (interface{}, error) {
 		errs = append(errs, err)
 	}
 
+	// Check average acceptance time
+	avgAcceptanceTime := ts.metrics.GetAverageAcceptanceTime()
+	if avgAcceptanceTime > maxAcceptanceTime {
+		err := fmt.Errorf("%w: %s > %s",
+			errAcceptanceTimeTooHigh,
+			avgAcceptanceTime,
+			maxAcceptanceTime,
+		)
+		errs = append(errs, err)
+	}
+
 	return map[string]interface{}{
 		"processingBlocks":       numProcessingBlks,
 		"longestProcessingBlock": maxTimeProcessing.String(), // .String() is needed here to ensure a human readable format
+		"avgAcceptanceTime":      avgAcceptanceTime.String(),
 		"lastAcceptedID":         ts.lastAcceptedID,
 		"lastAcceptedHeight":     ts.lastAcceptedHeight,
 	}, errors.Join(errs...)
@@ -381,7 +375,7 @@ func (ts *Topological) calculateInDegree(votes bag.Bag[ids.ID]) {
 		}
 
 		// If the vote is for the last accepted block, the vote is dropped
-		if votedBlock.Accepted() {
+		if votedBlock.Decided() {
 			continue
 		}
 
@@ -405,24 +399,21 @@ func (ts *Topological) calculateInDegree(votes bag.Bag[ids.ID]) {
 
 		// iterate through all the block's ancestors and set up the inDegrees of
 		// the blocks
-		for n := ts.blocks[parentID]; !n.Accepted(); n = ts.blocks[parentID] {
+		for n := ts.blocks[parentID]; !n.Decided(); n = ts.blocks[parentID] {
 			parentID = n.blk.Parent()
 
 			// Increase the inDegree by one
-			kahn := ts.kahnNodes[parentID]
+			kahn, previouslySeen := ts.kahnNodes[parentID]
 			kahn.inDegree++
 			ts.kahnNodes[parentID] = kahn
 
 			// If we have already seen this block, then we shouldn't increase
 			// the inDegree of the ancestors through this block again.
-			if kahn.inDegree != 1 {
+			if previouslySeen {
+				// Nodes are only leaves if they have no inbound edges.
+				ts.leaves.Remove(parentID)
 				break
 			}
-
-			// If I am transitively seeing this block for the first time, either
-			// the block was previously unknown or it was previously a leaf.
-			// Regardless, it shouldn't be tracked as a leaf.
-			ts.leaves.Remove(parentID)
 		}
 	}
 }
@@ -452,7 +443,7 @@ func (ts *Topological) pushVotes() []votes {
 
 		// If the block is accepted, then we don't need to push votes to the
 		// parent block
-		if block.Accepted() {
+		if block.Decided() {
 			continue
 		}
 
@@ -532,7 +523,7 @@ func (ts *Topological) vote(ctx context.Context, voteStack []votes) (ids.ID, err
 		// block.
 		if parentBlock.sb.Finalized() && ts.lastAcceptedID == vote.parentID {
 			if err := ts.acceptPreferredChild(ctx, parentBlock); err != nil {
-				return ids.ID{}, err
+				return ids.Empty, err
 			}
 
 			// by accepting the child of parentBlock, the last accepted block is
@@ -552,7 +543,7 @@ func (ts *Topological) vote(ctx context.Context, voteStack []votes) (ids.ID, err
 		// children will need to have their confidence reset. If there isn't a
 		// child having RecordPoll called, then the nextID will default to the
 		// nil ID.
-		nextID := ids.ID{}
+		nextID := ids.Empty
 		if len(voteStack) > 0 {
 			nextID = voteStack[newStackSize-1].parentID
 		}
@@ -576,7 +567,7 @@ func (ts *Topological) vote(ctx context.Context, voteStack []votes) (ids.ID, err
 			// Therefore, we need to make sure the child is still in the tree.
 			childBlock, notRejected := ts.blocks[childID]
 			if notRejected {
-				ts.ctx.Log.Verbo("defering confidence reset of child block",
+				ts.ctx.Log.Verbo("deferring confidence reset of child block",
 					zap.Stringer("childID", childID),
 				)
 
@@ -625,6 +616,7 @@ func (ts *Topological) acceptPreferredChild(ctx context.Context, n *snowmanBlock
 		zap.Stringer("blkID", pref),
 		zap.Uint64("height", height),
 		zap.Time("timestamp", timestamp),
+		zap.Stringer("parentID", ts.lastAcceptedID),
 	)
 	if err := child.Accept(ctx); err != nil {
 		return err
@@ -706,4 +698,12 @@ func (ts *Topological) rejectTransitively(ctx context.Context, rejected []ids.ID
 		}
 	}
 	return nil
+}
+
+func (ts *Topological) GetParent(id ids.ID) (ids.ID, bool) {
+	block, ok := ts.blocks[id]
+	if !ok || block == nil || block.blk == nil {
+		return ids.Empty, false
+	}
+	return block.blk.Parent(), true
 }

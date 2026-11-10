@@ -1,10 +1,9 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package executor
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -14,10 +13,15 @@ import (
 
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/snow/snowtest"
+	"github.com/ava-labs/avalanchego/upgrade/upgradetest"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
+	"github.com/ava-labs/avalanchego/utils/iterator"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
 	"github.com/ava-labs/avalanchego/vms/platformvm/block"
+	"github.com/ava-labs/avalanchego/vms/platformvm/genesis/genesistest"
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
 	"github.com/ava-labs/avalanchego/vms/platformvm/status"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
@@ -29,7 +33,7 @@ func TestApricotStandardBlockTimeVerification(t *testing.T) {
 	require := require.New(t)
 	ctrl := gomock.NewController(t)
 
-	env := newEnvironment(t, ctrl, apricotPhase5)
+	env := newEnvironment(t, upgradetest.ApricotPhase5)
 
 	// setup and store parent block
 	// it's a standard block for simplicity
@@ -44,17 +48,21 @@ func TestApricotStandardBlockTimeVerification(t *testing.T) {
 	parentID := apricotParentBlk.ID()
 
 	// store parent block, with relevant quantities
-	onParentAccept := state.NewMockDiff(ctrl)
+	chainTime := env.clk.Time().Truncate(time.Second)
+	mockParent := state.NewMockChain(ctrl)
+	mockParent.EXPECT().GetTimestamp().Return(chainTime).AnyTimes()
+	mockParent.EXPECT().GetFeeState().Return(gas.State{}).AnyTimes()
+	mockParent.EXPECT().GetL1ValidatorExcess().Return(gas.Gas(0)).AnyTimes()
+	mockParent.EXPECT().GetAccruedFees().Return(uint64(0)).AnyTimes()
+	mockParent.EXPECT().NumActiveL1Validators().Return(0).AnyTimes()
+	mockParent.EXPECT().GetActiveL1ValidatorsIterator().Return(&iterator.Empty[state.L1Validator]{}, nil).AnyTimes()
+	onParentAccept, err := state.NewDiffOn(mockParent, state.StakerAdditionAfterDeletionForbidden)
+	require.NoError(err)
 	env.blkManager.(*manager).blkIDToState[parentID] = &blockState{
 		statelessBlock: apricotParentBlk,
 		onAcceptState:  onParentAccept,
 	}
 	env.blkManager.(*manager).lastAccepted = parentID
-
-	chainTime := env.clk.Time().Truncate(time.Second)
-	env.mockedState.EXPECT().GetLastAccepted().Return(parentID).AnyTimes()
-	env.mockedState.EXPECT().GetTimestamp().Return(chainTime).AnyTimes()
-	onParentAccept.EXPECT().GetTimestamp().Return(chainTime).AnyTimes()
 
 	// wrong height
 	apricotChildBlk, err := block.NewApricotStandardBlock(
@@ -64,7 +72,7 @@ func TestApricotStandardBlockTimeVerification(t *testing.T) {
 	)
 	require.NoError(err)
 	blk := env.blkManager.NewBlock(apricotChildBlk)
-	err = blk.Verify(context.Background())
+	err = blk.Verify(t.Context())
 	require.ErrorIs(err, errIncorrectBlockHeight)
 
 	// valid height
@@ -75,14 +83,14 @@ func TestApricotStandardBlockTimeVerification(t *testing.T) {
 	)
 	require.NoError(err)
 	blk = env.blkManager.NewBlock(apricotChildBlk)
-	require.NoError(blk.Verify(context.Background()))
+	require.NoError(blk.Verify(t.Context()))
 }
 
 func TestBanffStandardBlockTimeVerification(t *testing.T) {
 	require := require.New(t)
 	ctrl := gomock.NewController(t)
 
-	env := newEnvironment(t, ctrl, banff)
+	env := newEnvironment(t, upgradetest.Banff)
 	now := env.clk.Time()
 	env.clk.Set(now)
 
@@ -101,53 +109,48 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 	parentID := banffParentBlk.ID()
 
 	// store parent block, with relevant quantities
-	onParentAccept := state.NewMockDiff(ctrl)
 	chainTime := env.clk.Time().Truncate(time.Second)
-	env.blkManager.(*manager).blkIDToState[parentID] = &blockState{
-		statelessBlock: banffParentBlk,
-		onAcceptState:  onParentAccept,
-		timestamp:      chainTime,
-	}
-	env.blkManager.(*manager).lastAccepted = parentID
-	env.mockedState.EXPECT().GetLastAccepted().Return(parentID).AnyTimes()
-	env.mockedState.EXPECT().GetTimestamp().Return(chainTime).AnyTimes()
-
 	nextStakerTime := chainTime.Add(executor.SyncBound).Add(-1 * time.Second)
-
-	// store just once current staker to mark next staker time.
-	currentStakerIt := state.NewMockStakerIterator(ctrl)
-	currentStakerIt.EXPECT().Next().Return(true).AnyTimes()
-	currentStakerIt.EXPECT().Value().Return(
-		&state.Staker{
-			NextTime: nextStakerTime,
-			Priority: txs.PrimaryNetworkValidatorCurrentPriority,
-		},
-	).AnyTimes()
-	currentStakerIt.EXPECT().Release().Return().AnyTimes()
-	onParentAccept.EXPECT().GetCurrentStakerIterator().Return(currentStakerIt, nil).AnyTimes()
-
-	// no pending stakers
-	pendingIt := state.NewMockStakerIterator(ctrl)
-	pendingIt.EXPECT().Next().Return(false).AnyTimes()
-	pendingIt.EXPECT().Release().Return().AnyTimes()
-	onParentAccept.EXPECT().GetPendingStakerIterator().Return(pendingIt, nil).AnyTimes()
-
-	onParentAccept.EXPECT().GetTimestamp().Return(chainTime).AnyTimes()
-
 	txID := ids.GenerateTestID()
 	utxo := &avax.UTXO{
 		UTXOID: avax.UTXOID{
 			TxID: txID,
 		},
 		Asset: avax.Asset{
-			ID: avaxAssetID,
+			ID: snowtest.AVAXAssetID,
 		},
 		Out: &secp256k1fx.TransferOutput{
-			Amt: env.config.CreateSubnetTxFee,
+			Amt: 1,
 		},
 	}
 	utxoID := utxo.InputID()
-	onParentAccept.EXPECT().GetUTXO(utxoID).Return(utxo, nil).AnyTimes()
+	mockParent := state.NewMockChain(ctrl)
+	mockParent.EXPECT().GetTimestamp().Return(chainTime).AnyTimes()
+	mockParent.EXPECT().GetFeeState().Return(gas.State{}).AnyTimes()
+	mockParent.EXPECT().GetL1ValidatorExcess().Return(gas.Gas(0)).AnyTimes()
+	mockParent.EXPECT().GetAccruedFees().Return(uint64(0)).AnyTimes()
+	mockParent.EXPECT().NumActiveL1Validators().Return(0).AnyTimes()
+	// store just once current staker to mark next staker time.
+	mockParent.EXPECT().GetCurrentStakerIterator().DoAndReturn(func() (iterator.Iterator[*state.Staker], error) {
+		return iterator.FromSlice(
+			&state.Staker{
+				NextTime: nextStakerTime,
+				Priority: txs.PrimaryNetworkValidatorCurrentPriority,
+			},
+		), nil
+	}).AnyTimes()
+	mockParent.EXPECT().GetPendingStakerIterator().Return(iterator.Empty[*state.Staker]{}, nil).AnyTimes()
+	mockParent.EXPECT().GetActiveL1ValidatorsIterator().Return(iterator.Empty[state.L1Validator]{}, nil).AnyTimes()
+	mockParent.EXPECT().GetExpiryIterator().Return(iterator.Empty[state.ExpiryEntry]{}, nil).AnyTimes()
+	mockParent.EXPECT().GetUTXO(utxoID).Return(utxo, nil).AnyTimes()
+	onParentAccept, err := state.NewDiffOn(mockParent, state.StakerAdditionAfterDeletionForbidden)
+	require.NoError(err)
+	env.blkManager.(*manager).blkIDToState[parentID] = &blockState{
+		statelessBlock: banffParentBlk,
+		onAcceptState:  onParentAccept,
+		timestamp:      chainTime,
+	}
+	env.blkManager.(*manager).lastAccepted = parentID
 
 	// Create the tx
 	utx := &txs.CreateSubnetTx{
@@ -158,7 +161,7 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 				UTXOID: utxo.UTXOID,
 				Asset:  utxo.Asset,
 				In: &secp256k1fx.TransferInput{
-					Amt: env.config.CreateSubnetTxFee,
+					Amt: 1,
 				},
 			}},
 		}},
@@ -176,7 +179,7 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		err = block.Verify(context.Background())
+		err = block.Verify(t.Context())
 		require.ErrorIs(err, errApricotBlockIssuedAfterFork)
 	}
 
@@ -191,7 +194,7 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		err = block.Verify(context.Background())
+		err = block.Verify(t.Context())
 		require.ErrorIs(err, errIncorrectBlockHeight)
 	}
 
@@ -206,8 +209,8 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		err = block.Verify(context.Background())
-		require.ErrorIs(err, errChildBlockEarlierThanParent)
+		err = block.Verify(t.Context())
+		require.ErrorIs(err, executor.ErrChildBlockEarlierThanParent)
 	}
 
 	{
@@ -222,7 +225,7 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		err = block.Verify(context.Background())
+		err = block.Verify(t.Context())
 		require.ErrorIs(err, executor.ErrChildBlockBeyondSyncBound)
 		env.clk.Set(initClkTime)
 	}
@@ -238,7 +241,7 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		err = block.Verify(context.Background())
+		err = block.Verify(t.Context())
 		require.ErrorIs(err, executor.ErrChildBlockAfterStakerChangeTime)
 	}
 
@@ -253,8 +256,8 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		err = block.Verify(context.Background())
-		require.ErrorIs(err, errBanffStandardBlockWithoutChanges)
+		err = block.Verify(t.Context())
+		require.ErrorIs(err, ErrStandardBlockWithoutChanges)
 	}
 
 	{
@@ -268,7 +271,7 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		require.NoError(block.Verify(context.Background()))
+		require.NoError(block.Verify(t.Context()))
 	}
 
 	{
@@ -282,30 +285,30 @@ func TestBanffStandardBlockTimeVerification(t *testing.T) {
 		)
 		require.NoError(err)
 		block := env.blkManager.NewBlock(banffChildBlk)
-		require.NoError(block.Verify(context.Background()))
+		require.NoError(block.Verify(t.Context()))
 	}
 }
 
 func TestBanffStandardBlockUpdatePrimaryNetworkStakers(t *testing.T) {
 	require := require.New(t)
 
-	env := newEnvironment(t, nil, banff)
+	env := newEnvironment(t, upgradetest.Banff)
 
 	// Case: Timestamp is after next validator start time
 	// Add a pending validator
-	pendingValidatorStartTime := defaultGenesisTime.Add(1 * time.Second)
+	pendingValidatorStartTime := genesistest.DefaultValidatorStartTime.Add(1 * time.Second)
 	pendingValidatorEndTime := pendingValidatorStartTime.Add(defaultMinStakingDuration)
 	nodeID := ids.GenerateTestNodeID()
 	rewardAddress := ids.GenerateTestShortID()
-	addPendingValidatorTx, err := addPendingValidator(
+	addPendingValidatorTx := addPendingValidator(
+		t,
 		env,
 		pendingValidatorStartTime,
 		pendingValidatorEndTime,
 		nodeID,
 		rewardAddress,
-		[]*secp256k1.PrivateKey{preFundedKeys[0]},
+		[]*secp256k1.PrivateKey{genesistest.DefaultFundedKeys[0]},
 	)
-	require.NoError(err)
 
 	// build standard block moving ahead chain time
 	preferredID := env.state.GetLastAccepted()
@@ -321,7 +324,7 @@ func TestBanffStandardBlockUpdatePrimaryNetworkStakers(t *testing.T) {
 	block := env.blkManager.NewBlock(statelessStandardBlock)
 
 	// update staker set
-	require.NoError(block.Verify(context.Background()))
+	require.NoError(block.Verify(t.Context()))
 
 	// tests
 	blkStateMap := env.blkManager.(*manager).blkIDToState
@@ -335,7 +338,7 @@ func TestBanffStandardBlockUpdatePrimaryNetworkStakers(t *testing.T) {
 	require.ErrorIs(err, database.ErrNotFound)
 
 	// Test VM validators
-	require.NoError(block.Accept(context.Background()))
+	require.NoError(block.Accept(t.Context()))
 	_, ok := env.config.Validators.GetValidator(constants.PrimaryNetworkID, nodeID)
 	require.True(ok)
 }
@@ -360,8 +363,8 @@ func TestBanffStandardBlockUpdateStakers(t *testing.T) {
 	staker1 := staker{
 		nodeID:        ids.BuildTestNodeID([]byte{0xf1}),
 		rewardAddress: ids.ShortID{0xf1},
-		startTime:     defaultGenesisTime.Add(1 * time.Minute),
-		endTime:       defaultGenesisTime.Add(10 * defaultMinStakingDuration).Add(1 * time.Minute),
+		startTime:     genesistest.DefaultValidatorStartTime.Add(1 * time.Minute),
+		endTime:       genesistest.DefaultValidatorStartTime.Add(10 * defaultMinStakingDuration).Add(1 * time.Minute),
 	}
 	staker2 := staker{
 		nodeID:        ids.BuildTestNodeID([]byte{0xf2}),
@@ -490,33 +493,38 @@ func TestBanffStandardBlockUpdateStakers(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.description, func(t *testing.T) {
 			require := require.New(t)
-			env := newEnvironment(t, nil, banff)
+			env := newEnvironment(t, upgradetest.Banff)
 
 			subnetID := testSubnet1.ID()
 			env.config.TrackedSubnets.Add(subnetID)
 
 			for _, staker := range test.stakers {
-				_, err := addPendingValidator(
+				addPendingValidator(
+					t,
 					env,
 					staker.startTime,
 					staker.endTime,
 					staker.nodeID,
 					staker.rewardAddress,
-					[]*secp256k1.PrivateKey{preFundedKeys[0]},
+					[]*secp256k1.PrivateKey{genesistest.DefaultFundedKeys[0]},
 				)
-				require.NoError(err)
 			}
 
 			for _, staker := range test.subnetStakers {
-				tx, err := env.txBuilder.NewAddSubnetValidatorTx(
-					10, // Weight
-					uint64(staker.startTime.Unix()),
-					uint64(staker.endTime.Unix()),
-					staker.nodeID, // validator ID
-					subnetID,      // Subnet ID
-					[]*secp256k1.PrivateKey{preFundedKeys[0], preFundedKeys[1]},
-					ids.ShortEmpty,
-					nil,
+				wallet := newWallet(t, env, walletConfig{
+					subnetIDs: []ids.ID{subnetID},
+				})
+
+				tx, err := wallet.IssueAddSubnetValidatorTx(
+					&txs.SubnetValidator{
+						Validator: txs.Validator{
+							NodeID: staker.nodeID,
+							Start:  uint64(staker.startTime.Unix()),
+							End:    uint64(staker.endTime.Unix()),
+							Wght:   10,
+						},
+						Subnet: subnetID,
+					},
 				)
 				require.NoError(err)
 
@@ -526,7 +534,7 @@ func TestBanffStandardBlockUpdateStakers(t *testing.T) {
 				)
 				require.NoError(err)
 
-				env.state.PutPendingValidator(staker)
+				require.NoError(env.state.PutPendingValidator(staker))
 				env.state.AddTx(tx, status.Committed)
 			}
 			env.state.SetHeight( /*dummyHeight*/ 1)
@@ -550,8 +558,8 @@ func TestBanffStandardBlockUpdateStakers(t *testing.T) {
 				require.NoError(err)
 
 				// update staker set
-				require.NoError(block.Verify(context.Background()))
-				require.NoError(block.Accept(context.Background()))
+				require.NoError(block.Verify(t.Context()))
+				require.NoError(block.Accept(t.Context()))
 			}
 
 			for stakerNodeID, status := range test.expectedStakers {
@@ -589,24 +597,28 @@ func TestBanffStandardBlockUpdateStakers(t *testing.T) {
 // is after the new timestamp
 func TestBanffStandardBlockRemoveSubnetValidator(t *testing.T) {
 	require := require.New(t)
-	env := newEnvironment(t, nil, banff)
+	env := newEnvironment(t, upgradetest.Banff)
 
 	subnetID := testSubnet1.ID()
 	env.config.TrackedSubnets.Add(subnetID)
 
+	wallet := newWallet(t, env, walletConfig{
+		subnetIDs: []ids.ID{subnetID},
+	})
+
 	// Add a subnet validator to the staker set
-	subnetValidatorNodeID := genesisNodeIDs[0]
-	subnetVdr1StartTime := defaultValidateStartTime
-	subnetVdr1EndTime := defaultValidateStartTime.Add(defaultMinStakingDuration)
-	tx, err := env.txBuilder.NewAddSubnetValidatorTx(
-		1,                                  // Weight
-		uint64(subnetVdr1StartTime.Unix()), // Start time
-		uint64(subnetVdr1EndTime.Unix()),   // end time
-		subnetValidatorNodeID,              // Node ID
-		subnetID,                           // Subnet ID
-		[]*secp256k1.PrivateKey{preFundedKeys[0], preFundedKeys[1]},
-		ids.ShortEmpty,
-		nil,
+	subnetValidatorNodeID := genesistest.DefaultNodeIDs[0]
+	subnetVdr1EndTime := genesistest.DefaultValidatorStartTime.Add(defaultMinStakingDuration)
+	tx, err := wallet.IssueAddSubnetValidatorTx(
+		&txs.SubnetValidator{
+			Validator: txs.Validator{
+				NodeID: subnetValidatorNodeID,
+				Start:  genesistest.DefaultValidatorStartTimeUnix,
+				End:    uint64(subnetVdr1EndTime.Unix()),
+				Wght:   1,
+			},
+			Subnet: subnetID,
+		},
 	)
 	require.NoError(err)
 
@@ -619,23 +631,24 @@ func TestBanffStandardBlockRemoveSubnetValidator(t *testing.T) {
 	)
 	require.NoError(err)
 
-	env.state.PutCurrentValidator(staker)
+	require.NoError(env.state.PutCurrentValidator(staker))
 	env.state.AddTx(tx, status.Committed)
 	require.NoError(env.state.Commit())
 
 	// The above validator is now part of the staking set
 
 	// Queue a staker that joins the staker set after the above validator leaves
-	subnetVdr2NodeID := genesisNodeIDs[1]
-	tx, err = env.txBuilder.NewAddSubnetValidatorTx(
-		1, // Weight
-		uint64(subnetVdr1EndTime.Add(time.Second).Unix()),                                // Start time
-		uint64(subnetVdr1EndTime.Add(time.Second).Add(defaultMinStakingDuration).Unix()), // end time
-		subnetVdr2NodeID, // Node ID
-		subnetID,         // Subnet ID
-		[]*secp256k1.PrivateKey{preFundedKeys[0], preFundedKeys[1]},
-		ids.ShortEmpty,
-		nil,
+	subnetVdr2NodeID := genesistest.DefaultNodeIDs[1]
+	tx, err = wallet.IssueAddSubnetValidatorTx(
+		&txs.SubnetValidator{
+			Validator: txs.Validator{
+				NodeID: subnetVdr2NodeID,
+				Start:  uint64(subnetVdr1EndTime.Add(time.Second).Unix()),
+				End:    uint64(subnetVdr1EndTime.Add(time.Second).Add(defaultMinStakingDuration).Unix()),
+				Wght:   1,
+			},
+			Subnet: subnetID,
+		},
 	)
 	require.NoError(err)
 
@@ -645,7 +658,7 @@ func TestBanffStandardBlockRemoveSubnetValidator(t *testing.T) {
 	)
 	require.NoError(err)
 
-	env.state.PutPendingValidator(staker)
+	require.NoError(env.state.PutPendingValidator(staker))
 	env.state.AddTx(tx, status.Committed)
 	require.NoError(env.state.Commit())
 
@@ -667,7 +680,7 @@ func TestBanffStandardBlockRemoveSubnetValidator(t *testing.T) {
 	block := env.blkManager.NewBlock(statelessStandardBlock)
 
 	// update staker set
-	require.NoError(block.Verify(context.Background()))
+	require.NoError(block.Verify(t.Context()))
 
 	blkStateMap := env.blkManager.(*manager).blkIDToState
 	updatedState := blkStateMap[block.ID()].onAcceptState
@@ -675,7 +688,7 @@ func TestBanffStandardBlockRemoveSubnetValidator(t *testing.T) {
 	require.ErrorIs(err, database.ErrNotFound)
 
 	// Check VM Validators are removed successfully
-	require.NoError(block.Accept(context.Background()))
+	require.NoError(block.Accept(t.Context()))
 	_, ok := env.config.Validators.GetValidator(subnetID, subnetVdr2NodeID)
 	require.False(ok)
 	_, ok = env.config.Validators.GetValidator(subnetID, subnetValidatorNodeID)
@@ -686,26 +699,31 @@ func TestBanffStandardBlockTrackedSubnet(t *testing.T) {
 	for _, tracked := range []bool{true, false} {
 		t.Run(fmt.Sprintf("tracked %t", tracked), func(t *testing.T) {
 			require := require.New(t)
-			env := newEnvironment(t, nil, banff)
+			env := newEnvironment(t, upgradetest.Banff)
 
 			subnetID := testSubnet1.ID()
 			if tracked {
 				env.config.TrackedSubnets.Add(subnetID)
 			}
 
+			wallet := newWallet(t, env, walletConfig{
+				subnetIDs: []ids.ID{subnetID},
+			})
+
 			// Add a subnet validator to the staker set
-			subnetValidatorNodeID := genesisNodeIDs[0]
-			subnetVdr1StartTime := defaultGenesisTime.Add(1 * time.Minute)
-			subnetVdr1EndTime := defaultGenesisTime.Add(10 * defaultMinStakingDuration).Add(1 * time.Minute)
-			tx, err := env.txBuilder.NewAddSubnetValidatorTx(
-				1,                                  // Weight
-				uint64(subnetVdr1StartTime.Unix()), // Start time
-				uint64(subnetVdr1EndTime.Unix()),   // end time
-				subnetValidatorNodeID,              // Node ID
-				subnetID,                           // Subnet ID
-				[]*secp256k1.PrivateKey{preFundedKeys[0], preFundedKeys[1]},
-				ids.ShortEmpty,
-				nil,
+			subnetValidatorNodeID := genesistest.DefaultNodeIDs[0]
+			subnetVdr1StartTime := genesistest.DefaultValidatorStartTime.Add(1 * time.Minute)
+			subnetVdr1EndTime := genesistest.DefaultValidatorStartTime.Add(10 * defaultMinStakingDuration).Add(1 * time.Minute)
+			tx, err := wallet.IssueAddSubnetValidatorTx(
+				&txs.SubnetValidator{
+					Validator: txs.Validator{
+						NodeID: subnetValidatorNodeID,
+						Start:  uint64(subnetVdr1StartTime.Unix()),
+						End:    uint64(subnetVdr1EndTime.Unix()),
+						Wght:   1,
+					},
+					Subnet: subnetID,
+				},
 			)
 			require.NoError(err)
 
@@ -715,7 +733,7 @@ func TestBanffStandardBlockTrackedSubnet(t *testing.T) {
 			)
 			require.NoError(err)
 
-			env.state.PutPendingValidator(staker)
+			require.NoError(env.state.PutPendingValidator(staker))
 			env.state.AddTx(tx, status.Committed)
 			require.NoError(env.state.Commit())
 
@@ -736,8 +754,8 @@ func TestBanffStandardBlockTrackedSubnet(t *testing.T) {
 			block := env.blkManager.NewBlock(statelessStandardBlock)
 
 			// update staker set
-			require.NoError(block.Verify(context.Background()))
-			require.NoError(block.Accept(context.Background()))
+			require.NoError(block.Verify(t.Context()))
+			require.NoError(block.Accept(t.Context()))
 			_, ok := env.config.Validators.GetValidator(subnetID, subnetValidatorNodeID)
 			require.True(ok)
 		})
@@ -746,23 +764,23 @@ func TestBanffStandardBlockTrackedSubnet(t *testing.T) {
 
 func TestBanffStandardBlockDelegatorStakerWeight(t *testing.T) {
 	require := require.New(t)
-	env := newEnvironment(t, nil, banff)
+	env := newEnvironment(t, upgradetest.Banff)
 
 	// Case: Timestamp is after next validator start time
 	// Add a pending validator
-	pendingValidatorStartTime := defaultGenesisTime.Add(1 * time.Second)
+	pendingValidatorStartTime := genesistest.DefaultValidatorStartTime.Add(1 * time.Second)
 	pendingValidatorEndTime := pendingValidatorStartTime.Add(defaultMaxStakingDuration)
 	nodeID := ids.GenerateTestNodeID()
 	rewardAddress := ids.GenerateTestShortID()
-	_, err := addPendingValidator(
+	addPendingValidator(
+		t,
 		env,
 		pendingValidatorStartTime,
 		pendingValidatorEndTime,
 		nodeID,
 		rewardAddress,
-		[]*secp256k1.PrivateKey{preFundedKeys[0]},
+		[]*secp256k1.PrivateKey{genesistest.DefaultFundedKeys[0]},
 	)
-	require.NoError(err)
 
 	// build standard block moving ahead chain time
 	preferredID := env.state.GetLastAccepted()
@@ -776,31 +794,31 @@ func TestBanffStandardBlockDelegatorStakerWeight(t *testing.T) {
 	)
 	require.NoError(err)
 	blk := env.blkManager.NewBlock(statelessStandardBlock)
-	require.NoError(blk.Verify(context.Background()))
-	require.NoError(blk.Accept(context.Background()))
+	require.NoError(blk.Verify(t.Context()))
+	require.NoError(blk.Accept(t.Context()))
 	require.NoError(env.state.Commit())
 
 	// Test validator weight before delegation
 	vdrWeight := env.config.Validators.GetWeight(constants.PrimaryNetworkID, nodeID)
 	require.Equal(env.config.MinValidatorStake, vdrWeight)
 
+	wallet := newWallet(t, env, walletConfig{})
+
 	// Add delegator
 	pendingDelegatorStartTime := pendingValidatorStartTime.Add(1 * time.Second)
 	pendingDelegatorEndTime := pendingDelegatorStartTime.Add(1 * time.Second)
 
-	addDelegatorTx, err := env.txBuilder.NewAddDelegatorTx(
-		env.config.MinDelegatorStake,
-		uint64(pendingDelegatorStartTime.Unix()),
-		uint64(pendingDelegatorEndTime.Unix()),
-		nodeID,
-		preFundedKeys[0].PublicKey().Address(),
-		[]*secp256k1.PrivateKey{
-			preFundedKeys[0],
-			preFundedKeys[1],
-			preFundedKeys[4],
+	addDelegatorTx, err := wallet.IssueAddDelegatorTx(
+		&txs.Validator{
+			NodeID: nodeID,
+			Start:  uint64(pendingDelegatorStartTime.Unix()),
+			End:    uint64(pendingDelegatorEndTime.Unix()),
+			Wght:   env.config.MinDelegatorStake,
 		},
-		ids.ShortEmpty,
-		nil,
+		&secp256k1fx.OutputOwners{
+			Threshold: 1,
+			Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+		},
 	)
 	require.NoError(err)
 
@@ -827,8 +845,8 @@ func TestBanffStandardBlockDelegatorStakerWeight(t *testing.T) {
 	)
 	require.NoError(err)
 	blk = env.blkManager.NewBlock(statelessStandardBlock)
-	require.NoError(blk.Verify(context.Background()))
-	require.NoError(blk.Accept(context.Background()))
+	require.NoError(blk.Verify(t.Context()))
+	require.NoError(blk.Accept(t.Context()))
 	require.NoError(env.state.Commit())
 
 	// Test validator weight after delegation

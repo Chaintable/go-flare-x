@@ -1,10 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package syncer
 
 import (
-	"fmt"
+	"math/big"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
@@ -29,7 +29,7 @@ type Config struct {
 
 	// Alpha specifies the amount of weight that validators must put behind a
 	// state summary to consider it valid to sync to.
-	Alpha uint64
+	Alpha *big.Int
 
 	// StateSyncBeacons are the nodes that will be used to sample and vote over
 	// state summaries.
@@ -45,7 +45,7 @@ func NewConfig(
 	sender common.Sender,
 	beacons validators.Manager,
 	sampleK int,
-	alpha uint64,
+	alpha *big.Int,
 	stateSyncerIDs []ids.NodeID,
 	vm block.ChainVM,
 ) (Config, error) {
@@ -62,12 +62,13 @@ func NewConfig(
 				return Config{}, err
 			}
 		}
-		stateSyncingWeight, err := stateSyncBeacons.TotalWeight(ctx.SubnetID)
-		if err != nil {
-			return Config{}, fmt.Errorf("failed to calculate total weight of state sync beacons for subnet %s: %w", ctx.SubnetID, err)
+		stateSyncingWeight := stateSyncBeacons.TotalWeight(ctx.SubnetID)
+		// Clamp sampleK to the total weight. If the weight exceeds uint64,
+		// sampleK (a small int) is necessarily smaller, so leave it as is.
+		if stateSyncingWeight.IsUint64() {
+			sampleK = int(min(uint64(sampleK), stateSyncingWeight.Uint64()))
 		}
-		sampleK = int(min(uint64(sampleK), stateSyncingWeight))
-		alpha = stateSyncingWeight/2 + 1 // must be > 50%
+		alpha = new(big.Int).Add(new(big.Int).Div(stateSyncingWeight, big.NewInt(2)), big.NewInt(1)) // must be > 50%
 	}
 	return Config{
 		AllGetsServer:    snowGetHandler,

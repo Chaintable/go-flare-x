@@ -1,14 +1,13 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package payload
 
 import (
-	"time"
+	"errors"
 
 	"github.com/ava-labs/avalanchego/codec"
 	"github.com/ava-labs/avalanchego/codec/linearcodec"
-	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/units"
 )
 
@@ -22,9 +21,9 @@ var Codec codec.Manager
 
 func init() {
 	Codec = codec.NewManager(MaxMessageSize)
-	lc := linearcodec.NewDefault(time.Time{})
+	lc := linearcodec.NewDefault()
 
-	err := utils.Err(
+	err := errors.Join(
 		lc.RegisterType(&Hash{}),
 		lc.RegisterType(&AddressedCall{}),
 		Codec.RegisterCodec(CodecVersion, lc),

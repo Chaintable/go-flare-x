@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package p2p
@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/snow/engine/common"
 	"github.com/ava-labs/avalanchego/utils/logging"
 )
 
@@ -47,7 +48,7 @@ func TestThrottlerHandlerAppGossip(t *testing.T) {
 				logging.NoLog{},
 			)
 
-			handler.AppGossip(context.Background(), ids.GenerateTestNodeID(), []byte("foobar"))
+			handler.AppGossip(t.Context(), ids.GenerateTestNodeID(), []byte("foobar"))
 			require.Equal(tt.expected, called)
 		})
 	}
@@ -57,7 +58,7 @@ func TestThrottlerHandlerAppRequest(t *testing.T) {
 	tests := []struct {
 		name        string
 		Throttler   Throttler
-		expectedErr error
+		expectedErr *common.AppError
 	}{
 		{
 			name:      "not throttled",
@@ -78,7 +79,7 @@ func TestThrottlerHandlerAppRequest(t *testing.T) {
 				tt.Throttler,
 				logging.NoLog{},
 			)
-			_, err := handler.AppRequest(context.Background(), ids.GenerateTestNodeID(), time.Time{}, []byte("foobar"))
+			_, err := handler.AppRequest(t.Context(), ids.GenerateTestNodeID(), time.Time{}, []byte("foobar"))
 			require.ErrorIs(err, tt.expectedErr)
 		})
 	}

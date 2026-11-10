@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package chains
@@ -117,16 +117,12 @@ func TestSubnetConfigs(t *testing.T) {
 			config: map[ids.ID]subnets.Config{
 				constants.PrimaryNetworkID: {},
 				testSubnetID: {
-					GossipConfig: subnets.GossipConfig{
-						AcceptedFrontierValidatorSize: 123456789,
-					},
+					ValidatorOnly: true,
 				},
 			},
 			subnetID: testSubnetID,
 			want: subnets.Config{
-				GossipConfig: subnets.GossipConfig{
-					AcceptedFrontierValidatorSize: 123456789,
-				},
+				ValidatorOnly: true,
 			},
 		},
 	}

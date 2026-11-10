@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package genesis
@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
 	"github.com/ava-labs/avalanchego/vms/platformvm/reward"
+	"github.com/ava-labs/avalanchego/vms/platformvm/validators/fee"
 )
 
 type StakingConfig struct {
@@ -34,24 +36,10 @@ type StakingConfig struct {
 }
 
 type TxFeeConfig struct {
-	// Transaction fee
-	TxFee uint64 `json:"txFee"`
-	// Transaction fee for create asset transactions
-	CreateAssetTxFee uint64 `json:"createAssetTxFee"`
-	// Transaction fee for create subnet transactions
-	CreateSubnetTxFee uint64 `json:"createSubnetTxFee"`
-	// Transaction fee for transform subnet transactions
-	TransformSubnetTxFee uint64 `json:"transformSubnetTxFee"`
-	// Transaction fee for create blockchain transactions
-	CreateBlockchainTxFee uint64 `json:"createBlockchainTxFee"`
-	// Transaction fee for adding a primary network validator
-	AddPrimaryNetworkValidatorFee uint64 `json:"addPrimaryNetworkValidatorFee"`
-	// Transaction fee for adding a primary network delegator
-	AddPrimaryNetworkDelegatorFee uint64 `json:"addPrimaryNetworkDelegatorFee"`
-	// Transaction fee for adding a subnet validator
-	AddSubnetValidatorFee uint64 `json:"addSubnetValidatorFee"`
-	// Transaction fee for adding a subnet delegator
-	AddSubnetDelegatorFee uint64 `json:"addSubnetDelegatorFee"`
+	CreateAssetTxFee   uint64     `json:"createAssetTxFee"`
+	TxFee              uint64     `json:"txFee"`
+	DynamicFeeConfig   gas.Config `json:"dynamicFeeConfig"`
+	ValidatorFeeConfig fee.Config `json:"validatorFeeConfig"`
 }
 
 type Params struct {
@@ -60,11 +48,11 @@ type Params struct {
 }
 
 func GetTxFeeConfig(networkID uint32) TxFeeConfig {
+	// TxFee configs are ommitted for LocalFlare and Local networks since they
+	// are set from program arguments (getTxFeeConfig)
 	switch networkID {
 	case constants.MainnetID:
 		return MainnetParams.TxFeeConfig
-	case constants.LocalID:
-		return LocalParams.TxFeeConfig
 	case constants.FlareID:
 		return FlareParams.TxFeeConfig
 	case constants.CostwoID:
@@ -76,6 +64,7 @@ func GetTxFeeConfig(networkID uint32) TxFeeConfig {
 	case constants.CostonID:
 		return CostonParams.TxFeeConfig
 	default:
+		// for LocalID and any other networkID
 		return LocalParams.TxFeeConfig
 	}
 }

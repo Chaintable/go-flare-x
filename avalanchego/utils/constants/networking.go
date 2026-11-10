@@ -1,22 +1,16 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package constants
 
 import (
-	"math"
 	"time"
 
 	"github.com/ava-labs/avalanchego/utils/compression"
 	"github.com/ava-labs/avalanchego/utils/units"
 )
 
-// Const variables to be exported
 const (
-	// Request ID used when sending a Put message to gossip an accepted container
-	// (ie not sent in response to a Get)
-	GossipMsgRequestID uint32 = math.MaxUint32
-
 	// The network must be "tcp", "tcp4", "tcp6", "unix" or "unixpacket".
 	NetworkType = "tcp"
 
@@ -44,13 +38,14 @@ const (
 	DefaultOutboundConnectionTimeout       = 30 * time.Second
 
 	// Timeouts
-	DefaultNetworkInitialTimeout        = 5 * time.Second
-	DefaultNetworkMinimumTimeout        = 2 * time.Second
-	DefaultNetworkMaximumTimeout        = 10 * time.Second
-	DefaultNetworkMaximumInboundTimeout = 10 * time.Second
-	DefaultNetworkTimeoutHalflife       = 5 * time.Minute
-	DefaultNetworkTimeoutCoefficient    = 2
-	DefaultNetworkReadHandshakeTimeout  = 15 * time.Second
+	DefaultNetworkInitialTimeout                   = 5 * time.Second
+	DefaultNetworkMinimumTimeout                   = 2 * time.Second
+	DefaultNetworkMaximumTimeout                   = 10 * time.Second
+	DefaultNetworkMaximumInboundTimeout            = 10 * time.Second
+	DefaultNetworkTimeoutHalflife                  = 5 * time.Minute
+	DefaultNetworkTimeoutCoefficient               = 2
+	DefaultNetworkReadHandshakeTimeout             = 15 * time.Second
+	DefaultNoIngressValidatorConnectionGracePeriod = 10 * time.Minute
 
 	DefaultNetworkCompressionType           = compression.TypeZstd
 	DefaultNetworkMaxClockDifference        = time.Minute
@@ -73,18 +68,9 @@ const (
 	DefaultBenchlistMinFailingDuration = 2*time.Minute + 30*time.Second
 
 	// Router
-	DefaultConsensusAppConcurrency                         = 2
-	DefaultConsensusShutdownTimeout                        = time.Minute
-	DefaultFrontierPollFrequency                           = 100 * time.Millisecond
-	DefaultConsensusGossipAcceptedFrontierValidatorSize    = 0
-	DefaultConsensusGossipAcceptedFrontierNonValidatorSize = 0
-	DefaultConsensusGossipAcceptedFrontierPeerSize         = 1
-	DefaultConsensusGossipOnAcceptValidatorSize            = 0
-	DefaultConsensusGossipOnAcceptNonValidatorSize         = 0
-	DefaultConsensusGossipOnAcceptPeerSize                 = 10
-	DefaultAppGossipValidatorSize                          = 10
-	DefaultAppGossipNonValidatorSize                       = 0
-	DefaultAppGossipPeerSize                               = 0
+	DefaultConsensusAppConcurrency  = 2
+	DefaultConsensusShutdownTimeout = time.Minute
+	DefaultFrontierPollFrequency    = 100 * time.Millisecond
 
 	// Inbound Throttling
 	DefaultInboundThrottlerAtLargeAllocSize         = 6 * units.MiB

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package timeout
@@ -27,7 +27,7 @@ func TestManagerFire(t *testing.T) {
 			TimeoutHalflife:    5 * time.Minute,
 		},
 		benchlist,
-		"",
+		prometheus.NewRegistry(),
 		prometheus.NewRegistry(),
 	)
 	require.NoError(t, err)
@@ -39,7 +39,7 @@ func TestManagerFire(t *testing.T) {
 
 	manager.RegisterRequest(
 		ids.EmptyNodeID,
-		ids.ID{},
+		ids.Empty,
 		true,
 		ids.RequestID{},
 		wg.Done,

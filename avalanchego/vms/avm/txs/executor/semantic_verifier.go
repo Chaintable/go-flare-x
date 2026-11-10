@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package executor
@@ -6,10 +6,10 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/version"
 	"github.com/ava-labs/avalanchego/vms/avm/state"
 	"github.com/ava-labs/avalanchego/vms/avm/txs"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
@@ -37,19 +37,19 @@ func (v *SemanticVerifier) BaseTx(tx *txs.BaseTx) error {
 		// syntactic verification, which happens before semantic verification.
 		cred := v.Tx.Creds[i].Credential
 		if err := v.verifyTransfer(tx, in, cred); err != nil {
-			return err
+			return fmt.Errorf("failed to verify transfer: %w", err)
 		}
 	}
 
 	for _, out := range tx.Outs {
 		fxIndex, err := v.getFx(out.Out)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get fx: %w", err)
 		}
 
 		assetID := out.AssetID()
 		if err := v.verifyFxUsage(fxIndex, assetID); err != nil {
-			return err
+			return fmt.Errorf("failed to verify fx usage: %w", err)
 		}
 	}
 
@@ -154,7 +154,7 @@ func (v *SemanticVerifier) verifyTransfer(
 ) error {
 	utxo, err := v.State.GetUTXO(in.UTXOID.InputID())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get utxo %s: %w", in.UTXOID.InputID(), err)
 	}
 	return v.verifyTransferOfUTXO(tx, in, cred, utxo)
 }
@@ -240,11 +240,9 @@ func (v *SemanticVerifier) verifyFxUsage(
 		}
 	}
 
-	if !v.State.GetTimestamp().Before(version.GetCortinaTime(v.Ctx.NetworkID)) {
-		// Allow fx to be used for AVAX asset with fxID 0 when createAssetTx.States is empty
-		if len(createAssetTx.States) == 0 && assetID == v.Ctx.AVAXAssetID && fxID == 0 {
-			return nil
-		}
+	// Allow fx to be used for AVAX asset with fxID 0 when createAssetTx.States is empty
+	if len(createAssetTx.States) == 0 && assetID == v.Ctx.AVAXAssetID && fxID == 0 {
+		return nil
 	}
 
 	return errIncompatibleFx

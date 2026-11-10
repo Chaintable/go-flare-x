@@ -1,11 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package secp256k1fx
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -81,7 +80,7 @@ func TestTransferInputVerifyUnsorted(t *testing.T) {
 
 func TestTransferInputSerialize(t *testing.T) {
 	require := require.New(t)
-	c := linearcodec.NewDefault(time.Time{})
+	c := linearcodec.NewDefault()
 	m := codec.NewDefaultManager()
 	require.NoError(m.RegisterCodec(0, c))
 

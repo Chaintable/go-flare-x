@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package message
@@ -12,15 +12,12 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/compression"
-	"github.com/ava-labs/avalanchego/utils/logging"
 )
 
 func Test_newOutboundBuilder(t *testing.T) {
 	t.Parallel()
 
 	mb, err := newMsgBuilder(
-		logging.NoLog{},
-		"test",
 		prometheus.NewRegistry(),
 		10*time.Second,
 	)
@@ -40,7 +37,7 @@ func Test_newOutboundBuilder(t *testing.T) {
 				[]uint64{1000, 2000},
 			)
 			require.NoError(t, err)
-			t.Logf("outbound message with compression type %s built message with size %d", compressionType, len(outMsg.Bytes()))
+			t.Logf("outbound message with compression type %s built message with size %d", compressionType, len(outMsg.Bytes))
 		})
 	}
 }

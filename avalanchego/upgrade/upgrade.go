@@ -42,7 +42,7 @@ var (
 		FortunaTime:               time.Date(2025, time.April, 8, 15, 0, 0, 0, time.UTC),
 		GraniteTime:               time.Date(2025, time.November, 19, 16, 0, 0, 0, time.UTC),
 		GraniteEpochDuration:      5 * time.Minute,
-		HeliconTime:               UnscheduledActivationTime,
+		HeliconTime:               time.Date(2026, time.September, 22, 15, 0, 0, 0, time.UTC),
 	}
 	// Fuji = Config{
 	// 	ApricotPhase1Time:            time.Date(2021, time.March, 26, 14, 0, 0, 0, time.UTC),
@@ -66,13 +66,14 @@ var (
 	//  FortunaTime :              UnscheduledActivationTime,
 	// 	GraniteTime:               time.Date(2025, time.October, 29, 15, 0, 0, 0, time.UTC),
 	// 	GraniteEpochDuration:      5 * time.Minute,
+	//  HeliconTime:               time.Date(2026, time.July, 28, 15, 0, 0, 0, time.UTC),
 	// }
 	Flare = Config{
-		ApricotPhase1Time:     InitiallyActiveTime,
-		ApricotPhase2Time:     InitiallyActiveTime,
-		ApricotPhase3Time:     InitiallyActiveTime,
-		ApricotPhase4Time:     InitiallyActiveTime,
-		ApricotPhase5Time:     InitiallyActiveTime,
+		ApricotPhase1Time:     ZeroTime,
+		ApricotPhase2Time:     ZeroTime,
+		ApricotPhase3Time:     ZeroTime,
+		ApricotPhase4Time:     ZeroTime,
+		ApricotPhase5Time:     ZeroTime,
 		ApricotPhasePre6Time:  time.Date(2024, time.December, 17, 12, 0, 0, 0, time.UTC),
 		ApricotPhase6Time:     time.Date(2024, time.December, 17, 13, 0, 0, 0, time.UTC),
 		ApricotPhasePost6Time: time.Date(2024, time.December, 17, 14, 0, 0, 0, time.UTC),
@@ -83,11 +84,11 @@ var (
 		FortunaTime:           time.Date(2026, time.April, 14, 12, 0, 0, 0, time.UTC),
 		GraniteTime:           time.Date(2026, time.July, 14, 12, 0, 0, 0, time.UTC),
 		GraniteEpochDuration:  5 * time.Minute,
-		HeliconTime:           UnscheduledActivationTime,
+		HeliconTime:           time.Date(2026, time.November, 11, 14, 0, 0, 0, time.UTC),
 	}
 	Songbird = Config{
-		ApricotPhase1Time:      InitiallyActiveTime,
-		ApricotPhase2Time:      InitiallyActiveTime,
+		ApricotPhase1Time:      ZeroTime,
+		ApricotPhase2Time:      ZeroTime,
 		ApricotPhase3Time:      time.Date(2022, time.March, 7, 14, 0, 0, 0, time.UTC),
 		ApricotPhase4Time:      time.Date(2022, time.March, 7, 15, 0, 0, 0, time.UTC),
 		ApricotPhase5Time:      time.Date(2022, time.March, 7, 16, 0, 0, 0, time.UTC),
@@ -102,14 +103,14 @@ var (
 		FortunaTime:            time.Date(2026, time.March, 31, 12, 0, 0, 0, time.UTC),
 		GraniteTime:            time.Date(2026, time.July, 7, 12, 0, 0, 0, time.UTC),
 		GraniteEpochDuration:   5 * time.Minute,
-		HeliconTime:            UnscheduledActivationTime,
+		HeliconTime:            time.Date(2026, time.November, 11, 8, 0, 0, 0, time.UTC),
 	}
 	Costwo = Config{
-		ApricotPhase1Time:     InitiallyActiveTime,
-		ApricotPhase2Time:     InitiallyActiveTime,
-		ApricotPhase3Time:     InitiallyActiveTime,
-		ApricotPhase4Time:     InitiallyActiveTime,
-		ApricotPhase5Time:     InitiallyActiveTime,
+		ApricotPhase1Time:     ZeroTime,
+		ApricotPhase2Time:     ZeroTime,
+		ApricotPhase3Time:     ZeroTime,
+		ApricotPhase4Time:     ZeroTime,
+		ApricotPhase5Time:     ZeroTime,
 		ApricotPhasePre6Time:  time.Date(2024, time.November, 26, 12, 0, 0, 0, time.UTC),
 		ApricotPhase6Time:     time.Date(2024, time.November, 26, 13, 0, 0, 0, time.UTC),
 		ApricotPhasePost6Time: time.Date(2024, time.November, 26, 14, 0, 0, 0, time.UTC),
@@ -120,11 +121,11 @@ var (
 		FortunaTime:           time.Date(2026, time.March, 24, 12, 0, 0, 0, time.UTC),
 		GraniteTime:           time.Date(2026, time.June, 16, 12, 0, 0, 0, time.UTC),
 		GraniteEpochDuration:  5 * time.Minute,
-		HeliconTime:           UnscheduledActivationTime,
+		HeliconTime:           time.Date(2026, time.November, 3, 12, 0, 0, 0, time.UTC),
 	}
 	Coston = Config{
-		ApricotPhase1Time:      InitiallyActiveTime,
-		ApricotPhase2Time:      InitiallyActiveTime,
+		ApricotPhase1Time:      ZeroTime,
+		ApricotPhase2Time:      ZeroTime,
 		ApricotPhase3Time:      time.Date(2022, time.February, 25, 14, 0, 0, 0, time.UTC),
 		ApricotPhase4Time:      time.Date(2022, time.February, 25, 15, 0, 0, 0, time.UTC),
 		ApricotPhase5Time:      time.Date(2022, time.February, 25, 16, 0, 0, 0, time.UTC),
@@ -139,7 +140,7 @@ var (
 		FortunaTime:            time.Date(2026, time.March, 17, 12, 0, 0, 0, time.UTC),
 		GraniteTime:            time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC),
 		GraniteEpochDuration:   5 * time.Minute,
-		HeliconTime:            UnscheduledActivationTime,
+		HeliconTime:            time.Date(2026, time.November, 11, 7, 0, 0, 0, time.UTC),
 	}
 	LocalFlare = Config{
 		ApricotPhase1Time:            ZeroTime,
@@ -159,7 +160,7 @@ var (
 		FortunaTime:                  ZeroTime,
 		GraniteTime:                  ZeroTime,
 		GraniteEpochDuration:         5 * time.Minute,
-		HeliconTime:                  UnscheduledActivationTime,
+		HeliconTime:                  ZeroTime,
 	}
 	Local = Config{
 		ApricotPhase1Time:            ZeroTime,
@@ -180,7 +181,7 @@ var (
 		FortunaTime:                  ZeroTime,
 		GraniteTime:                  ZeroTime,
 		GraniteEpochDuration:         5 * time.Minute,
-		HeliconTime:                  UnscheduledActivationTime,
+		HeliconTime:                  ZeroTime,
 	}
 	Default = Config{
 		ApricotPhase1Time:            InitiallyActiveTime,
@@ -200,7 +201,7 @@ var (
 		FortunaTime:                  InitiallyActiveTime,
 		GraniteTime:                  InitiallyActiveTime,
 		GraniteEpochDuration:         30 * time.Second,
-		HeliconTime:                  UnscheduledActivationTime,
+		HeliconTime:                  InitiallyActiveTime,
 	}
 
 	ErrInvalidUpgradeTimes = errors.New("invalid upgrade configuration")

@@ -84,7 +84,9 @@ var (
 	errMinValidatorStakeAboveMax              = errors.New("minimum validator stake can't be greater than maximum validator stake")
 	errInvalidDelegationFee                   = errors.New("delegation fee must be in the range [0, 1,000,000]")
 	errInvalidMinStakeDuration                = errors.New("min stake duration must be > 0")
+	errInvalidHeliconMinStakeDuration         = errors.New("helicon min stake duration must be > 0")
 	errMinStakeDurationAboveMax               = errors.New("max stake duration can't be less than min stake duration")
+	errHeliconMinStakeDurationAboveMax        = errors.New("max stake duration can't be less than helicon min stake duration")
 	errStakeMaxConsumptionTooLarge            = fmt.Errorf("max stake consumption must be less than or equal to %d", reward.PercentDenominator)
 	errStakeMaxConsumptionBelowMin            = errors.New("stake max consumption can't be less than min stake consumption")
 	errStakeMintingPeriodBelowMin             = errors.New("stake minting period can't be less than max stake duration")
@@ -794,12 +796,17 @@ func getStakingConfig(v *viper.Viper, networkID uint32) (node.StakingConfig, err
 	if err != nil {
 		return node.StakingConfig{}, err
 	}
-	if networkID != constants.MainnetID {
+	// The staking flags are honored on local and custom networks only. The
+	// public networks (Avalanche Mainnet and the Flare/Songbird networks in
+	// constants.ProductionNetworkIDs) use fixed per-network values, so that a
+	// node flag can never make nodes disagree on a consensus parameter.
+	if networkID != constants.MainnetID && !constants.ProductionNetworkIDs.Contains(networkID) {
 		config.UptimeRequirement = v.GetFloat64(UptimeRequirementKey)
 		config.MinValidatorStake = v.GetUint64(MinValidatorStakeKey)
 		config.MaxValidatorStake = v.GetUint64(MaxValidatorStakeKey)
 		config.MinDelegatorStake = v.GetUint64(MinDelegatorStakeKey)
 		config.MinStakeDuration = v.GetDuration(MinStakeDurationKey)
+		config.HeliconMinStakeDuration = v.GetDuration(HeliconMinStakeDurationKey)
 		config.MaxStakeDuration = v.GetDuration(MaxStakeDurationKey)
 		config.RewardConfig.MaxConsumptionRate = v.GetUint64(StakeMaxConsumptionRateKey)
 		config.RewardConfig.MinConsumptionRate = v.GetUint64(StakeMinConsumptionRateKey)
@@ -815,8 +822,12 @@ func getStakingConfig(v *viper.Viper, networkID uint32) (node.StakingConfig, err
 			return node.StakingConfig{}, errInvalidDelegationFee
 		case config.MinStakeDuration <= 0:
 			return node.StakingConfig{}, errInvalidMinStakeDuration
+		case config.HeliconMinStakeDuration <= 0:
+			return node.StakingConfig{}, errInvalidHeliconMinStakeDuration
 		case config.MaxStakeDuration < config.MinStakeDuration:
 			return node.StakingConfig{}, errMinStakeDurationAboveMax
+		case config.MaxStakeDuration < config.HeliconMinStakeDuration:
+			return node.StakingConfig{}, errHeliconMinStakeDurationAboveMax
 		case config.RewardConfig.MaxConsumptionRate > reward.PercentDenominator:
 			return node.StakingConfig{}, errStakeMaxConsumptionTooLarge
 		case config.RewardConfig.MaxConsumptionRate < config.RewardConfig.MinConsumptionRate:
@@ -825,6 +836,9 @@ func getStakingConfig(v *viper.Viper, networkID uint32) (node.StakingConfig, err
 			return node.StakingConfig{}, errStakeMintingPeriodBelowMin
 		}
 	} else {
+		// See genesis.GetStakingConfig for how these values apply on the Flare
+		// networks, whose primary network rules live in
+		// vms/platformvm/txs/executor/inflation_settings.go.
 		config.StakingConfig = genesis.GetStakingConfig(networkID)
 	}
 	return config, nil

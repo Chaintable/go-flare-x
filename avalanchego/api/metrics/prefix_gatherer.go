@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ava-labs/avalanchego/utils/metric"
@@ -69,7 +68,7 @@ func (g *prefixedGatherer) Gather() ([]*dto.MetricFamily, error) {
 		if strings.Contains(metricFamily.GetName(), "pipeline_") || strings.Contains(metricFamily.GetName(), "chain_") {
 			continue
 		}
-		metricFamily.Name = proto.String(metric.AppendNamespace(
+		metricFamily.Name = new(metric.AppendNamespace(
 			g.prefix,
 			metricFamily.GetName(),
 		))

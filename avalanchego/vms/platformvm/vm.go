@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package platformvm
@@ -7,15 +7,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gorilla/rpc/v2"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/ava-labs/avalanchego/cache"
+	"github.com/ava-labs/avalanchego/api/metrics"
+	"github.com/ava-labs/avalanchego/cache/lru"
 	"github.com/ava-labs/avalanchego/codec"
 	"github.com/ava-labs/avalanchego/codec/linearcodec"
 	"github.com/ava-labs/avalanchego/database"
@@ -23,6 +23,7 @@ import (
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
+	"github.com/ava-labs/avalanchego/snow/pchain"
 	"github.com/ava-labs/avalanchego/snow/uptime"
 	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/utils"
@@ -32,41 +33,42 @@ import (
 	"github.com/ava-labs/avalanchego/utils/timer/mockable"
 	"github.com/ava-labs/avalanchego/version"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
-	"github.com/ava-labs/avalanchego/vms/platformvm/block"
 	"github.com/ava-labs/avalanchego/vms/platformvm/config"
 	"github.com/ava-labs/avalanchego/vms/platformvm/fx"
-	"github.com/ava-labs/avalanchego/vms/platformvm/metrics"
+	"github.com/ava-labs/avalanchego/vms/platformvm/genesis"
 	"github.com/ava-labs/avalanchego/vms/platformvm/network"
-	"github.com/ava-labs/avalanchego/vms/platformvm/reward"
+	"github.com/ava-labs/avalanchego/vms/platformvm/pchainreader"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
 	"github.com/ava-labs/avalanchego/vms/platformvm/utxo"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
+	"github.com/ava-labs/avalanchego/vms/txs/mempool"
 
 	snowmanblock "github.com/ava-labs/avalanchego/snow/engine/snowman/block"
 	blockbuilder "github.com/ava-labs/avalanchego/vms/platformvm/block/builder"
 	blockexecutor "github.com/ava-labs/avalanchego/vms/platformvm/block/executor"
-	txbuilder "github.com/ava-labs/avalanchego/vms/platformvm/txs/builder"
+	platformvmmetrics "github.com/ava-labs/avalanchego/vms/platformvm/metrics"
 	txexecutor "github.com/ava-labs/avalanchego/vms/platformvm/txs/executor"
+	pmempool "github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
 	pvalidators "github.com/ava-labs/avalanchego/vms/platformvm/validators"
 )
 
 var (
-	_ snowmanblock.ChainVM       = (*VM)(nil)
-	_ secp256k1fx.VM             = (*VM)(nil)
-	_ validators.State           = (*VM)(nil)
-	_ validators.SubnetConnector = (*VM)(nil)
+	_ snowmanblock.ChainVM                         = (*VM)(nil)
+	_ snowmanblock.BuildBlockWithContextChainVM    = (*VM)(nil)
+	_ snowmanblock.SetPreferenceWithContextChainVM = (*VM)(nil)
+	_ secp256k1fx.VM                               = (*VM)(nil)
+	_ validators.State                             = (*VM)(nil)
+	_ pchain.ReaderProvider                        = (*VM)(nil)
 )
 
 type VM struct {
-	config.Config
+	config.Internal
 	blockbuilder.Builder
-	network.Network
+	*network.Network
 	validators.State
 
-	metrics            metrics.Metrics
-	atomicUtxosManager avax.AtomicUTXOManager
+	metrics platformvmmetrics.Metrics
 
 	// Used to get time. Useful for faking time during tests.
 	clock mockable.Clock
@@ -77,7 +79,10 @@ type VM struct {
 	ctx *snow.Context
 	db  database.Database
 
-	state state.State
+	state *state.State
+	// genesisUTXOs are the genesis UTXOs (TxID == ids.Empty), kept so the
+	// P-chain reader can resolve their owners; they have no producing tx.
+	genesisUTXOs []*avax.UTXO
 
 	fx            fx.Fx
 	codecRegistry codec.Registry
@@ -85,16 +90,12 @@ type VM struct {
 	// Bootstrapped remembers if this chain has finished bootstrapping or not
 	bootstrapped utils.Atomic[bool]
 
-	txBuilder txbuilder.Builder
-	manager   blockexecutor.Manager
+	manager blockexecutor.Manager
 
 	// Cancelled on shutdown
 	onShutdownCtx context.Context
 	// Call [onShutdownCtxCancel] to cancel [onShutdownCtx] during Shutdown()
 	onShutdownCtxCancel context.CancelFunc
-
-	// TODO: Remove after v1.11.x is activated
-	pruned utils.Atomic[bool]
 }
 
 // Initialize this blockchain.
@@ -106,25 +107,24 @@ func (vm *VM) Initialize(
 	genesisBytes []byte,
 	_ []byte,
 	configBytes []byte,
-	toEngine chan<- common.Message,
 	_ []*common.Fx,
 	appSender common.AppSender,
 ) error {
 	chainCtx.Log.Verbo("initializing platform chain")
 
-	execConfig, err := config.GetExecutionConfig(configBytes)
+	execConfig, err := config.GetConfig(configBytes)
 	if err != nil {
 		return err
 	}
 	chainCtx.Log.Info("using VM execution config", zap.Reflect("config", execConfig))
 
-	registerer := prometheus.NewRegistry()
-	if err := chainCtx.Metrics.Register(registerer); err != nil {
+	registerer, err := metrics.MakeAndRegister(chainCtx.Metrics, "")
+	if err != nil {
 		return err
 	}
 
 	// Initialize metrics as soon as possible
-	vm.metrics, err = metrics.New("", registerer)
+	vm.metrics, err = platformvmmetrics.New(registerer)
 	if err != nil {
 		return fmt.Errorf("failed to initialize metrics: %w", err)
 	}
@@ -133,57 +133,60 @@ func (vm *VM) Initialize(
 	vm.db = db
 
 	// Note: this codec is never used to serialize anything
-	vm.codecRegistry = linearcodec.NewDefault(time.Time{})
+	vm.codecRegistry = linearcodec.NewDefault()
 	vm.fx = &secp256k1fx.Fx{}
 	if err := vm.fx.Initialize(vm); err != nil {
 		return err
 	}
 
-	rewards := reward.NewCalculator(vm.RewardConfig)
-
 	vm.state, err = state.New(
 		vm.db,
 		genesisBytes,
 		registerer,
-		&vm.Config,
+		vm.Internal.Validators,
+		vm.Internal.UpgradeConfig,
 		execConfig,
 		vm.ctx,
 		vm.metrics,
-		rewards,
+		vm.RewardConfig,
 	)
 	if err != nil {
 		return err
 	}
 
-	validatorManager := pvalidators.NewManager(chainCtx.Log, vm.Config, vm.state, vm.metrics, &vm.clock)
+	genesisState, err := genesis.Parse(genesisBytes)
+	if err != nil {
+		return fmt.Errorf("parsing genesis: %w", err)
+	}
+	vm.genesisUTXOs = make([]*avax.UTXO, 0, len(genesisState.UTXOs))
+	for _, utxo := range genesisState.UTXOs {
+		genesisUTXO := utxo.UTXO
+		vm.genesisUTXOs = append(vm.genesisUTXOs, &genesisUTXO)
+	}
+
+	validatorManager := pvalidators.NewManager(vm.Internal, vm.state, vm.metrics, &vm.clock)
 	vm.State = validatorManager
-	vm.atomicUtxosManager = avax.NewAtomicUTXOManager(chainCtx.SharedMemory, txs.Codec)
-	utxoHandler := utxo.NewHandler(vm.ctx, &vm.clock, vm.fx)
+	utxoVerifier := utxo.NewVerifier(vm.ctx, &vm.clock, vm.fx)
 	vm.uptimeManager = uptime.NewManager(vm.state, &vm.clock)
 	vm.UptimeLockedCalculator.SetCalculator(&vm.bootstrapped, &chainCtx.Lock, vm.uptimeManager)
 
-	vm.txBuilder = txbuilder.New(
-		vm.ctx,
-		&vm.Config,
-		&vm.clock,
-		vm.fx,
-		vm.state,
-		vm.atomicUtxosManager,
-		utxoHandler,
-	)
-
 	txExecutorBackend := &txexecutor.Backend{
-		Config:       &vm.Config,
+		Config:       &vm.Internal,
 		Ctx:          vm.ctx,
 		Clk:          &vm.clock,
 		Fx:           vm.fx,
-		FlowChecker:  utxoHandler,
+		FlowChecker:  utxoVerifier,
 		Uptimes:      vm.uptimeManager,
-		Rewards:      rewards,
 		Bootstrapped: &vm.bootstrapped,
 	}
 
-	mempool, err := mempool.New("mempool", registerer, toEngine)
+	mempool, err := pmempool.New(
+		"mempool",
+		vm.Internal.DynamicFeeConfig.Weights,
+		execConfig.MempoolGasCapacity,
+		vm.ctx.AVAXAssetID,
+		registerer,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create mempool: %w", err)
 	}
@@ -209,6 +212,9 @@ func (vm *VM) Initialize(
 		mempool,
 		txExecutorBackend.Config.PartialSyncPrimaryNetwork,
 		appSender,
+		chainCtx.Lock.RLocker(),
+		vm.state,
+		chainCtx.WarpSigner,
 		registerer,
 		execConfig.Network,
 	)
@@ -219,7 +225,8 @@ func (vm *VM) Initialize(
 	vm.onShutdownCtx, vm.onShutdownCtxCancel = context.WithCancel(context.Background())
 	// TODO: Wait for this goroutine to exit during Shutdown once the platformvm
 	// has better control of the context lock.
-	go vm.Network.Gossip(vm.onShutdownCtx)
+	go vm.Network.PushGossip(vm.onShutdownCtx)
+	go vm.Network.PullGossip(vm.onShutdownCtx)
 
 	vm.Builder = blockbuilder.New(
 		mempool,
@@ -247,28 +254,13 @@ func (vm *VM) Initialize(
 	// [periodicallyPruneMempool] grabs the context lock.
 	go vm.periodicallyPruneMempool(execConfig.MempoolPruneFrequency)
 
-	shouldPrune, err := vm.state.ShouldPrune()
-	if err != nil {
-		return fmt.Errorf(
-			"failed to check if the database should be pruned: %w",
-			err,
-		)
-	}
-	if !shouldPrune {
-		chainCtx.Log.Info("state already pruned and indexed")
-		vm.pruned.Set(true)
-		return nil
-	}
-
 	go func() {
-		err := vm.state.PruneAndIndex(&vm.ctx.Lock, vm.ctx.Log)
+		err := vm.state.ReindexBlocks(&vm.ctx.Lock, vm.ctx.Log)
 		if err != nil {
-			vm.ctx.Log.Error("state pruning and height indexing failed",
+			vm.ctx.Log.Warn("reindexing blocks failed",
 				zap.Error(err),
 			)
 		}
-
-		vm.pruned.Set(true)
 	}()
 
 	return nil
@@ -299,7 +291,7 @@ func (vm *VM) pruneMempool() error {
 	// Packing all of the transactions in order performs additional checks that
 	// the MempoolTxVerifier doesn't include. So, evicting transactions from
 	// here is expected to happen occasionally.
-	blockTxs, err := vm.Builder.PackBlockTxs(math.MaxInt)
+	blockTxs, err := vm.Builder.PackAllBlockTxs()
 	if err != nil {
 		return err
 	}
@@ -319,7 +311,7 @@ func (vm *VM) pruneMempool() error {
 
 // Create all chains that exist that this node validates.
 func (vm *VM) initBlockchains() error {
-	if vm.Config.PartialSyncPrimaryNetwork {
+	if vm.Internal.PartialSyncPrimaryNetwork {
 		vm.ctx.Log.Info("skipping primary network chain creation")
 	} else if err := vm.createSubnet(constants.PrimaryNetworkID); err != nil {
 		return err
@@ -332,12 +324,12 @@ func (vm *VM) initBlockchains() error {
 			}
 		}
 	} else {
-		subnets, err := vm.state.GetSubnets()
+		subnetIDs, err := vm.state.GetSubnetIDs()
 		if err != nil {
 			return err
 		}
-		for _, subnet := range subnets {
-			if err := vm.createSubnet(subnet.ID()); err != nil {
+		for _, subnetID := range subnetIDs {
+			if err := vm.createSubnet(subnetID); err != nil {
 				return err
 			}
 		}
@@ -352,11 +344,11 @@ func (vm *VM) createSubnet(subnetID ids.ID) error {
 		return err
 	}
 	for _, chain := range chains {
-		tx, ok := chain.Unsigned.(*txs.CreateChainTx)
+		tx, ok := chain.Unsigned.(*platform.CreateChainTx)
 		if !ok {
-			return fmt.Errorf("expected tx type *txs.CreateChainTx but got %T", chain.Unsigned)
+			return fmt.Errorf("expected tx type *platform.CreateChainTx but got %T", chain.Unsigned)
 		}
-		vm.Config.CreateChain(chain.ID(), tx)
+		vm.Internal.CreateChain(chain.ID(), tx)
 	}
 	return nil
 }
@@ -378,31 +370,22 @@ func (vm *VM) onNormalOperationsStarted() error {
 		return err
 	}
 
-	primaryVdrIDs := vm.Validators.GetValidatorIDs(constants.PrimaryNetworkID)
-	if err := vm.uptimeManager.StartTracking(primaryVdrIDs, constants.PrimaryNetworkID); err != nil {
-		return err
+	if !vm.uptimeManager.StartedTracking() {
+		primaryVdrIDs := vm.Validators.GetValidatorIDs(constants.PrimaryNetworkID)
+		if err := vm.uptimeManager.StartTracking(primaryVdrIDs); err != nil {
+			return err
+		}
 	}
 
 	vl := validators.NewLogger(vm.ctx.Log, constants.PrimaryNetworkID, vm.ctx.NodeID)
-	vm.Validators.RegisterCallbackListener(constants.PrimaryNetworkID, vl)
+	vm.Validators.RegisterSetCallbackListener(constants.PrimaryNetworkID, vl)
 
 	for subnetID := range vm.TrackedSubnets {
-		vdrIDs := vm.Validators.GetValidatorIDs(subnetID)
-		if err := vm.uptimeManager.StartTracking(vdrIDs, subnetID); err != nil {
-			return err
-		}
-
 		vl := validators.NewLogger(vm.ctx.Log, subnetID, vm.ctx.NodeID)
-		vm.Validators.RegisterCallbackListener(subnetID, vl)
+		vm.Validators.RegisterSetCallbackListener(subnetID, vl)
 	}
 
-	if err := vm.state.Commit(); err != nil {
-		return err
-	}
-
-	// Start the block builder
-	vm.Builder.StartBlockTimer()
-	return nil
+	return vm.state.Commit()
 }
 
 func (vm *VM) SetState(_ context.Context, state snow.State) error {
@@ -423,19 +406,11 @@ func (vm *VM) Shutdown(context.Context) error {
 	}
 
 	vm.onShutdownCtxCancel()
-	vm.Builder.ShutdownBlockTimer()
 
-	if vm.bootstrapped.Get() {
+	if vm.uptimeManager.StartedTracking() {
 		primaryVdrIDs := vm.Validators.GetValidatorIDs(constants.PrimaryNetworkID)
-		if err := vm.uptimeManager.StopTracking(primaryVdrIDs, constants.PrimaryNetworkID); err != nil {
+		if err := vm.uptimeManager.StopTracking(primaryVdrIDs); err != nil {
 			return err
-		}
-
-		for subnetID := range vm.TrackedSubnets {
-			vdrIDs := vm.Validators.GetValidatorIDs(subnetID)
-			if err := vm.uptimeManager.StopTracking(vdrIDs, subnetID); err != nil {
-				return err
-			}
 		}
 
 		if err := vm.state.Commit(); err != nil {
@@ -443,7 +418,7 @@ func (vm *VM) Shutdown(context.Context) error {
 		}
 	}
 
-	return utils.Err(
+	return errors.Join(
 		vm.state.Close(),
 		vm.db.Close(),
 	)
@@ -452,7 +427,7 @@ func (vm *VM) Shutdown(context.Context) error {
 func (vm *VM) ParseBlock(_ context.Context, b []byte) (snowman.Block, error) {
 	// Note: blocks to be parsed are not verified, so we must used blocks.Codec
 	// rather than blocks.GenesisCodec
-	statelessBlk, err := block.Parse(block.Codec, b)
+	statelessBlk, err := platform.ParseBlock(platform.Codec, b)
 	if err != nil {
 		return nil, err
 	}
@@ -470,9 +445,12 @@ func (vm *VM) LastAccepted(context.Context) (ids.ID, error) {
 
 // SetPreference sets the preferred block to be the one with ID [blkID]
 func (vm *VM) SetPreference(_ context.Context, blkID ids.ID) error {
-	if vm.manager.SetPreference(blkID) {
-		vm.Builder.ResetBlockTimer()
-	}
+	vm.manager.SetPreference(blkID, nil)
+	return nil
+}
+
+func (vm *VM) SetPreferenceWithContext(_ context.Context, blkID ids.ID, blockCtx *snowmanblock.Context) error {
+	vm.manager.SetPreference(blkID, blockCtx)
 	return nil
 }
 
@@ -490,11 +468,9 @@ func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 	server.RegisterInterceptFunc(vm.metrics.InterceptRequest)
 	server.RegisterAfterFunc(vm.metrics.AfterRequest)
 	service := &Service{
-		vm:          vm,
-		addrManager: avax.NewAddressManager(vm.ctx),
-		stakerAttributesCache: &cache.LRU[ids.ID, *stakerAttributes]{
-			Size: stakerAttributesCacheSize,
-		},
+		vm:                    vm,
+		addrManager:           avax.NewAddressManager(vm.ctx),
+		stakerAttributesCache: lru.NewCache[ids.ID, *stakerAttributes](stakerAttributesCacheSize),
 	}
 	err := server.RegisterService(service, "platform")
 	return map[string]http.Handler{
@@ -502,19 +478,25 @@ func (vm *VM) CreateHandlers(context.Context) (map[string]http.Handler, error) {
 	}, err
 }
 
-func (vm *VM) Connected(_ context.Context, nodeID ids.NodeID, _ *version.Application) error {
-	return vm.uptimeManager.Connect(nodeID, constants.PrimaryNetworkID)
+func (*VM) NewHTTPHandler(context.Context) (http.Handler, error) {
+	return nil, nil
 }
 
-func (vm *VM) ConnectedSubnet(_ context.Context, nodeID ids.NodeID, subnetID ids.ID) error {
-	return vm.uptimeManager.Connect(nodeID, subnetID)
+func (vm *VM) Connected(ctx context.Context, nodeID ids.NodeID, version *version.Application) error {
+	if err := vm.uptimeManager.Connect(nodeID); err != nil {
+		return err
+	}
+	return vm.Network.Connected(ctx, nodeID, version)
 }
 
-func (vm *VM) Disconnected(_ context.Context, nodeID ids.NodeID) error {
+func (vm *VM) Disconnected(ctx context.Context, nodeID ids.NodeID) error {
 	if err := vm.uptimeManager.Disconnect(nodeID); err != nil {
 		return err
 	}
-	return vm.state.Commit()
+	if err := vm.state.Commit(); err != nil {
+		return err
+	}
+	return vm.Network.Disconnected(ctx, nodeID)
 }
 
 func (vm *VM) CodecRegistry() codec.Registry {
@@ -529,20 +511,54 @@ func (vm *VM) Logger() logging.Logger {
 	return vm.ctx.Log
 }
 
-func (vm *VM) VerifyHeightIndex(_ context.Context) error {
-	if vm.pruned.Get() {
-		return nil
-	}
-
-	return snowmanblock.ErrIndexIncomplete
-}
-
 func (vm *VM) GetBlockIDAtHeight(_ context.Context, height uint64) (ids.ID, error) {
 	return vm.state.GetBlockIDAtHeight(height)
 }
 
-func (vm *VM) issueTx(ctx context.Context, tx *txs.Tx) error {
-	err := vm.Network.IssueTx(ctx, tx)
+// NewPChainReader implements pchain.ReaderProvider. Every access to the
+// P-chain state through the returned reader holds lock (the P-chain context
+// lock when wired by chains/manager), one call at a time.
+//
+// The chain manager calls this while creating the P-chain, before Initialize,
+// so the reader must not touch the VM here: vmStore dereferences the state on
+// every call and the genesis UTXOs are read on first use. Other chains, the
+// only users, are created after the P-chain finished bootstrapping.
+func (vm *VM) NewPChainReader(lock sync.Locker) pchain.Reader {
+	return pchainreader.New(
+		pchainreader.NewLockedStore(lock, vmStore{vm: vm}),
+		func() []*avax.UTXO { return vm.genesisUTXOs },
+		vm.Internal.UpgradeConfig,
+	)
+}
+
+// vmStore adapts the VM's state to pchainreader.Store, resolving vm.state at
+// call time (it is nil until Initialize).
+type vmStore struct {
+	vm *VM
+}
+
+func (s vmStore) GetLastAccepted() ids.ID {
+	return s.vm.state.GetLastAccepted()
+}
+
+func (s vmStore) GetBlockIDAtHeight(height uint64) (ids.ID, error) {
+	return s.vm.state.GetBlockIDAtHeight(height)
+}
+
+func (s vmStore) GetBlockBytes(blockID ids.ID) ([]byte, error) {
+	return s.vm.state.GetBlockBytes(blockID)
+}
+
+func (s vmStore) GetTxBytes(txID ids.ID) ([]byte, error) {
+	return s.vm.state.GetTxBytes(txID)
+}
+
+func (s vmStore) GetRewardUTXOs(txID ids.ID) ([]*avax.UTXO, error) {
+	return s.vm.state.GetRewardUTXOs(txID)
+}
+
+func (vm *VM) issueTxFromRPC(tx *platform.Tx) error {
+	err := vm.Network.IssueTxFromRPC(tx)
 	if err != nil && !errors.Is(err, mempool.ErrDuplicateTx) {
 		vm.ctx.Log.Debug("failed to add tx to mempool",
 			zap.Stringer("txID", tx.ID()),
@@ -552,9 +568,4 @@ func (vm *VM) issueTx(ctx context.Context, tx *txs.Tx) error {
 	}
 
 	return nil
-}
-
-func (vm *VM) EthVerificationEnabled() bool {
-	time := vm.state.GetTimestamp()
-	return !time.Before(vm.Config.BanffTime)
 }

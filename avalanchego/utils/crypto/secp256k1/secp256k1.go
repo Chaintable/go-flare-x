@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package secp256k1
@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ava-labs/libevm/common"
+	"github.com/ava-labs/libevm/crypto"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 
 	"github.com/ava-labs/avalanchego/cache"
+	"github.com/ava-labs/avalanchego/cache/lru"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/cb58"
 	"github.com/ava-labs/avalanchego/utils/hashing"
@@ -55,7 +58,10 @@ var (
 
 func NewPrivateKey() (*PrivateKey, error) {
 	k, err := secp256k1.GeneratePrivateKey()
-	return &PrivateKey{sk: k}, err
+	if err != nil {
+		return nil, err
+	}
+	return newPrivateKey(k), nil
 }
 
 func ToPublicKey(b []byte) (*PublicKey, error) {
@@ -64,20 +70,17 @@ func ToPublicKey(b []byte) (*PublicKey, error) {
 	}
 
 	key, err := secp256k1.ParsePubKey(b)
-	return &PublicKey{
-		pk:    key,
-		bytes: b,
-	}, err
+	if err != nil {
+		return nil, err
+	}
+	return newPublicKey(key), nil
 }
 
 func ToPrivateKey(b []byte) (*PrivateKey, error) {
 	if len(b) != PrivateKeyLen {
 		return nil, errInvalidPrivateKeyLength
 	}
-	return &PrivateKey{
-		sk:    secp256k1.PrivKeyFromBytes(b),
-		bytes: b,
-	}, nil
+	return newPrivateKey(secp256k1.PrivKeyFromBytes(b)), nil
 }
 
 func RecoverPublicKey(msg, sig []byte) (*PublicKey, error) {
@@ -103,11 +106,17 @@ func RecoverPublicKeyFromHash(hash, sig []byte) (*PublicKey, error) {
 		return nil, errCompressed
 	}
 
-	return &PublicKey{pk: rawPubkey}, nil
+	return newPublicKey(rawPubkey), nil
 }
 
 type RecoverCache struct {
-	cache.LRU[ids.ID, *PublicKey]
+	cache cache.Cacher[ids.ID, *PublicKey]
+}
+
+func NewRecoverCache(size int) *RecoverCache {
+	return &RecoverCache{
+		cache: lru.NewCache[ids.ID, *PublicKey](size),
+	}
 }
 
 func (r *RecoverCache) RecoverPublicKey(msg, sig []byte) (*PublicKey, error) {
@@ -115,11 +124,16 @@ func (r *RecoverCache) RecoverPublicKey(msg, sig []byte) (*PublicKey, error) {
 }
 
 func (r *RecoverCache) RecoverPublicKeyFromHash(hash, sig []byte) (*PublicKey, error) {
+	// TODO: This type should always be initialized by calling NewRecoverCache.
+	if r == nil || r.cache == nil {
+		return RecoverPublicKeyFromHash(hash, sig)
+	}
+
 	cacheBytes := make([]byte, len(hash)+len(sig))
 	copy(cacheBytes, hash)
 	copy(cacheBytes[len(hash):], sig)
 	id := hashing.ComputeHash256Array(cacheBytes)
-	if cachedPublicKey, ok := r.Get(id); ok {
+	if cachedPublicKey, ok := r.cache.Get(id); ok {
 		return cachedPublicKey, nil
 	}
 
@@ -128,14 +142,27 @@ func (r *RecoverCache) RecoverPublicKeyFromHash(hash, sig []byte) (*PublicKey, e
 		return nil, err
 	}
 
-	r.Put(id, pubKey)
+	r.cache.Put(id, pubKey)
 	return pubKey, nil
 }
 
+// A PublicKey is an immutable secp256k1 public key. It is safe for concurrent
+// use, which allows a single instance to be shared, e.g. via [RecoverCache].
 type PublicKey struct {
 	pk    *secp256k1.PublicKey
 	addr  ids.ShortID
 	bytes []byte
+}
+
+// newPublicKey computes the compressed serialization and address eagerly so
+// that the returned key is never mutated after construction.
+func newPublicKey(pk *secp256k1.PublicKey) *PublicKey {
+	bytes := pk.SerializeCompressed()
+	return &PublicKey{
+		pk:    pk,
+		addr:  ids.ShortID(hashing.ComputeHash160Array(hashing.ComputeHash256(bytes))),
+		bytes: bytes,
+	}
 }
 
 func (k *PublicKey) Verify(msg, sig []byte) bool {
@@ -156,38 +183,47 @@ func (k *PublicKey) ToECDSA() *stdecdsa.PublicKey {
 }
 
 func (k *PublicKey) Address() ids.ShortID {
-	if k.addr == ids.ShortEmpty {
-		addr, err := ids.ToShortID(hashing.PubkeyBytesToAddress(k.Bytes()))
-		if err != nil {
-			panic(err)
-		}
-		k.addr = addr
-	}
 	return k.addr
 }
 
+func (k *PublicKey) EthAddress() common.Address {
+	return crypto.PubkeyToAddress(*(k.ToECDSA()))
+}
+
+// Bytes returns the compressed serialization of the key. The returned slice
+// is shared and MUST NOT be modified.
 func (k *PublicKey) Bytes() []byte {
-	if k.bytes == nil {
-		k.bytes = k.pk.SerializeCompressed()
-	}
 	return k.bytes
 }
 
+// A PrivateKey is a secp256k1 private key. Its public key and serialization
+// are computed at construction, so its accessors are safe for concurrent use.
 type PrivateKey struct {
 	sk    *secp256k1.PrivateKey
 	pk    *PublicKey
 	bytes []byte
 }
 
-func (k *PrivateKey) PublicKey() *PublicKey {
-	if k.pk == nil {
-		k.pk = &PublicKey{pk: k.sk.PubKey()}
+// newPrivateKey computes the public key and serialization eagerly so that
+// the returned key is never mutated after construction.
+func newPrivateKey(sk *secp256k1.PrivateKey) *PrivateKey {
+	return &PrivateKey{
+		sk:    sk,
+		pk:    newPublicKey(sk.PubKey()),
+		bytes: sk.Serialize(),
 	}
+}
+
+func (k *PrivateKey) PublicKey() *PublicKey {
 	return k.pk
 }
 
 func (k *PrivateKey) Address() ids.ShortID {
 	return k.PublicKey().Address()
+}
+
+func (k *PrivateKey) EthAddress() common.Address {
+	return crypto.PubkeyToAddress(*(k.PublicKey().ToECDSA()))
 }
 
 func (k *PrivateKey) Sign(msg []byte) ([]byte, error) {
@@ -204,10 +240,9 @@ func (k *PrivateKey) ToECDSA() *stdecdsa.PrivateKey {
 	return k.sk.ToECDSA()
 }
 
+// Bytes returns the serialized private key. The returned slice is shared and
+// MUST NOT be modified.
 func (k *PrivateKey) Bytes() []byte {
-	if k.bytes == nil {
-		k.bytes = k.sk.Serialize()
-	}
 	return k.bytes
 }
 
@@ -240,11 +275,19 @@ func (k *PrivateKey) UnmarshalJSON(b []byte) error {
 	}
 
 	strNoQuotes := str[1:lastIndex]
-	if !strings.HasPrefix(strNoQuotes, PrivateKeyPrefix) {
+	return k.unmarshalText(strNoQuotes)
+}
+
+func (k *PrivateKey) UnmarshalText(text []byte) error {
+	return k.unmarshalText(string(text))
+}
+
+func (k *PrivateKey) unmarshalText(text string) error {
+	if !strings.HasPrefix(text, PrivateKeyPrefix) {
 		return errMissingKeyPrefix
 	}
 
-	strNoPrefix := strNoQuotes[len(PrivateKeyPrefix):]
+	strNoPrefix := text[len(PrivateKeyPrefix):]
 	keyBytes, err := cb58.Decode(strNoPrefix)
 	if err != nil {
 		return err
@@ -253,15 +296,8 @@ func (k *PrivateKey) UnmarshalJSON(b []byte) error {
 		return errInvalidPrivateKeyLength
 	}
 
-	*k = PrivateKey{
-		sk:    secp256k1.PrivKeyFromBytes(keyBytes),
-		bytes: keyBytes,
-	}
+	*k = *newPrivateKey(secp256k1.PrivKeyFromBytes(keyBytes))
 	return nil
-}
-
-func (k *PrivateKey) UnmarshalText(text []byte) error {
-	return k.UnmarshalJSON(text)
 }
 
 // raw sig has format [v || r || s] whereas the sig has format [r || s || v]

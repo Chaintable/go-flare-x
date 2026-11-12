@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package genesis
@@ -7,8 +7,14 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
 	"github.com/ava-labs/avalanchego/vms/platformvm/reward"
+	"github.com/ava-labs/avalanchego/vms/platformvm/validators/fee"
 )
+
+// ACP267UptimeRequirement is the 90% Primary Network uptime requirement
+// introduced by ACP-267.
+const ACP267UptimeRequirement = .9
 
 type StakingConfig struct {
 	// Staking uptime requirements
@@ -29,29 +35,18 @@ type StakingConfig struct {
 	// MaxStakeDuration is the maximum amount of time a validator can validate
 	// for in a single period.
 	MaxStakeDuration time.Duration `json:"maxStakeDuration"`
+	// HeliconMinStakeDuration is the minimum staking duration for the primary
+	// network after the Helicon upgrade (ACP-273).
+	HeliconMinStakeDuration time.Duration `json:"heliconMinStakeDuration"`
 	// RewardConfig is the config for the reward function.
 	RewardConfig reward.Config `json:"rewardConfig"`
 }
 
 type TxFeeConfig struct {
-	// Transaction fee
-	TxFee uint64 `json:"txFee"`
-	// Transaction fee for create asset transactions
-	CreateAssetTxFee uint64 `json:"createAssetTxFee"`
-	// Transaction fee for create subnet transactions
-	CreateSubnetTxFee uint64 `json:"createSubnetTxFee"`
-	// Transaction fee for transform subnet transactions
-	TransformSubnetTxFee uint64 `json:"transformSubnetTxFee"`
-	// Transaction fee for create blockchain transactions
-	CreateBlockchainTxFee uint64 `json:"createBlockchainTxFee"`
-	// Transaction fee for adding a primary network validator
-	AddPrimaryNetworkValidatorFee uint64 `json:"addPrimaryNetworkValidatorFee"`
-	// Transaction fee for adding a primary network delegator
-	AddPrimaryNetworkDelegatorFee uint64 `json:"addPrimaryNetworkDelegatorFee"`
-	// Transaction fee for adding a subnet validator
-	AddSubnetValidatorFee uint64 `json:"addSubnetValidatorFee"`
-	// Transaction fee for adding a subnet delegator
-	AddSubnetDelegatorFee uint64 `json:"addSubnetDelegatorFee"`
+	CreateAssetTxFee   uint64     `json:"createAssetTxFee"`
+	TxFee              uint64     `json:"txFee"`
+	DynamicFeeConfig   gas.Config `json:"dynamicFeeConfig"`
+	ValidatorFeeConfig fee.Config `json:"validatorFeeConfig"`
 }
 
 type Params struct {
@@ -60,11 +55,11 @@ type Params struct {
 }
 
 func GetTxFeeConfig(networkID uint32) TxFeeConfig {
+	// TxFee configs are ommitted for LocalFlare and Local networks since they
+	// are set from program arguments (getTxFeeConfig)
 	switch networkID {
 	case constants.MainnetID:
 		return MainnetParams.TxFeeConfig
-	case constants.LocalID:
-		return LocalParams.TxFeeConfig
 	case constants.FlareID:
 		return FlareParams.TxFeeConfig
 	case constants.CostwoID:
@@ -76,10 +71,25 @@ func GetTxFeeConfig(networkID uint32) TxFeeConfig {
 	case constants.CostonID:
 		return CostonParams.TxFeeConfig
 	default:
+		// for LocalID and any other networkID
 		return LocalParams.TxFeeConfig
 	}
 }
 
+// GetStakingConfig returns the staking parameters of the given network.
+//
+// Flare: config.getStakingConfig uses these for the public networks
+// (constants.ProductionNetworkIDs and Avalanche Mainnet), where the staking
+// flags are ignored; local and custom networks take the flags, which default
+// to LocalParams. On the Flare networks the primary network's stake limits and
+// durations are the time-phased rules in
+// vms/platformvm/txs/executor/inflation_settings.go, not these values: the
+// stake limits here only mirror the latest phase of those rules and are kept
+// in step with them. UptimeRequirement and the stake durations do apply
+// directly (reward votes, permissioned subnet validators, TransformSubnetTx)
+// and equal the LocalParams values every node ran with while the flags were
+// still honored on these networks, so fixing them changed no behavior.
+// RewardConfig also retains the former flag defaults; staking rewards are zero.
 func GetStakingConfig(networkID uint32) StakingConfig {
 	switch networkID {
 	case constants.MainnetID:

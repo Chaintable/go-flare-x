@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package info
@@ -6,7 +6,9 @@ package info
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
+	"net/netip"
 
 	"github.com/gorilla/rpc/v2"
 	"go.uber.org/zap"
@@ -17,11 +19,13 @@ import (
 	"github.com/ava-labs/avalanchego/network/peer"
 	"github.com/ava-labs/avalanchego/snow/networking/benchlist"
 	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/upgrade"
+	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/constants"
-	"github.com/ava-labs/avalanchego/utils/ips"
 	"github.com/ava-labs/avalanchego/utils/json"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/set"
+	"github.com/ava-labs/avalanchego/utils/units"
 	"github.com/ava-labs/avalanchego/version"
 	"github.com/ava-labs/avalanchego/vms"
 	"github.com/ava-labs/avalanchego/vms/nftfx"
@@ -30,35 +34,105 @@ import (
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
 )
 
-var errNoChainProvided = errors.New("argument 'chain' not given")
+var (
+	errNoChainProvided = errors.New("argument 'chain' not given")
+
+	mainnetGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(1 * units.Avax),
+		TransformSubnetTxFee:          json.Uint64(10 * units.Avax),
+		CreateBlockchainTxFee:         json.Uint64(1 * units.Avax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	flareGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(100 * units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(100 * units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(100 * units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	costwoGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(100 * units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(100 * units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(100 * units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	localFlareGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(100 * units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(100 * units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(100 * units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	songbirdGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	costonGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(100 * units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(100 * units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(100 * units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	localGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(100 * units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(100 * units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(100 * units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+	defaultGetTxFeeResponse = GetTxFeeResponse{
+		CreateSubnetTxFee:             json.Uint64(100 * units.MilliAvax),
+		TransformSubnetTxFee:          json.Uint64(100 * units.MilliAvax),
+		CreateBlockchainTxFee:         json.Uint64(100 * units.MilliAvax),
+		AddPrimaryNetworkValidatorFee: json.Uint64(0),
+		AddPrimaryNetworkDelegatorFee: json.Uint64(0),
+		AddSubnetValidatorFee:         json.Uint64(units.MilliAvax),
+		AddSubnetDelegatorFee:         json.Uint64(units.MilliAvax),
+	}
+)
 
 // Info is the API service for unprivileged info on a node
 type Info struct {
 	Parameters
 	log          logging.Logger
 	validators   validators.Manager
-	myIP         ips.DynamicIPPort
+	myIP         *utils.Atomic[netip.AddrPort]
 	networking   network.Network
 	chainManager chains.Manager
-	vmManager    vms.Manager
+	vmManager    *vms.Manager
 	benchlist    benchlist.Manager
 }
 
 type Parameters struct {
-	Version                       *version.Application
-	NodeID                        ids.NodeID
-	NodePOP                       *signer.ProofOfPossession
-	NetworkID                     uint32
-	TxFee                         uint64
-	CreateAssetTxFee              uint64
-	CreateSubnetTxFee             uint64
-	TransformSubnetTxFee          uint64
-	CreateBlockchainTxFee         uint64
-	AddPrimaryNetworkValidatorFee uint64
-	AddPrimaryNetworkDelegatorFee uint64
-	AddSubnetValidatorFee         uint64
-	AddSubnetDelegatorFee         uint64
-	VMManager                     vms.Manager
+	Version   *version.Application
+	NodeID    ids.NodeID
+	NodePOP   *signer.ProofOfPossession
+	NetworkID uint32
+	VMManager *vms.Manager
+	Upgrades  upgrade.Config
+
+	TxFee            uint64
+	CreateAssetTxFee uint64
 }
 
 func NewService(
@@ -66,8 +140,8 @@ func NewService(
 	log logging.Logger,
 	validators validators.Manager,
 	chainManager chains.Manager,
-	vmManager vms.Manager,
-	myIP ips.DynamicIPPort,
+	vmManager *vms.Manager,
+	myIP *utils.Atomic[netip.AddrPort],
 	network network.Network,
 	benchlist benchlist.Manager,
 ) (http.Handler, error) {
@@ -112,7 +186,7 @@ func (i *Info) GetNodeVersion(_ *http.Request, _ *struct{}, reply *GetNodeVersio
 	}
 
 	reply.Version = i.Version.String()
-	reply.DatabaseVersion = version.CurrentDatabase.String()
+	reply.DatabaseVersion = version.CurrentDatabase
 	reply.RPCProtocolVersion = json.Uint32(version.RPCChainVMProtocol)
 	reply.GitCommit = version.GitCommit
 	reply.VMVersions = vmVersions
@@ -144,7 +218,7 @@ type GetNetworkIDReply struct {
 
 // GetNodeIPReply are the results from calling GetNodeIP
 type GetNodeIPReply struct {
-	IP string `json:"ip"`
+	IP netip.AddrPort `json:"ip"`
 }
 
 // GetNodeIP returns the IP of this node
@@ -154,7 +228,7 @@ func (i *Info) GetNodeIP(_ *http.Request, _ *struct{}, reply *GetNodeIPReply) er
 		zap.String("method", "getNodeIP"),
 	)
 
-	reply.IP = i.myIP.IPPort().String()
+	reply.IP = i.myIP.Get()
 	return nil
 }
 
@@ -226,7 +300,9 @@ type PeersReply struct {
 	Peers []Peer `json:"peers"`
 }
 
-// Peers returns the list of current validators
+// Peers returns the current peers this node is connected to. If nodeIDs are
+// provided, the response is filtered to just include peers that match those
+// IDs.
 func (i *Info) Peers(_ *http.Request, args *PeersArgs, reply *PeersReply) error {
 	i.log.Debug("API called",
 		zap.String("service", "info"),
@@ -289,6 +365,17 @@ func (i *Info) IsBootstrapped(_ *http.Request, args *IsBootstrappedArgs, reply *
 	return nil
 }
 
+// Upgrades returns the upgrade schedule this node is running.
+func (i *Info) Upgrades(_ *http.Request, _ *struct{}, reply *upgrade.Config) error {
+	i.log.Debug("API called",
+		zap.String("service", "info"),
+		zap.String("method", "upgrades"),
+	)
+
+	*reply = i.Parameters.Upgrades
+	return nil
+}
+
 // UptimeResponse are the results from calling Uptime
 type UptimeResponse struct {
 	// RewardingStakePercentage shows what percent of network stake thinks we're
@@ -306,18 +393,13 @@ type UptimeResponse struct {
 	WeightedAveragePercentage json.Float64 `json:"weightedAveragePercentage"`
 }
 
-type UptimeRequest struct {
-	// if omitted, defaults to primary network
-	SubnetID ids.ID `json:"subnetID"`
-}
-
-func (i *Info) Uptime(_ *http.Request, args *UptimeRequest, reply *UptimeResponse) error {
+func (i *Info) Uptime(_ *http.Request, _ *struct{}, reply *UptimeResponse) error {
 	i.log.Debug("API called",
 		zap.String("service", "info"),
 		zap.String("method", "uptime"),
 	)
 
-	result, err := i.networking.NodeUptime(args.SubnetID)
+	result, err := i.networking.NodeUptime()
 	if err != nil {
 		return fmt.Errorf("couldn't get node uptime: %w", err)
 	}
@@ -327,11 +409,11 @@ func (i *Info) Uptime(_ *http.Request, args *UptimeRequest, reply *UptimeRespons
 }
 
 type ACP struct {
-	SupportWeight json.Uint64         `json:"supportWeight"`
+	SupportWeight json.BigInt         `json:"supportWeight"`
 	Supporters    set.Set[ids.NodeID] `json:"supporters"`
-	ObjectWeight  json.Uint64         `json:"objectWeight"`
+	ObjectWeight  json.BigInt         `json:"objectWeight"`
 	Objectors     set.Set[ids.NodeID] `json:"objectors"`
-	AbstainWeight json.Uint64         `json:"abstainWeight"`
+	AbstainWeight json.BigInt         `json:"abstainWeight"`
 }
 
 type ACPsReply struct {
@@ -341,7 +423,11 @@ type ACPsReply struct {
 func (a *ACPsReply) getACP(acpNum uint32) *ACP {
 	acp, ok := a.ACPs[acpNum]
 	if !ok {
-		acp = &ACP{}
+		acp = &ACP{
+			SupportWeight: json.NewBigIntFromInt(0),
+			ObjectWeight:  json.NewBigIntFromInt(0),
+			AbstainWeight: json.NewBigIntFromInt(0),
+		}
 		a.ACPs[acpNum] = acp
 	}
 	return acp
@@ -356,7 +442,7 @@ func (i *Info) Acps(_ *http.Request, _ *struct{}, reply *ACPsReply) error {
 	reply.ACPs = make(map[uint32]*ACP, constants.CurrentACPs.Len())
 	peers := i.networking.PeerInfo(nil)
 	for _, peer := range peers {
-		weight := json.Uint64(i.validators.GetWeight(constants.PrimaryNetworkID, peer.ID))
+		weight := i.validators.GetWeight(constants.PrimaryNetworkID, peer.ID)
 		if weight == 0 {
 			continue
 		}
@@ -364,22 +450,19 @@ func (i *Info) Acps(_ *http.Request, _ *struct{}, reply *ACPsReply) error {
 		for acpNum := range peer.SupportedACPs {
 			acp := reply.getACP(acpNum)
 			acp.Supporters.Add(peer.ID)
-			acp.SupportWeight += weight
+			acp.SupportWeight.Set(new(big.Int).Add(acp.SupportWeight.ToBigInt(), new(big.Int).SetUint64(weight)))
 		}
 		for acpNum := range peer.ObjectedACPs {
 			acp := reply.getACP(acpNum)
 			acp.Objectors.Add(peer.ID)
-			acp.ObjectWeight += weight
+			acp.ObjectWeight.Set(new(big.Int).Add(acp.ObjectWeight.ToBigInt(), new(big.Int).SetUint64(weight)))
 		}
 	}
 
-	totalWeight, err := i.validators.TotalWeight(constants.PrimaryNetworkID)
-	if err != nil {
-		return err
-	}
+	totalWeight := i.validators.TotalWeight(constants.PrimaryNetworkID)
 	for acpNum := range constants.CurrentACPs {
 		acp := reply.getACP(acpNum)
-		acp.AbstainWeight = json.Uint64(totalWeight) - acp.SupportWeight - acp.ObjectWeight
+		acp.AbstainWeight.Set(new(big.Int).Sub(totalWeight, new(big.Int).Add(acp.SupportWeight.ToBigInt(), acp.ObjectWeight.ToBigInt())))
 	}
 	return nil
 }
@@ -398,20 +481,31 @@ type GetTxFeeResponse struct {
 
 // GetTxFee returns the transaction fee in nAVAX.
 func (i *Info) GetTxFee(_ *http.Request, _ *struct{}, reply *GetTxFeeResponse) error {
-	i.log.Debug("API called",
+	i.log.Warn("deprecated API called",
 		zap.String("service", "info"),
 		zap.String("method", "getTxFee"),
 	)
 
+	switch i.NetworkID {
+	case constants.MainnetID:
+		*reply = mainnetGetTxFeeResponse
+	case constants.FlareID:
+		*reply = flareGetTxFeeResponse
+	case constants.CostwoID:
+		*reply = costwoGetTxFeeResponse
+	case constants.LocalFlareID:
+		*reply = localFlareGetTxFeeResponse
+	case constants.SongbirdID:
+		*reply = songbirdGetTxFeeResponse
+	case constants.CostonID:
+		*reply = costonGetTxFeeResponse
+	case constants.LocalID:
+		*reply = localGetTxFeeResponse
+	default:
+		*reply = defaultGetTxFeeResponse
+	}
 	reply.TxFee = json.Uint64(i.TxFee)
 	reply.CreateAssetTxFee = json.Uint64(i.CreateAssetTxFee)
-	reply.CreateSubnetTxFee = json.Uint64(i.CreateSubnetTxFee)
-	reply.TransformSubnetTxFee = json.Uint64(i.TransformSubnetTxFee)
-	reply.CreateBlockchainTxFee = json.Uint64(i.CreateBlockchainTxFee)
-	reply.AddPrimaryNetworkValidatorFee = json.Uint64(i.AddPrimaryNetworkValidatorFee)
-	reply.AddPrimaryNetworkDelegatorFee = json.Uint64(i.AddPrimaryNetworkDelegatorFee)
-	reply.AddSubnetValidatorFee = json.Uint64(i.AddSubnetValidatorFee)
-	reply.AddSubnetDelegatorFee = json.Uint64(i.AddSubnetDelegatorFee)
 	return nil
 }
 

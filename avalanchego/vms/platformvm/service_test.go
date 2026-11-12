@@ -1,163 +1,145 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package platformvm
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	"golang.org/x/exp/maps"
 
 	"github.com/ava-labs/avalanchego/api"
-	"github.com/ava-labs/avalanchego/api/keystore"
-	"github.com/ava-labs/avalanchego/cache"
+	"github.com/ava-labs/avalanchego/cache/lru"
 	"github.com/ava-labs/avalanchego/chains/atomic"
 	"github.com/ava-labs/avalanchego/database"
-	"github.com/ava-labs/avalanchego/database/memdb"
 	"github.com/ava-labs/avalanchego/database/prefixdb"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/upgrade/upgradetest"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
+	"github.com/ava-labs/avalanchego/utils/crypto/bls/signer/localsigner"
 	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
 	"github.com/ava-labs/avalanchego/utils/formatting"
+	"github.com/ava-labs/avalanchego/utils/formatting/address"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/set"
+	"github.com/ava-labs/avalanchego/version"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
-	"github.com/ava-labs/avalanchego/vms/platformvm/block"
-	"github.com/ava-labs/avalanchego/vms/platformvm/block/builder"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
+	"github.com/ava-labs/avalanchego/vms/platformvm/block/executor/executormock"
+	"github.com/ava-labs/avalanchego/vms/platformvm/genesis/genesistest"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
+	"github.com/ava-labs/avalanchego/vms/platformvm/reward"
 	"github.com/ava-labs/avalanchego/vms/platformvm/signer"
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
+	"github.com/ava-labs/avalanchego/vms/platformvm/state/statetest"
 	"github.com/ava-labs/avalanchego/vms/platformvm/status"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
+	"github.com/ava-labs/avalanchego/vms/platformvm/validators/fee"
+	"github.com/ava-labs/avalanchego/vms/platformvm/warp/message"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
+	"github.com/ava-labs/avalanchego/vms/types"
+	"github.com/ava-labs/avalanchego/wallet/subnet/primary/common"
 
 	avajson "github.com/ava-labs/avalanchego/utils/json"
-	vmkeystore "github.com/ava-labs/avalanchego/vms/components/keystore"
 	pchainapi "github.com/ava-labs/avalanchego/vms/platformvm/api"
+	blockbuilder "github.com/ava-labs/avalanchego/vms/platformvm/block/builder"
 	blockexecutor "github.com/ava-labs/avalanchego/vms/platformvm/block/executor"
 	txexecutor "github.com/ava-labs/avalanchego/vms/platformvm/txs/executor"
 )
 
-var (
-	// Test user username
-	testUsername = "ScoobyUser"
-
-	// Test user password, must meet minimum complexity/length requirements
-	testPassword = "ShaggyPassword1Zoinks!"
-
-	// Bytes decoded from CB58 "ewoqjP7PxY4yr3iLTpLisriqt94hdyDFNgchSxGGztUrTXtNN"
-	testPrivateKey = []byte{
-		0x56, 0x28, 0x9e, 0x99, 0xc9, 0x4b, 0x69, 0x12,
-		0xbf, 0xc1, 0x2a, 0xdc, 0x09, 0x3c, 0x9b, 0x51,
-		0x12, 0x4f, 0x0d, 0xc5, 0x4a, 0xc7, 0xa7, 0x66,
-		0xb2, 0xbc, 0x5c, 0xcf, 0x55, 0x8d, 0x80, 0x27,
-	}
-
-	// 3cb7d3842e8cee6a0ebd09f1fe884f6861e1b29c
-	// Platform address resulting from the above private key
-	testAddress = "P-testing18jma8ppw3nhx5r4ap8clazz0dps7rv5umpc36y"
-
-	encodings = []formatting.Encoding{
-		formatting.JSON, formatting.Hex,
-	}
-)
+var encodings = []formatting.Encoding{
+	formatting.JSON, formatting.Hex,
+}
 
 func defaultService(t *testing.T) (*Service, *mutableSharedMemory) {
-	vm, _, mutableSharedMemory := defaultVM(t, latestFork)
-	vm.ctx.Lock.Lock()
-	defer vm.ctx.Lock.Unlock()
-	ks := keystore.New(logging.NoLog{}, memdb.New())
-	require.NoError(t, ks.CreateUser(testUsername, testPassword))
-
-	vm.ctx.Keystore = ks.NewBlockchainKeyStore(vm.ctx.ChainID)
+	vm, _, mutableSharedMemory := defaultVM(t, upgradetest.Latest)
 	return &Service{
-		vm:          vm,
-		addrManager: avax.NewAddressManager(vm.ctx),
-		stakerAttributesCache: &cache.LRU[ids.ID, *stakerAttributes]{
-			Size: stakerAttributesCacheSize,
-		},
+		vm:                    vm,
+		addrManager:           avax.NewAddressManager(vm.ctx),
+		stakerAttributesCache: lru.NewCache[ids.ID, *stakerAttributes](stakerAttributesCacheSize),
 	}, mutableSharedMemory
 }
 
-// Give user [testUsername] control of [testPrivateKey] and keys[0] (which is funded)
-func defaultAddress(t *testing.T, service *Service) {
+func TestGetProposedHeight(t *testing.T) {
 	require := require.New(t)
+	service, _ := defaultService(t)
+
+	reply := api.GetHeightResponse{}
+	require.NoError(service.GetProposedHeight(&http.Request{}, nil, &reply))
+
+	minHeight, err := service.vm.GetMinimumHeight(t.Context())
+	require.NoError(err)
+	require.Equal(minHeight, uint64(reply.Height))
 
 	service.vm.ctx.Lock.Lock()
-	defer service.vm.ctx.Lock.Unlock()
-	user, err := vmkeystore.NewUserFromKeystore(service.vm.ctx.Keystore, testUsername, testPassword)
+
+	// issue any transaction to put into the new block
+	subnetID := testSubnet1.ID()
+	wallet := newWallet(t, service.vm, walletConfig{
+		subnetIDs: []ids.ID{subnetID},
+	})
+
+	tx, err := wallet.IssueCreateChainTx(
+		subnetID,
+		[]byte{},
+		constants.AVMID,
+		[]ids.ID{},
+		"chain name",
+		common.WithMemo([]byte{}),
+	)
 	require.NoError(err)
 
-	pk, err := secp256k1.ToPrivateKey(testPrivateKey)
+	service.vm.ctx.Lock.Unlock()
+
+	// Get the last accepted block which should be genesis
+	genesisBlockID := service.vm.manager.LastAccepted()
+
+	require.NoError(service.vm.Network.IssueTxFromRPC(tx))
+	service.vm.ctx.Lock.Lock()
+
+	block, err := service.vm.BuildBlock(t.Context())
 	require.NoError(err)
 
-	require.NoError(user.PutKeys(pk, keys[0]))
-}
+	blk := block.(*blockexecutor.Block)
+	require.NoError(blk.Verify(t.Context()))
 
-func TestAddValidator(t *testing.T) {
-	require := require.New(t)
+	require.NoError(blk.Accept(t.Context()))
 
-	expectedJSONString := `{"username":"","password":"","from":null,"changeAddr":"","txID":"11111111111111111111111111111111LpoYY","startTime":"0","endTime":"0","weight":"0","nodeID":"NodeID-111111111111111111116DBWJs","rewardAddress":"","delegationFeeRate":"0.0000"}`
-	args := AddValidatorArgs{}
-	bytes, err := json.Marshal(&args)
+	service.vm.ctx.Lock.Unlock()
+
+	latestBlockID := service.vm.manager.LastAccepted()
+	latestBlock, err := service.vm.manager.GetBlock(latestBlockID)
 	require.NoError(err)
-	require.Equal(expectedJSONString, string(bytes))
-}
+	require.NotEqual(genesisBlockID, latestBlockID)
 
-func TestCreateBlockchainArgsParsing(t *testing.T) {
-	require := require.New(t)
+	// Confirm that the proposed height hasn't changed with the new block being accepted.
+	require.NoError(service.GetProposedHeight(&http.Request{}, nil, &reply))
+	require.Equal(minHeight, uint64(reply.Height))
 
-	jsonString := `{"vmID":"lol","fxIDs":["secp256k1"], "name":"awesome", "username":"bob loblaw", "password":"yeet", "genesisData":"SkB92YpWm4Q2iPnLGCuDPZPgUQMxajqQQuz91oi3xD984f8r"}`
-	args := CreateBlockchainArgs{}
-	require.NoError(json.Unmarshal([]byte(jsonString), &args))
+	// Set the clock to beyond the proposer VM height of the most recent accepted block
+	service.vm.clock.Set(latestBlock.Timestamp().Add(31 * time.Second))
 
-	_, err := json.Marshal(args.GenesisData)
-	require.NoError(err)
-}
-
-func TestExportKey(t *testing.T) {
-	require := require.New(t)
-	jsonString := `{"username":"ScoobyUser","password":"ShaggyPassword1Zoinks!","address":"` + testAddress + `"}`
-	args := ExportKeyArgs{}
-	require.NoError(json.Unmarshal([]byte(jsonString), &args))
-
-	service, _ := defaultService(t)
-	defaultAddress(t, service)
-
-	reply := ExportKeyReply{}
-	require.NoError(service.ExportKey(nil, &args, &reply))
-
-	require.Equal(testPrivateKey, reply.PrivateKey.Bytes())
-}
-
-func TestImportKey(t *testing.T) {
-	require := require.New(t)
-	jsonString := `{"username":"ScoobyUser","password":"ShaggyPassword1Zoinks!","privateKey":"PrivateKey-ewoqjP7PxY4yr3iLTpLisriqt94hdyDFNgchSxGGztUrTXtNN"}`
-	args := ImportKeyArgs{}
-	require.NoError(json.Unmarshal([]byte(jsonString), &args))
-
-	service, _ := defaultService(t)
-
-	reply := api.JSONAddress{}
-	require.NoError(service.ImportKey(nil, &args, &reply))
-	require.Equal(testAddress, reply.Address)
+	// Confirm that the proposed height has updated to the latest block height
+	require.NoError(service.GetProposedHeight(&http.Request{}, nil, &reply))
+	require.Equal(latestBlock.Height(), uint64(reply.Height))
 }
 
 // Test issuing a tx and accepted
 func TestGetTxStatus(t *testing.T) {
 	require := require.New(t)
 	service, mutableSharedMemory := defaultService(t)
-	defaultAddress(t, service)
 	service.vm.ctx.Lock.Lock()
 
 	recipientKey, err := secp256k1.NewPrivateKey()
@@ -168,23 +150,24 @@ func TestGetTxStatus(t *testing.T) {
 	sm := m.NewSharedMemory(service.vm.ctx.ChainID)
 	peerSharedMemory := m.NewSharedMemory(service.vm.ctx.XChainID)
 
-	// #nosec G404
+	randSrc := rand.NewSource(0)
+
 	utxo := &avax.UTXO{
 		UTXOID: avax.UTXOID{
 			TxID:        ids.GenerateTestID(),
-			OutputIndex: rand.Uint32(),
+			OutputIndex: uint32(randSrc.Int63()),
 		},
 		Asset: avax.Asset{ID: service.vm.ctx.AVAXAssetID},
 		Out: &secp256k1fx.TransferOutput{
 			Amt: 1234567,
 			OutputOwners: secp256k1fx.OutputOwners{
 				Locktime:  0,
-				Addrs:     []ids.ShortID{recipientKey.PublicKey().Address()},
+				Addrs:     []ids.ShortID{recipientKey.Address()},
 				Threshold: 1,
 			},
 		},
 	}
-	utxoBytes, err := txs.Codec.Marshal(txs.CodecVersion, utxo)
+	utxoBytes, err := platform.Codec.Marshal(platform.CodecVersion, utxo)
 	require.NoError(err)
 
 	inputID := utxo.InputID()
@@ -195,7 +178,7 @@ func TestGetTxStatus(t *testing.T) {
 					Key:   inputID[:],
 					Value: utxoBytes,
 					Traits: [][]byte{
-						recipientKey.PublicKey().Address().Bytes(),
+						recipientKey.Address().Bytes(),
 					},
 				},
 			},
@@ -204,12 +187,15 @@ func TestGetTxStatus(t *testing.T) {
 
 	mutableSharedMemory.SharedMemory = sm
 
-	tx, err := service.vm.txBuilder.NewImportTx(
+	wallet := newWallet(t, service.vm, walletConfig{
+		keys: []*secp256k1.PrivateKey{recipientKey},
+	})
+	tx, err := wallet.IssueImportTx(
 		service.vm.ctx.XChainID,
-		ids.ShortEmpty,
-		[]*secp256k1.PrivateKey{recipientKey},
-		ids.ShortEmpty,
-		nil,
+		&secp256k1fx.OutputOwners{
+			Threshold: 1,
+			Addrs:     []ids.ShortID{ids.ShortEmpty},
+		},
 	)
 	require.NoError(err)
 
@@ -221,82 +207,113 @@ func TestGetTxStatus(t *testing.T) {
 	)
 	require.NoError(service.GetTxStatus(nil, arg, &resp))
 	require.Equal(status.Unknown, resp.Status)
-	require.Zero(resp.Reason)
+	require.Empty(resp.Reason)
 
 	// put the chain in existing chain list
-	require.NoError(service.vm.Network.IssueTx(context.Background(), tx))
+	require.NoError(service.vm.Network.IssueTxFromRPC(tx))
 	service.vm.ctx.Lock.Lock()
 
-	block, err := service.vm.BuildBlock(context.Background())
+	block, err := service.vm.BuildBlock(t.Context())
 	require.NoError(err)
 
 	blk := block.(*blockexecutor.Block)
-	require.NoError(blk.Verify(context.Background()))
+	require.NoError(blk.Verify(t.Context()))
 
-	require.NoError(blk.Accept(context.Background()))
+	require.NoError(blk.Accept(t.Context()))
 
 	service.vm.ctx.Lock.Unlock()
 
 	resp = GetTxStatusResponse{} // reset
 	require.NoError(service.GetTxStatus(nil, arg, &resp))
 	require.Equal(status.Committed, resp.Status)
-	require.Zero(resp.Reason)
+	require.Empty(resp.Reason)
 }
 
 // Test issuing and then retrieving a transaction
 func TestGetTx(t *testing.T) {
 	type test struct {
 		description string
-		createTx    func(service *Service) (*txs.Tx, error)
+		createTx    func(t testing.TB, s *Service) *platform.Tx
 	}
 
 	tests := []test{
 		{
 			"standard block",
-			func(service *Service) (*txs.Tx, error) {
-				return service.vm.txBuilder.NewCreateChainTx( // Test GetTx works for standard blocks
-					testSubnet1.ID(),
+			func(t testing.TB, s *Service) *platform.Tx {
+				subnetID := testSubnet1.ID()
+				wallet := newWallet(t, s.vm, walletConfig{
+					subnetIDs: []ids.ID{subnetID},
+				})
+
+				tx, err := wallet.IssueCreateChainTx(
+					subnetID,
 					[]byte{},
 					constants.AVMID,
 					[]ids.ID{},
 					"chain name",
-					[]*secp256k1.PrivateKey{testSubnet1ControlKeys[0], testSubnet1ControlKeys[1]},
-					keys[0].PublicKey().Address(), // change addr
-					nil,
+					common.WithMemo([]byte{}),
 				)
+				require.NoError(t, err)
+				return tx
 			},
 		},
 		{
 			"proposal block",
-			func(service *Service) (*txs.Tx, error) {
-				sk, err := bls.NewSecretKey()
+			func(t testing.TB, s *Service) *platform.Tx {
+				wallet := newWallet(t, s.vm, walletConfig{})
+
+				sk, err := localsigner.New()
+				require.NoError(t, err)
+				pop, err := signer.NewProofOfPossession(sk)
 				require.NoError(t, err)
 
-				return service.vm.txBuilder.NewAddPermissionlessValidatorTx( // Test GetTx works for proposal blocks
-					service.vm.MinValidatorStake,
-					uint64(service.vm.clock.Time().Add(txexecutor.SyncBound).Unix()),
-					uint64(service.vm.clock.Time().Add(txexecutor.SyncBound).Add(defaultMinStakingDuration).Unix()),
-					ids.GenerateTestNodeID(),
-					signer.NewProofOfPossession(sk),
-					ids.GenerateTestShortID(),
+				rewardsOwner := &secp256k1fx.OutputOwners{
+					Threshold: 1,
+					Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+				}
+				tx, err := wallet.IssueAddPermissionlessValidatorTx(
+					&platform.SubnetValidator{
+						Validator: platform.Validator{
+							NodeID: ids.GenerateTestNodeID(),
+							Start:  uint64(s.vm.clock.Time().Add(txexecutor.SyncBound).Unix()),
+							End:    uint64(s.vm.clock.Time().Add(txexecutor.SyncBound).Add(defaultMinStakingDuration).Unix()),
+							Wght:   s.vm.MinValidatorStake,
+						},
+						Subnet: constants.PrimaryNetworkID,
+					},
+					pop,
+					s.vm.ctx.AVAXAssetID,
+					rewardsOwner,
+					rewardsOwner,
 					0,
-					[]*secp256k1.PrivateKey{keys[0]},
-					keys[0].PublicKey().Address(), // change addr
-					nil,
+					common.WithMemo([]byte{}),
 				)
+				require.NoError(t, err)
+				return tx
 			},
 		},
 		{
 			"atomic block",
-			func(service *Service) (*txs.Tx, error) {
-				return service.vm.txBuilder.NewExportTx( // Test GetTx works for proposal blocks
-					100,
-					service.vm.ctx.XChainID,
-					ids.GenerateTestShortID(),
-					[]*secp256k1.PrivateKey{keys[0]},
-					keys[0].PublicKey().Address(), // change addr
-					nil,
+			func(t testing.TB, s *Service) *platform.Tx {
+				wallet := newWallet(t, s.vm, walletConfig{})
+
+				tx, err := wallet.IssueExportTx(
+					s.vm.ctx.XChainID,
+					[]*avax.TransferableOutput{{
+						Asset: avax.Asset{ID: s.vm.ctx.AVAXAssetID},
+						Out: &secp256k1fx.TransferOutput{
+							Amt: 100,
+							OutputOwners: secp256k1fx.OutputOwners{
+								Locktime:  0,
+								Threshold: 1,
+								Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+							},
+						},
+					}},
+					common.WithMemo([]byte{}),
 				)
+				require.NoError(t, err)
+				return tx
 			},
 		},
 	}
@@ -310,12 +327,9 @@ func TestGetTx(t *testing.T) {
 			t.Run(testName, func(t *testing.T) {
 				require := require.New(t)
 				service, _ := defaultService(t)
-				defaultAddress(t, service)
+
 				service.vm.ctx.Lock.Lock()
-
-				tx, err := test.createTx(service)
-				require.NoError(err)
-
+				tx := test.createTx(t, service)
 				service.vm.ctx.Lock.Unlock()
 
 				arg := &api.GetTxArgs{
@@ -323,28 +337,28 @@ func TestGetTx(t *testing.T) {
 					Encoding: encoding,
 				}
 				var response api.GetTxReply
-				err = service.GetTx(nil, arg, &response)
+				err := service.GetTx(nil, arg, &response)
 				require.ErrorIs(err, database.ErrNotFound) // We haven't issued the tx yet
 
-				require.NoError(service.vm.Network.IssueTx(context.Background(), tx))
+				require.NoError(service.vm.Network.IssueTxFromRPC(tx))
 				service.vm.ctx.Lock.Lock()
 
-				blk, err := service.vm.BuildBlock(context.Background())
+				blk, err := service.vm.BuildBlock(t.Context())
 				require.NoError(err)
 
-				require.NoError(blk.Verify(context.Background()))
+				require.NoError(blk.Verify(t.Context()))
 
-				require.NoError(blk.Accept(context.Background()))
+				require.NoError(blk.Accept(t.Context()))
 
 				if blk, ok := blk.(snowman.OracleBlock); ok { // For proposal blocks, commit them
-					options, err := blk.Options(context.Background())
+					options, err := blk.Options(t.Context())
 					if !errors.Is(err, snowman.ErrNotOracle) {
 						require.NoError(err)
 
 						commit := options[0].(*blockexecutor.Block)
-						require.IsType(&block.BanffCommitBlock{}, commit.Block)
-						require.NoError(commit.Verify(context.Background()))
-						require.NoError(commit.Accept(context.Background()))
+						require.IsType(&platform.BanffCommitBlock{}, commit.Block)
+						require.NoError(commit.Verify(t.Context()))
+						require.NoError(commit.Accept(t.Context()))
 					}
 				}
 
@@ -365,7 +379,7 @@ func TestGetTx(t *testing.T) {
 					tx.Unsigned.InitCtx(service.vm.ctx)
 					expectedTxJSON, err := json.Marshal(tx)
 					require.NoError(err)
-					require.Equal(expectedTxJSON, []byte(response.Tx))
+					require.JSONEq(string(expectedTxJSON), string(response.Tx))
 				}
 			})
 		}
@@ -375,24 +389,34 @@ func TestGetTx(t *testing.T) {
 func TestGetBalance(t *testing.T) {
 	require := require.New(t)
 	service, _ := defaultService(t)
-	defaultAddress(t, service)
+
+	feeCalculator := state.PickFeeCalculator(&service.vm.Internal, service.vm.state)
+	createSubnetFee, err := feeCalculator.CalculateFee(testSubnet1.Unsigned)
+	require.NoError(err)
 
 	// Ensure GetStake is correct for each of the genesis validators
-	genesis, _ := defaultGenesis(t, service.vm.ctx.AVAXAssetID)
+	genesis := genesistest.New(t, genesistest.Config{})
 	for idx, utxo := range genesis.UTXOs {
+		out := utxo.Out.(*secp256k1fx.TransferOutput)
+		require.Len(out.Addrs, 1)
+
+		addr := out.Addrs[0]
+		addrStr, err := address.Format("P", constants.UnitTestHRP, addr.Bytes())
+		require.NoError(err)
+
 		request := GetBalanceRequest{
 			Addresses: []string{
-				"P-" + utxo.Address,
+				addrStr,
 			},
 		}
 		reply := GetBalanceResponse{}
 
 		require.NoError(service.GetBalance(nil, &request, &reply))
-		balance := defaultBalance
+		balance := genesistest.DefaultInitialBalance
 		if idx == 0 {
 			// we use the first key to fund a subnet creation in [defaultGenesis].
 			// As such we need to account for the subnet creation fee
-			balance = defaultBalance - service.vm.Config.GetCreateSubnetTxFee(service.vm.clock.Time())
+			balance = genesistest.DefaultInitialBalance - createSubnetFee
 		}
 		require.Equal(avajson.Uint64(balance), reply.Balance)
 		require.Equal(avajson.Uint64(balance), reply.Unlocked)
@@ -404,24 +428,31 @@ func TestGetBalance(t *testing.T) {
 func TestGetStake(t *testing.T) {
 	require := require.New(t)
 	service, _ := defaultService(t)
-	defaultAddress(t, service)
 
 	// Ensure GetStake is correct for each of the genesis validators
-	genesis, _ := defaultGenesis(t, service.vm.ctx.AVAXAssetID)
+	genesis := genesistest.New(t, genesistest.Config{})
 	addrsStrs := []string{}
-	for i, validator := range genesis.Validators {
-		addr := "P-" + validator.RewardOwner.Addresses[0]
-		addrsStrs = append(addrsStrs, addr)
+	for _, validatorTx := range genesis.Validators {
+		validator := validatorTx.Unsigned.(*platform.AddValidatorTx)
+		require.Len(validator.StakeOuts, 1)
+		stakeOut := validator.StakeOuts[0].Out.(*secp256k1fx.TransferOutput)
+		require.Len(stakeOut.Addrs, 1)
+		addr := stakeOut.Addrs[0]
+
+		addrStr, err := address.Format("P", constants.UnitTestHRP, addr.Bytes())
+		require.NoError(err)
+
+		addrsStrs = append(addrsStrs, addrStr)
 
 		args := GetStakeArgs{
 			JSONAddresses: api.JSONAddresses{
-				Addresses: []string{addr},
+				Addresses: []string{addrStr},
 			},
 			Encoding: formatting.Hex,
 		}
 		response := GetStakeReply{}
 		require.NoError(service.GetStake(nil, &args, &response))
-		require.Equal(defaultWeight, uint64(response.Staked))
+		require.Equal(genesistest.DefaultValidatorWeight, uint64(response.Staked))
 		require.Len(response.Outputs, 1)
 
 		// Unmarshal into an output
@@ -429,15 +460,26 @@ func TestGetStake(t *testing.T) {
 		require.NoError(err)
 
 		var output avax.TransferableOutput
-		_, err = txs.Codec.Unmarshal(outputBytes, &output)
+		_, err = platform.Codec.Unmarshal(outputBytes, &output)
 		require.NoError(err)
 
-		out := output.Out.(*secp256k1fx.TransferOutput)
-		require.Equal(defaultWeight, out.Amount())
-		require.Equal(uint32(1), out.Threshold)
-		require.Len(out.Addrs, 1)
-		require.Equal(keys[i].PublicKey().Address(), out.Addrs[0])
-		require.Zero(out.Locktime)
+		require.Equal(
+			avax.TransferableOutput{
+				Asset: avax.Asset{
+					ID: service.vm.ctx.AVAXAssetID,
+				},
+				Out: &secp256k1fx.TransferOutput{
+					Amt: genesistest.DefaultValidatorWeight,
+					OutputOwners: secp256k1fx.OutputOwners{
+						Threshold: 1,
+						Addrs: []ids.ShortID{
+							addr,
+						},
+					},
+				},
+			},
+			output,
+		)
 	}
 
 	// Make sure this works for multiple addresses
@@ -449,7 +491,7 @@ func TestGetStake(t *testing.T) {
 	}
 	response := GetStakeReply{}
 	require.NoError(service.GetStake(nil, &args, &response))
-	require.Equal(len(genesis.Validators)*int(defaultWeight), int(response.Staked))
+	require.Equal(len(genesis.Validators)*int(genesistest.DefaultValidatorWeight), int(response.Staked))
 	require.Len(response.Outputs, len(genesis.Validators))
 
 	for _, outputStr := range response.Outputs {
@@ -457,54 +499,65 @@ func TestGetStake(t *testing.T) {
 		require.NoError(err)
 
 		var output avax.TransferableOutput
-		_, err = txs.Codec.Unmarshal(outputBytes, &output)
+		_, err = platform.Codec.Unmarshal(outputBytes, &output)
 		require.NoError(err)
 
 		out := output.Out.(*secp256k1fx.TransferOutput)
-		require.Equal(defaultWeight, out.Amount())
+		require.Equal(genesistest.DefaultValidatorWeight, out.Amt)
 		require.Equal(uint32(1), out.Threshold)
 		require.Zero(out.Locktime)
 		require.Len(out.Addrs, 1)
 	}
 
-	oldStake := defaultWeight
+	oldStake := genesistest.DefaultValidatorWeight
 
 	service.vm.ctx.Lock.Lock()
 
+	wallet := newWallet(t, service.vm, walletConfig{})
+
 	// Add a delegator
 	stakeAmount := service.vm.MinDelegatorStake + 12345
-	delegatorNodeID := genesisNodeIDs[0]
-	delegatorStartTime := defaultValidateStartTime
-	delegatorEndTime := defaultGenesisTime.Add(defaultMinStakingDuration)
-	tx, err := service.vm.txBuilder.NewAddDelegatorTx(
-		stakeAmount,
-		uint64(delegatorStartTime.Unix()),
-		uint64(delegatorEndTime.Unix()),
-		delegatorNodeID,
-		ids.GenerateTestShortID(),
-		[]*secp256k1.PrivateKey{keys[0]},
-		keys[0].PublicKey().Address(), // change addr
-		nil,
+	delegatorNodeID := genesistest.DefaultNodeIDs[0]
+	delegatorEndTime := genesistest.DefaultValidatorStartTime.Add(defaultMinStakingDuration)
+	rewardsOwner := &secp256k1fx.OutputOwners{
+		Threshold: 1,
+		Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+	}
+	withChangeOwner := common.WithChangeOwner(&secp256k1fx.OutputOwners{
+		Threshold: 1,
+		Addrs:     []ids.ShortID{genesistest.DefaultFundedKeys[0].Address()},
+	})
+	tx, err := wallet.IssueAddDelegatorTx(
+		&platform.Validator{
+			NodeID: delegatorNodeID,
+			Start:  genesistest.DefaultValidatorStartTimeUnix,
+			End:    uint64(delegatorEndTime.Unix()),
+			Wght:   stakeAmount,
+		},
+		rewardsOwner,
+		withChangeOwner,
 	)
 	require.NoError(err)
 
-	addDelTx := tx.Unsigned.(*txs.AddDelegatorTx)
+	addDelTx := tx.Unsigned.(*platform.AddDelegatorTx)
 	staker, err := state.NewCurrentStaker(
 		tx.ID(),
 		addDelTx,
-		delegatorStartTime,
+		genesistest.DefaultValidatorStartTime,
+		addDelTx.EndTime(),
+		addDelTx.Weight(),
 		0,
 	)
 	require.NoError(err)
 
-	service.vm.state.PutCurrentDelegator(staker)
+	require.NoError(service.vm.state.PutCurrentDelegator(staker))
 	service.vm.state.AddTx(tx, status.Committed)
 	require.NoError(service.vm.state.Commit())
 
 	service.vm.ctx.Lock.Unlock()
 
 	// Make sure the delegator addr has the right stake (old stake + stakeAmount)
-	addr, _ := service.addrManager.FormatLocalAddress(keys[0].PublicKey().Address())
+	addr, _ := service.addrManager.FormatLocalAddress(genesistest.DefaultFundedKeys[0].Address())
 	args.Addresses = []string{addr}
 	require.NoError(service.GetStake(nil, &args, &response))
 	require.Equal(oldStake+stakeAmount, uint64(response.Staked))
@@ -515,7 +568,7 @@ func TestGetStake(t *testing.T) {
 	for i := range outputs {
 		outputBytes, err := formatting.Decode(args.Encoding, response.Outputs[i])
 		require.NoError(err)
-		_, err = txs.Codec.Unmarshal(outputBytes, &outputs[i])
+		_, err = platform.Codec.Unmarshal(outputBytes, &outputs[i])
 		require.NoError(err)
 	}
 
@@ -530,27 +583,27 @@ func TestGetStake(t *testing.T) {
 	// Add a pending staker
 	stakeAmount = service.vm.MinValidatorStake + 54321
 	pendingStakerNodeID := ids.GenerateTestNodeID()
-	pendingStakerEndTime := uint64(defaultGenesisTime.Add(defaultMinStakingDuration).Unix())
-	tx, err = service.vm.txBuilder.NewAddValidatorTx(
-		stakeAmount,
-		uint64(defaultGenesisTime.Unix()),
-		pendingStakerEndTime,
-		pendingStakerNodeID,
-		ids.GenerateTestShortID(),
+	pendingStakerEndTime := uint64(genesistest.DefaultValidatorStartTime.Add(defaultMinStakingDuration).Unix())
+	tx, err = wallet.IssueAddValidatorTx(
+		&platform.Validator{
+			NodeID: pendingStakerNodeID,
+			Start:  uint64(genesistest.DefaultValidatorStartTime.Unix()),
+			End:    pendingStakerEndTime,
+			Wght:   stakeAmount,
+		},
+		rewardsOwner,
 		0,
-		[]*secp256k1.PrivateKey{keys[0]},
-		keys[0].PublicKey().Address(), // change addr
-		nil,
+		withChangeOwner,
 	)
 	require.NoError(err)
 
 	staker, err = state.NewPendingStaker(
 		tx.ID(),
-		tx.Unsigned.(*txs.AddValidatorTx),
+		tx.Unsigned.(*platform.AddValidatorTx),
 	)
 	require.NoError(err)
 
-	service.vm.state.PutPendingValidator(staker)
+	require.NoError(service.vm.state.PutPendingValidator(staker))
 	service.vm.state.AddTx(tx, status.Committed)
 	require.NoError(service.vm.state.Commit())
 
@@ -566,7 +619,7 @@ func TestGetStake(t *testing.T) {
 	for i := range outputs {
 		outputBytes, err := formatting.Decode(args.Encoding, response.Outputs[i])
 		require.NoError(err)
-		_, err = txs.Codec.Unmarshal(outputBytes, &outputs[i])
+		_, err = platform.Codec.Unmarshal(outputBytes, &outputs[i])
 		require.NoError(err)
 	}
 
@@ -577,62 +630,83 @@ func TestGetStake(t *testing.T) {
 func TestGetCurrentValidators(t *testing.T) {
 	require := require.New(t)
 	service, _ := defaultService(t)
-	defaultAddress(t, service)
 
-	genesis, _ := defaultGenesis(t, service.vm.ctx.AVAXAssetID)
+	genesis := genesistest.New(t, genesistest.Config{})
 
 	// Call getValidators
 	args := GetCurrentValidatorsArgs{SubnetID: constants.PrimaryNetworkID}
 	response := GetCurrentValidatorsReply{}
 
+	// Connect to nodes other than the last node in genesis.Validators, which is the node being tested.
+	connectedIDs := set.NewSet[ids.NodeID](len(genesis.Validators) - 1)
+	for _, validatorTx := range genesis.Validators[:len(genesis.Validators)-1] {
+		validator := validatorTx.Unsigned.(*platform.AddValidatorTx)
+		connectedIDs.Add(validator.NodeID())
+		require.NoError(service.vm.Connected(t.Context(), validator.NodeID(), version.Current))
+	}
+
 	require.NoError(service.GetCurrentValidators(nil, &args, &response))
 	require.Len(response.Validators, len(genesis.Validators))
 
-	for _, vdr := range genesis.Validators {
+	for _, validatorTx := range genesis.Validators {
+		validator := validatorTx.Unsigned.(*platform.AddValidatorTx)
+		nodeID := validator.NodeID()
+
 		found := false
-		for i := 0; i < len(response.Validators) && !found; i++ {
+		for i := 0; i < len(response.Validators); i++ {
 			gotVdr := response.Validators[i].(pchainapi.PermissionlessValidator)
-			if gotVdr.NodeID != vdr.NodeID {
+			if gotVdr.NodeID != nodeID {
 				continue
 			}
 
-			require.Equal(vdr.EndTime, gotVdr.EndTime)
-			require.Equal(vdr.StartTime, gotVdr.StartTime)
+			require.Equal(validator.EndTime().Unix(), int64(gotVdr.EndTime))
+			require.Equal(validator.StartTime().Unix(), int64(gotVdr.StartTime))
+			require.Equal(connectedIDs.Contains(validator.NodeID()), *gotVdr.Connected)
+			require.Equal(float32(avajson.Float32(100)), float32(*gotVdr.Uptime))
 			found = true
+			break
 		}
-		require.True(found, "expected validators to contain %s but didn't", vdr.NodeID)
+		require.True(found, "expected validators to contain %s but didn't", nodeID)
 	}
 
 	// Add a delegator
 	stakeAmount := service.vm.MinDelegatorStake + 12345
-	validatorNodeID := genesisNodeIDs[1]
-	delegatorStartTime := defaultValidateStartTime
-	delegatorEndTime := delegatorStartTime.Add(defaultMinStakingDuration)
+	validatorNodeID := genesistest.DefaultNodeIDs[1]
+	delegatorEndTime := genesistest.DefaultValidatorStartTime.Add(defaultMinStakingDuration)
 
 	service.vm.ctx.Lock.Lock()
 
-	delTx, err := service.vm.txBuilder.NewAddDelegatorTx(
-		stakeAmount,
-		uint64(delegatorStartTime.Unix()),
-		uint64(delegatorEndTime.Unix()),
-		validatorNodeID,
-		ids.GenerateTestShortID(),
-		[]*secp256k1.PrivateKey{keys[0]},
-		keys[0].PublicKey().Address(), // change addr
-		nil,
+	wallet := newWallet(t, service.vm, walletConfig{})
+	delTx, err := wallet.IssueAddDelegatorTx(
+		&platform.Validator{
+			NodeID: validatorNodeID,
+			Start:  genesistest.DefaultValidatorStartTimeUnix,
+			End:    uint64(delegatorEndTime.Unix()),
+			Wght:   stakeAmount,
+		},
+		&secp256k1fx.OutputOwners{
+			Threshold: 1,
+			Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+		},
+		common.WithChangeOwner(&secp256k1fx.OutputOwners{
+			Threshold: 1,
+			Addrs:     []ids.ShortID{genesistest.DefaultFundedKeys[0].Address()},
+		}),
 	)
 	require.NoError(err)
 
-	addDelTx := delTx.Unsigned.(*txs.AddDelegatorTx)
+	addDelTx := delTx.Unsigned.(*platform.AddDelegatorTx)
 	staker, err := state.NewCurrentStaker(
 		delTx.ID(),
 		addDelTx,
-		delegatorStartTime,
+		genesistest.DefaultValidatorStartTime,
+		addDelTx.EndTime(),
+		addDelTx.Weight(),
 		0,
 	)
 	require.NoError(err)
 
-	service.vm.state.PutCurrentDelegator(staker)
+	require.NoError(service.vm.state.PutCurrentDelegator(staker))
 	service.vm.state.AddTx(delTx, status.Committed)
 	require.NoError(service.vm.state.Commit())
 
@@ -669,7 +743,7 @@ func TestGetCurrentValidators(t *testing.T) {
 		require.Len(*innerVdr.Delegators, 1)
 		delegator := (*innerVdr.Delegators)[0]
 		require.Equal(delegator.NodeID, innerVdr.NodeID)
-		require.Equal(int64(delegator.StartTime), delegatorStartTime.Unix())
+		require.Equal(uint64(delegator.StartTime), genesistest.DefaultValidatorStartTimeUnix)
 		require.Equal(int64(delegator.EndTime), delegatorEndTime.Unix())
 		require.Equal(uint64(delegator.Weight), stakeAmount)
 	}
@@ -678,11 +752,11 @@ func TestGetCurrentValidators(t *testing.T) {
 	service.vm.ctx.Lock.Lock()
 
 	// Reward the delegator
-	tx, err := builder.NewRewardValidatorTx(service.vm.ctx, delTx.ID())
+	tx, err := blockbuilder.NewRewardValidatorTx(service.vm.ctx, delTx.ID())
 	require.NoError(err)
 	service.vm.state.AddTx(tx, status.Committed)
-	service.vm.state.DeleteCurrentDelegator(staker)
-	require.NoError(service.vm.state.SetDelegateeReward(staker.SubnetID, staker.NodeID, 100000))
+	require.NoError(service.vm.state.DeleteCurrentDelegator(staker))
+	require.NoError(service.vm.state.SetStakingInfo(staker.SubnetID, staker.NodeID, state.StakingInfo{DelegateeReward: 100000}))
 	require.NoError(service.vm.state.Commit())
 
 	service.vm.ctx.Lock.Unlock()
@@ -698,6 +772,264 @@ func TestGetCurrentValidators(t *testing.T) {
 			continue
 		}
 		require.Equal(uint64(100000), uint64(*castVdr.AccruedDelegateeReward))
+	}
+}
+
+func TestGetValidatorsAt(t *testing.T) {
+	require := require.New(t)
+	service, _ := defaultService(t)
+
+	genesis := genesistest.New(t, genesistest.Config{})
+
+	args := GetValidatorsAtArgs{}
+	response := GetValidatorsAtReply{}
+
+	service.vm.ctx.Lock.Lock()
+	lastAccepted := service.vm.manager.LastAccepted()
+	lastAcceptedBlk, err := service.vm.manager.GetBlock(lastAccepted)
+	require.NoError(err)
+
+	service.vm.ctx.Lock.Unlock()
+
+	// Confirm that it returns the genesis validators given the latest height
+	args.Height = pchainapi.Height(lastAcceptedBlk.Height())
+	require.NoError(service.GetValidatorsAt(&http.Request{}, &args, &response))
+	require.Len(response.Validators, len(genesis.Validators))
+
+	service.vm.ctx.Lock.Lock()
+
+	wallet := newWallet(t, service.vm, walletConfig{})
+	rewardsOwner := &secp256k1fx.OutputOwners{
+		Threshold: 1,
+		Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+	}
+
+	sk, err := localsigner.New()
+	require.NoError(err)
+	pop, err := signer.NewProofOfPossession(sk)
+	require.NoError(err)
+
+	tx, err := wallet.IssueAddPermissionlessValidatorTx(
+		&platform.SubnetValidator{
+			Validator: platform.Validator{
+				NodeID: ids.GenerateTestNodeID(),
+				Start:  uint64(service.vm.clock.Time().Add(txexecutor.SyncBound).Unix()),
+				End:    uint64(service.vm.clock.Time().Add(txexecutor.SyncBound).Add(defaultMinStakingDuration).Unix()),
+				Wght:   service.vm.MinValidatorStake,
+			},
+			Subnet: constants.PrimaryNetworkID,
+		},
+		pop,
+		service.vm.ctx.AVAXAssetID,
+		rewardsOwner,
+		rewardsOwner,
+		0,
+		common.WithMemo([]byte{}),
+	)
+
+	require.NoError(err)
+
+	service.vm.ctx.Lock.Unlock()
+	require.NoError(service.vm.Network.IssueTxFromRPC(tx))
+	service.vm.ctx.Lock.Lock()
+
+	block, err := service.vm.BuildBlock(t.Context())
+	require.NoError(err)
+
+	blk := block.(*blockexecutor.Block)
+	require.NoError(blk.Verify(t.Context()))
+
+	require.NoError(blk.Accept(t.Context()))
+	service.vm.ctx.Lock.Unlock()
+
+	newLastAccepted := service.vm.manager.LastAccepted()
+	newLastAcceptedBlk, err := service.vm.manager.GetBlock(newLastAccepted)
+	require.NoError(err)
+	require.NotEqual(newLastAccepted, lastAccepted)
+
+	// Confirm that it returns the genesis validators + the new validator given the latest height
+	args.Height = pchainapi.Height(newLastAcceptedBlk.Height())
+	require.NoError(service.GetValidatorsAt(&http.Request{}, &args, &response))
+	require.Len(response.Validators, len(genesis.Validators)+1)
+
+	// Confirm that [IsProposed] works. The proposed height should be the genesis height
+	args.Height = pchainapi.Height(pchainapi.ProposedHeight)
+	require.NoError(service.GetValidatorsAt(&http.Request{}, &args, &response))
+	require.Len(response.Validators, len(genesis.Validators))
+
+	service.vm.ctx.Lock.Lock()
+
+	// set clock beyond the [validators.recentlyAcceptedWindowTTL] to bump the
+	// proposerVM height
+	service.vm.clock.Set(newLastAcceptedBlk.Timestamp().Add(40 * time.Second))
+	service.vm.ctx.Lock.Unlock()
+
+	// Resending the same request with [Height] set to [platformapi.ProposedHeight] should now
+	// include the new validator
+	require.NoError(service.GetValidatorsAt(&http.Request{}, &args, &response))
+	require.Len(response.Validators, len(genesis.Validators)+1)
+}
+
+func TestGetCurrentValidatorsAutoRenewedValidator(t *testing.T) {
+	require := require.New(t)
+	service, _ := defaultService(t)
+
+	nodeID := ids.GenerateTestNodeID()
+	startTime := service.vm.clock.Time()
+
+	const (
+		autoCompoundRewardShares = uint32(reward.PercentDenominator / 3)
+		potentialReward          = uint64(12_345)
+		period                   = defaultMinStakingDuration
+	)
+	periodSeconds := uint64(period / time.Second)
+	weight := service.vm.MinValidatorStake
+	endTime := startTime.Add(period)
+
+	rewardOwner := &secp256k1fx.OutputOwners{
+		Threshold: 1,
+		Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+	}
+	validatorAuthority := &secp256k1fx.OutputOwners{
+		Threshold: 1,
+		Addrs:     []ids.ShortID{ids.GenerateTestShortID()},
+	}
+	sk, err := localsigner.New()
+	require.NoError(err)
+	pop, err := signer.NewProofOfPossession(sk)
+	require.NoError(err)
+
+	addAutoRenewedValidatorTx := &platform.AddAutoRenewedValidatorTx{
+		ValidatorNodeID:          types.JSONByteSlice(nodeID.Bytes()),
+		Signer:                   pop,
+		ValidatorRewardsOwner:    rewardOwner,
+		DelegatorRewardsOwner:    rewardOwner,
+		ValidatorAuthority:       validatorAuthority,
+		DelegationShares:         reward.PercentDenominator,
+		AutoCompoundRewardShares: autoCompoundRewardShares,
+		Period:                   periodSeconds,
+	}
+	tx := &platform.Tx{Unsigned: addAutoRenewedValidatorTx}
+	require.NoError(tx.Initialize(platform.Codec))
+
+	service.vm.ctx.Lock.Lock()
+	staker := &state.Staker{
+		TxID:            tx.ID(),
+		NodeID:          addAutoRenewedValidatorTx.NodeID(),
+		PublicKey:       pop.Key(),
+		SubnetID:        addAutoRenewedValidatorTx.SubnetID(),
+		Weight:          weight,
+		StartTime:       startTime,
+		EndTime:         endTime,
+		PotentialReward: potentialReward,
+		NextTime:        endTime,
+		Priority:        addAutoRenewedValidatorTx.CurrentPriority(),
+	}
+
+	diff, err := state.NewDiffOn(service.vm.state, state.StakerAdditionAfterDeletionAllowed)
+	require.NoError(err)
+	diff.AddTx(tx, status.Committed)
+	require.NoError(diff.PutCurrentValidator(staker))
+	require.NoError(diff.SetStakingInfo(staker.SubnetID, staker.NodeID, state.StakingInfo{
+		AutoCompoundRewardShares: autoCompoundRewardShares,
+		NextPeriod:               periodSeconds,
+	}))
+	require.NoError(diff.Apply(service.vm.state))
+	require.NoError(service.vm.state.Commit())
+	service.vm.ctx.Lock.Unlock()
+
+	reply := GetCurrentValidatorsReply{}
+	require.NoError(service.GetCurrentValidators(&http.Request{}, &GetCurrentValidatorsArgs{
+		SubnetID: constants.PrimaryNetworkID,
+		NodeIDs:  []ids.NodeID{nodeID},
+	}, &reply))
+	require.Len(reply.Validators, 1)
+
+	gotValidator := reply.Validators[0].(pchainapi.PermissionlessValidator)
+
+	rewardOwnerAddr, err := service.addrManager.FormatLocalAddress(rewardOwner.Addrs[0])
+	require.NoError(err)
+	validatorAuthorityAddr, err := service.addrManager.FormatLocalAddress(validatorAuthority.Addrs[0])
+	require.NoError(err)
+
+	wantRewardOwner := &pchainapi.Owner{
+		Threshold: avajson.Uint32(rewardOwner.Threshold),
+		Addresses: []string{rewardOwnerAddr},
+	}
+	wantValidator := pchainapi.PermissionlessValidator{
+		Staker: pchainapi.Staker{
+			TxID:      tx.ID(),
+			StartTime: avajson.Uint64(startTime.Unix()),
+			EndTime:   avajson.Uint64(endTime.Unix()),
+			Weight:    avajson.Uint64(weight),
+			NodeID:    nodeID,
+		},
+		ValidationRewardOwner:  wantRewardOwner,
+		DelegationRewardOwner:  wantRewardOwner,
+		PotentialReward:        new(avajson.Uint64(potentialReward)),
+		AccruedDelegateeReward: new(avajson.Uint64),
+		DelegationFee:          avajson.Float32(100),
+		Uptime:                 new(avajson.Float32(100)),
+		Connected:              new(false),
+		Signer: &signer.ProofOfPossession{
+			PublicKey:         pop.PublicKey,
+			ProofOfPossession: pop.ProofOfPossession,
+		},
+		AutoRenewedConfig: &pchainapi.AutoRenewedConfig{
+			ValidatorAuthority: &pchainapi.Owner{
+				Threshold: avajson.Uint32(validatorAuthority.Threshold),
+				Addresses: []string{validatorAuthorityAddr},
+			},
+			NextPeriod:               avajson.Uint64(periodSeconds),
+			AutoCompoundRewardShares: avajson.Uint32(autoCompoundRewardShares),
+		},
+		DelegatorCount:  new(avajson.Uint64),
+		DelegatorWeight: new(avajson.Uint64),
+		Delegators:      &[]pchainapi.PrimaryDelegator{},
+	}
+	require.Equal(wantValidator, gotValidator)
+}
+
+func TestGetValidatorsAtArgsMarshalling(t *testing.T) {
+	subnetID, err := ids.FromString("u3Jjpzzj95827jdENvR1uc76f4zvvVQjGshbVWaSr2Ce5WV1H")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		args GetValidatorsAtArgs
+		json string
+	}{
+		{
+			name: "specific height",
+			args: GetValidatorsAtArgs{
+				Height:   pchainapi.Height(12345),
+				SubnetID: subnetID,
+			},
+			json: `{"height":"12345","subnetID":"u3Jjpzzj95827jdENvR1uc76f4zvvVQjGshbVWaSr2Ce5WV1H"}`,
+		},
+		{
+			name: "proposed height",
+			args: GetValidatorsAtArgs{
+				Height:   pchainapi.ProposedHeight,
+				SubnetID: subnetID,
+			},
+			json: `{"height":"proposed","subnetID":"u3Jjpzzj95827jdENvR1uc76f4zvvVQjGshbVWaSr2Ce5WV1H"}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+
+			// Test that marshalling produces the expected JSON
+			argsJSON, err := json.Marshal(test.args)
+			require.NoError(err)
+			require.JSONEq(test.json, string(argsJSON))
+
+			// Test that unmarshalling produces the expected args
+			var parsedArgs GetValidatorsAtArgs
+			require.NoError(json.Unmarshal(argsJSON, &parsedArgs))
+			require.Equal(test.args, parsedArgs)
+		})
 	}
 }
 
@@ -742,18 +1074,17 @@ func TestGetBlock(t *testing.T) {
 			service, _ := defaultService(t)
 			service.vm.ctx.Lock.Lock()
 
-			service.vm.Config.CreateAssetTxFee = 100 * defaultTxFee
-
-			// Make a block an accept it, then check we can get it.
-			tx, err := service.vm.txBuilder.NewCreateChainTx( // Test GetTx works for standard blocks
-				testSubnet1.ID(),
+			subnetID := testSubnet1.ID()
+			wallet := newWallet(t, service.vm, walletConfig{
+				subnetIDs: []ids.ID{subnetID},
+			})
+			tx, err := wallet.IssueCreateChainTx(
+				subnetID,
 				[]byte{},
 				constants.AVMID,
 				[]ids.ID{},
 				"chain name",
-				[]*secp256k1.PrivateKey{testSubnet1ControlKeys[0], testSubnet1ControlKeys[1]},
-				keys[0].PublicKey().Address(), // change addr
-				nil,
+				common.WithMemo([]byte{}),
 			)
 			require.NoError(err)
 
@@ -761,18 +1092,18 @@ func TestGetBlock(t *testing.T) {
 			preferred, err := service.vm.manager.GetBlock(preferredID)
 			require.NoError(err)
 
-			statelessBlock, err := block.NewBanffStandardBlock(
+			statelessBlock, err := platform.NewBanffStandardBlock(
 				preferred.Timestamp(),
 				preferred.ID(),
 				preferred.Height()+1,
-				[]*txs.Tx{tx},
+				[]*platform.Tx{tx},
 			)
 			require.NoError(err)
 
 			blk := service.vm.manager.NewBlock(statelessBlock)
 
-			require.NoError(blk.Verify(context.Background()))
-			require.NoError(blk.Accept(context.Background()))
+			require.NoError(blk.Verify(t.Context()))
+			require.NoError(blk.Accept(t.Context()))
 
 			service.vm.ctx.Lock.Unlock()
 
@@ -783,12 +1114,12 @@ func TestGetBlock(t *testing.T) {
 			response := api.GetBlockResponse{}
 			require.NoError(service.GetBlock(nil, &args, &response))
 
-			switch {
-			case test.encoding == formatting.JSON:
+			switch test.encoding {
+			case formatting.JSON:
 				statelessBlock.InitCtx(service.vm.ctx)
 				expectedBlockJSON, err := json.Marshal(statelessBlock)
 				require.NoError(err)
-				require.Equal(expectedBlockJSON, []byte(response.Block))
+				require.JSONEq(string(expectedBlockJSON), string(response.Block))
 			default:
 				var blockStr string
 				require.NoError(json.Unmarshal(response.Block, &blockStr))
@@ -818,11 +1149,11 @@ func TestGetValidatorsAtReplyMarshalling(t *testing.T) {
 	}
 	{
 		nodeID := ids.GenerateTestNodeID()
-		sk, err := bls.NewSecretKey()
+		sk, err := localsigner.New()
 		require.NoError(err)
 		reply.Validators[nodeID] = &validators.GetValidatorOutput{
 			NodeID:    nodeID,
-			PublicKey: bls.PublicFromSecretKey(sk),
+			PublicKey: sk.PublicKey(),
 			Weight:    math.MaxUint64,
 		}
 	}
@@ -851,11 +1182,10 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 	tests := []test{
 		{
 			name: "block height not found",
-			serviceAndExpectedBlockFunc: func(_ *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
-				state := state.NewMockState(ctrl)
-				state.EXPECT().GetBlockIDAtHeight(blockHeight).Return(ids.Empty, database.ErrNotFound)
+			serviceAndExpectedBlockFunc: func(t *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
+				state := statetest.New(t, statetest.Config{})
 
-				manager := blockexecutor.NewMockManager(ctrl)
+				manager := executormock.NewManager(ctrl)
 				return &Service{
 					vm: &VM{
 						state:   state,
@@ -871,12 +1201,20 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 		},
 		{
 			name: "block not found",
-			serviceAndExpectedBlockFunc: func(_ *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
-				state := state.NewMockState(ctrl)
-				state.EXPECT().GetBlockIDAtHeight(blockHeight).Return(blockID, nil)
+			serviceAndExpectedBlockFunc: func(t *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
+				block, err := platform.NewBanffStandardBlock(
+					time.Now(),
+					blockID,
+					blockHeight,
+					nil,
+				)
+				require.NoError(t, err)
 
-				manager := blockexecutor.NewMockManager(ctrl)
-				manager.EXPECT().GetStatelessBlock(blockID).Return(nil, database.ErrNotFound)
+				state := statetest.New(t, statetest.Config{})
+				state.AddStatelessBlock(block)
+
+				manager := executormock.NewManager(ctrl)
+				manager.EXPECT().GetStatelessBlock(block.ID()).Return(nil, database.ErrNotFound)
 				return &Service{
 					vm: &VM{
 						state:   state,
@@ -892,14 +1230,16 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 		},
 		{
 			name: "JSON format",
-			serviceAndExpectedBlockFunc: func(_ *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
-				block := block.NewMockBlock(ctrl)
+			serviceAndExpectedBlockFunc: func(t *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
+				block := platform.NewMockBlock(ctrl)
 				block.EXPECT().InitCtx(gomock.Any())
+				block.EXPECT().ID().Return(blockID).Times(1)
+				block.EXPECT().Height().Return(blockHeight).Times(1)
 
-				state := state.NewMockState(ctrl)
-				state.EXPECT().GetBlockIDAtHeight(blockHeight).Return(blockID, nil)
+				state := statetest.New(t, statetest.Config{})
+				state.AddStatelessBlock(block)
 
-				manager := blockexecutor.NewMockManager(ctrl)
+				manager := executormock.NewManager(ctrl)
 				manager.EXPECT().GetStatelessBlock(blockID).Return(block, nil)
 				return &Service{
 					vm: &VM{
@@ -917,17 +1257,19 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 		{
 			name: "hex format",
 			serviceAndExpectedBlockFunc: func(t *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
-				block := block.NewMockBlock(ctrl)
+				block := platform.NewMockBlock(ctrl)
 				blockBytes := []byte("hi mom")
 				block.EXPECT().Bytes().Return(blockBytes)
+				block.EXPECT().ID().Return(blockID).Times(1)
+				block.EXPECT().Height().Return(blockHeight).Times(1)
 
-				state := state.NewMockState(ctrl)
-				state.EXPECT().GetBlockIDAtHeight(blockHeight).Return(blockID, nil)
+				state := statetest.New(t, statetest.Config{})
+				state.AddStatelessBlock(block)
 
 				expected, err := formatting.Encode(formatting.Hex, blockBytes)
 				require.NoError(t, err)
 
-				manager := blockexecutor.NewMockManager(ctrl)
+				manager := executormock.NewManager(ctrl)
 				manager.EXPECT().GetStatelessBlock(blockID).Return(block, nil)
 				return &Service{
 					vm: &VM{
@@ -945,17 +1287,19 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 		{
 			name: "hexc format",
 			serviceAndExpectedBlockFunc: func(t *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
-				block := block.NewMockBlock(ctrl)
+				block := platform.NewMockBlock(ctrl)
 				blockBytes := []byte("hi mom")
 				block.EXPECT().Bytes().Return(blockBytes)
+				block.EXPECT().ID().Return(blockID).Times(1)
+				block.EXPECT().Height().Return(blockHeight).Times(1)
 
-				state := state.NewMockState(ctrl)
-				state.EXPECT().GetBlockIDAtHeight(blockHeight).Return(blockID, nil)
+				state := statetest.New(t, statetest.Config{})
+				state.AddStatelessBlock(block)
 
 				expected, err := formatting.Encode(formatting.HexC, blockBytes)
 				require.NoError(t, err)
 
-				manager := blockexecutor.NewMockManager(ctrl)
+				manager := executormock.NewManager(ctrl)
 				manager.EXPECT().GetStatelessBlock(blockID).Return(block, nil)
 				return &Service{
 					vm: &VM{
@@ -973,17 +1317,19 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 		{
 			name: "hexnc format",
 			serviceAndExpectedBlockFunc: func(t *testing.T, ctrl *gomock.Controller) (*Service, interface{}) {
-				block := block.NewMockBlock(ctrl)
+				block := platform.NewMockBlock(ctrl)
 				blockBytes := []byte("hi mom")
 				block.EXPECT().Bytes().Return(blockBytes)
+				block.EXPECT().ID().Return(blockID).Times(1)
+				block.EXPECT().Height().Return(blockHeight).Times(1)
 
-				state := state.NewMockState(ctrl)
-				state.EXPECT().GetBlockIDAtHeight(blockHeight).Return(blockID, nil)
+				state := statetest.New(t, statetest.Config{})
+				state.AddStatelessBlock(block)
 
 				expected, err := formatting.Encode(formatting.HexNC, blockBytes)
 				require.NoError(t, err)
 
-				manager := blockexecutor.NewMockManager(ctrl)
+				manager := executormock.NewManager(ctrl)
 				manager.EXPECT().GetStatelessBlock(blockID).Return(block, nil)
 				return &Service{
 					vm: &VM{
@@ -1021,7 +1367,404 @@ func TestServiceGetBlockByHeight(t *testing.T) {
 			expectedJSON, err := json.Marshal(expected)
 			require.NoError(err)
 
-			require.Equal(json.RawMessage(expectedJSON), reply.Block)
+			require.JSONEq(string(expectedJSON), string(reply.Block))
 		})
 	}
+}
+
+func TestServiceGetSubnets(t *testing.T) {
+	require := require.New(t)
+	service, _ := defaultService(t)
+
+	testSubnet1ID := testSubnet1.ID()
+
+	var response GetSubnetsResponse
+	require.NoError(service.GetSubnets(nil, &GetSubnetsArgs{}, &response))
+	require.Equal([]APISubnet{
+		{
+			ID: testSubnet1ID,
+			ControlKeys: []string{
+				"P-testing1d6kkj0qh4wcmus3tk59npwt3rluc6en72ngurd",
+				"P-testing17fpqs358de5lgu7a5ftpw2t8axf0pm33983krk",
+				"P-testing1lnk637g0edwnqc2tn8tel39652fswa3xk4r65e",
+			},
+			Threshold: 2,
+		},
+		{
+			ID:          constants.PrimaryNetworkID,
+			ControlKeys: []string{},
+			Threshold:   0,
+		},
+	}, response.Subnets)
+
+	newOwnerIDStr := "P-testing1t73fa4p4dypa4s3kgufuvr6hmprjclw66mgqgm"
+	newOwnerID, err := service.addrManager.ParseLocalAddress(newOwnerIDStr)
+	require.NoError(err)
+
+	service.vm.ctx.Lock.Lock()
+	service.vm.state.SetSubnetOwner(testSubnet1ID, &secp256k1fx.OutputOwners{
+		Addrs:     []ids.ShortID{newOwnerID},
+		Threshold: 1,
+	})
+	service.vm.ctx.Lock.Unlock()
+
+	require.NoError(service.GetSubnets(nil, &GetSubnetsArgs{}, &response))
+	require.Equal([]APISubnet{
+		{
+			ID: testSubnet1ID,
+			ControlKeys: []string{
+				newOwnerIDStr,
+			},
+			Threshold: 1,
+		},
+		{
+			ID:          constants.PrimaryNetworkID,
+			ControlKeys: []string{},
+			Threshold:   0,
+		},
+	}, response.Subnets)
+}
+
+func TestGetFeeConfig(t *testing.T) {
+	require := require.New(t)
+
+	service, _ := defaultService(t)
+
+	var reply gas.Config
+	require.NoError(service.GetFeeConfig(nil, nil, &reply))
+	require.Equal(defaultDynamicFeeConfig, reply)
+}
+
+func FuzzGetFeeState(f *testing.F) {
+	f.Fuzz(func(t *testing.T, capacity, excess uint64) {
+		require := require.New(t)
+
+		service, _ := defaultService(t)
+
+		var (
+			expectedState = gas.State{
+				Capacity: gas.Gas(capacity),
+				Excess:   gas.Gas(excess),
+			}
+			expectedTime  = time.Now()
+			expectedReply = GetFeeStateReply{
+				State: expectedState,
+				Price: gas.CalculatePrice(
+					defaultDynamicFeeConfig.MinPrice,
+					expectedState.Excess,
+					defaultDynamicFeeConfig.ExcessConversionConstant,
+				),
+				Time: expectedTime,
+			}
+		)
+
+		service.vm.ctx.Lock.Lock()
+		service.vm.state.SetFeeState(expectedState)
+		service.vm.state.SetTimestamp(expectedTime)
+		service.vm.ctx.Lock.Unlock()
+
+		var reply GetFeeStateReply
+		require.NoError(service.GetFeeState(nil, nil, &reply))
+		require.Equal(expectedReply, reply)
+	})
+}
+
+func TestGetCurrentValidatorsForL1(t *testing.T) {
+	subnetID := ids.GenerateTestID()
+
+	sk, err := localsigner.New()
+	require.NoError(t, err)
+	pk := sk.PublicKey()
+	pkBytes := bls.PublicKeyToUncompressedBytes(pk)
+
+	otherSK, err := localsigner.New()
+	require.NoError(t, err)
+	otherPK := otherSK.PublicKey()
+	otherPKBytes := bls.PublicKeyToUncompressedBytes(otherPK)
+
+	tests := []struct {
+		name         string
+		initial      []*state.Staker
+		l1Validators []state.L1Validator
+	}{
+		{
+			name: "empty_noop",
+		},
+		{
+			name: "initial_stakers",
+			initial: []*state.Staker{
+				{
+					TxID:      ids.GenerateTestID(),
+					SubnetID:  subnetID,
+					NodeID:    ids.GenerateTestNodeID(),
+					PublicKey: pk,
+					Weight:    1,
+					StartTime: time.Unix(0, 0),
+				},
+				{
+					TxID:      ids.GenerateTestID(),
+					SubnetID:  subnetID,
+					NodeID:    ids.GenerateTestNodeID(),
+					PublicKey: otherPK,
+					Weight:    1,
+					StartTime: time.Unix(1, 0),
+				},
+			},
+		},
+		{
+			name: "l1_validators",
+			l1Validators: []state.L1Validator{
+				{
+					ValidationID: ids.GenerateTestID(),
+					SubnetID:     subnetID,
+					NodeID:       ids.GenerateTestNodeID(),
+					StartTime:    0,
+					PublicKey:    pkBytes,
+					Weight:       1,
+				},
+				{
+					ValidationID: ids.GenerateTestID(),
+					SubnetID:     subnetID,
+					NodeID:       ids.GenerateTestNodeID(),
+					PublicKey:    otherPKBytes,
+					StartTime:    1,
+					Weight:       1,
+				},
+			},
+		},
+		{
+			name: "initial_stakers_l1_validators_mixed",
+			initial: []*state.Staker{
+				{
+					TxID:      ids.GenerateTestID(),
+					SubnetID:  subnetID,
+					NodeID:    ids.GenerateTestNodeID(),
+					PublicKey: pk,
+					Weight:    123123,
+					StartTime: time.Unix(0, 0),
+				},
+				{
+					TxID:      ids.GenerateTestID(),
+					SubnetID:  subnetID,
+					NodeID:    ids.GenerateTestNodeID(),
+					PublicKey: otherPK,
+					Weight:    1,
+					StartTime: time.Unix(2, 0),
+				},
+			},
+			l1Validators: []state.L1Validator{
+				{
+					ValidationID:      ids.GenerateTestID(),
+					SubnetID:          subnetID,
+					NodeID:            ids.GenerateTestNodeID(),
+					StartTime:         0,
+					PublicKey:         pkBytes,
+					Weight:            1,
+					EndAccumulatedFee: 1,
+					MinNonce:          2,
+				},
+				{
+					ValidationID:      ids.GenerateTestID(),
+					SubnetID:          subnetID,
+					NodeID:            ids.GenerateTestNodeID(),
+					PublicKey:         pkBytes,
+					StartTime:         2,
+					Weight:            1,
+					EndAccumulatedFee: 0,
+				},
+				{
+					ValidationID:      ids.GenerateTestID(),
+					SubnetID:          subnetID,
+					NodeID:            ids.GenerateTestNodeID(),
+					PublicKey:         otherPKBytes,
+					StartTime:         3,
+					Weight:            0,
+					EndAccumulatedFee: 1,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+
+			service, _ := defaultService(t)
+			service.vm.ctx.Lock.Lock()
+			stakersByTxID := make(map[ids.ID]*state.Staker)
+			for _, staker := range test.initial {
+				primaryStaker := &state.Staker{
+					TxID:      ids.GenerateTestID(),
+					SubnetID:  constants.PrimaryNetworkID,
+					NodeID:    staker.NodeID,
+					PublicKey: staker.PublicKey,
+					Weight:    5,
+					// start primary network staker 1 second before the subnet staker
+					StartTime: staker.StartTime.Add(-time.Second),
+					Priority:  platform.PrimaryNetworkValidatorCurrentPriority,
+				}
+				require.NoError(service.vm.state.PutCurrentValidator(primaryStaker))
+				staker.Priority = platform.SubnetPermissionedValidatorCurrentPriority
+				require.NoError(service.vm.state.PutCurrentValidator(staker))
+
+				stakersByTxID[staker.TxID] = staker
+			}
+
+			l1ValidatorsByVID := make(map[ids.ID]state.L1Validator)
+			if len(test.l1Validators) != 0 {
+				service.vm.state.SetSubnetToL1Conversion(subnetID,
+					state.SubnetToL1Conversion{
+						ConversionID: ids.GenerateTestID(),
+						ChainID:      ids.GenerateTestID(),
+						Addr:         []byte{'a', 'd', 'd', 'r'},
+					})
+			}
+
+			for _, l1Validator := range test.l1Validators {
+				deactivationOwner := message.PChainOwner{
+					Threshold: 1,
+					Addresses: []ids.ShortID{
+						ids.GenerateTestShortID(),
+					},
+				}
+
+				remainingBalanceOwner := message.PChainOwner{
+					Threshold: 1,
+					Addresses: []ids.ShortID{
+						ids.GenerateTestShortID(),
+					},
+				}
+
+				remainingBalanceOwnerBytes, err := platform.Codec.Marshal(platform.CodecVersion, remainingBalanceOwner)
+				require.NoError(err)
+				deactivationOwnerBytes, err := platform.Codec.Marshal(platform.CodecVersion, deactivationOwner)
+				require.NoError(err)
+				l1Validator.RemainingBalanceOwner = remainingBalanceOwnerBytes
+				l1Validator.DeactivationOwner = deactivationOwnerBytes
+
+				require.NoError(service.vm.state.PutL1Validator(l1Validator))
+
+				if l1Validator.Weight == 0 {
+					continue
+				}
+				l1ValidatorsByVID[l1Validator.ValidationID] = l1Validator
+			}
+
+			service.vm.state.SetHeight(0)
+			require.NoError(service.vm.state.Commit())
+			service.vm.ctx.Lock.Unlock()
+
+			testValidator := func(vdr any) ids.NodeID {
+				switch v := vdr.(type) {
+				case pchainapi.Staker:
+					staker, exists := stakersByTxID[v.TxID]
+					require.True(exists, "unexpected validator: %s", vdr)
+					require.Equal(staker.NodeID, v.NodeID)
+					require.Equal(avajson.Uint64(staker.Weight), v.Weight)
+					require.Equal(staker.StartTime.Unix(), int64(v.StartTime))
+					return v.NodeID
+				case pchainapi.APIL1Validator:
+					validator, exists := l1ValidatorsByVID[*v.ValidationID]
+					require.True(exists, "unexpected validator: %s", vdr)
+					require.Equal(validator.NodeID, v.NodeID)
+					require.Equal(avajson.Uint64(validator.Weight), v.Weight)
+					require.Equal(validator.StartTime, uint64(v.StartTime))
+					accruedFees := service.vm.state.GetAccruedFees()
+					require.Equal(avajson.Uint64(validator.EndAccumulatedFee-accruedFees), *v.Balance)
+					require.Equal(avajson.Uint64(validator.MinNonce), *v.MinNonce)
+					require.Equal(
+						types.JSONByteSlice(bls.PublicKeyToCompressedBytes(bls.PublicKeyFromValidUncompressedBytes(validator.PublicKey))),
+						*v.PublicKey)
+					var expectedRemainingBalanceOwner message.PChainOwner
+					_, err := platform.Codec.Unmarshal(validator.RemainingBalanceOwner, &expectedRemainingBalanceOwner)
+					require.NoError(err)
+					formattedRemainingBalanceOwner, err := service.addrManager.FormatLocalAddress(expectedRemainingBalanceOwner.Addresses[0])
+					require.NoError(err)
+					require.Equal(formattedRemainingBalanceOwner, v.RemainingBalanceOwner.Addresses[0])
+					require.Equal(avajson.Uint32(expectedRemainingBalanceOwner.Threshold), v.RemainingBalanceOwner.Threshold)
+					var expectedDeactivationOwner message.PChainOwner
+					_, err = platform.Codec.Unmarshal(validator.DeactivationOwner, &expectedDeactivationOwner)
+					require.NoError(err)
+					formattedDeactivationOwner, err := service.addrManager.FormatLocalAddress(expectedDeactivationOwner.Addresses[0])
+					require.NoError(err)
+					require.Equal(formattedDeactivationOwner, v.DeactivationOwner.Addresses[0])
+					require.Equal(avajson.Uint32(expectedDeactivationOwner.Threshold), v.DeactivationOwner.Threshold)
+					return v.NodeID
+				default:
+					t.Fatalf("unexpected validator type: %T", vdr)
+					return ids.NodeID{}
+				}
+			}
+
+			args := GetCurrentValidatorsArgs{
+				SubnetID: subnetID,
+			}
+			reply := GetCurrentValidatorsReply{}
+			require.NoError(service.GetCurrentValidators(&http.Request{}, &args, &reply))
+			require.Len(reply.Validators, len(stakersByTxID)+len(l1ValidatorsByVID))
+			for _, vdr := range reply.Validators {
+				testValidator(vdr)
+			}
+
+			// Test with a specific node ID
+			var nodeIDs []ids.NodeID
+			if len(stakersByTxID) > 0 {
+				// pick the first staker
+				nodeIDs = append(nodeIDs, maps.Values(stakersByTxID)[0].NodeID)
+			}
+			if len(l1ValidatorsByVID) > 0 {
+				nodeIDs = append(nodeIDs, maps.Values(l1ValidatorsByVID)[0].NodeID)
+			}
+
+			args.NodeIDs = nodeIDs
+			reply = GetCurrentValidatorsReply{}
+			require.NoError(service.GetCurrentValidators(&http.Request{}, &args, &reply))
+			require.Len(reply.Validators, len(nodeIDs))
+			for i, vdr := range reply.Validators {
+				nodeID := testValidator(vdr)
+				require.Equal(args.NodeIDs[i], nodeID)
+			}
+		})
+	}
+}
+
+func TestGetValidatorFeeConfig(t *testing.T) {
+	require := require.New(t)
+
+	service, _ := defaultService(t)
+
+	var reply fee.Config
+	require.NoError(service.GetValidatorFeeConfig(nil, nil, &reply))
+	require.Equal(defaultValidatorFeeConfig, reply)
+}
+
+func FuzzGetValidatorFeeState(f *testing.F) {
+	f.Fuzz(func(t *testing.T, l1ValidatorExcess uint64) {
+		require := require.New(t)
+
+		service, _ := defaultService(t)
+
+		var (
+			expectedL1ValidatorExcess = gas.Gas(l1ValidatorExcess)
+			expectedTime              = time.Now()
+			expectedReply             = GetValidatorFeeStateReply{
+				Excess: expectedL1ValidatorExcess,
+				Price: gas.CalculatePrice(
+					defaultValidatorFeeConfig.MinPrice,
+					expectedL1ValidatorExcess,
+					defaultValidatorFeeConfig.ExcessConversionConstant,
+				),
+				Time: expectedTime,
+			}
+		)
+
+		service.vm.ctx.Lock.Lock()
+		service.vm.state.SetL1ValidatorExcess(expectedL1ValidatorExcess)
+		service.vm.state.SetTimestamp(expectedTime)
+		service.vm.ctx.Lock.Unlock()
+
+		var reply GetValidatorFeeStateReply
+		require.NoError(service.GetValidatorFeeState(nil, nil, &reply))
+		require.Equal(expectedReply, reply)
+	})
 }

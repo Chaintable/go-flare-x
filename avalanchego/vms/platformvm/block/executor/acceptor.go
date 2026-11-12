@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package executor
@@ -9,15 +9,14 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/ava-labs/avalanchego/utils"
-	"github.com/ava-labs/avalanchego/vms/platformvm/block"
 	"github.com/ava-labs/avalanchego/vms/platformvm/metrics"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
 	"github.com/ava-labs/avalanchego/vms/platformvm/validators"
 )
 
 var (
-	_ block.Visitor = (*acceptor)(nil)
+	_ platform.BlockVisitor = (*acceptor)(nil)
 
 	errMissingBlockState = errors.New("missing state of block")
 )
@@ -27,56 +26,55 @@ var (
 // being shutdown.
 type acceptor struct {
 	*backend
-	metrics      metrics.Metrics
-	validators   validators.Manager
-	bootstrapped *utils.Atomic[bool]
+	metrics    metrics.Metrics
+	validators *validators.Manager
 }
 
-func (a *acceptor) BanffAbortBlock(b *block.BanffAbortBlock) error {
+func (a *acceptor) BanffAbortBlock(b *platform.BanffAbortBlock) error {
 	return a.optionBlock(b, "banff abort")
 }
 
-func (a *acceptor) BanffCommitBlock(b *block.BanffCommitBlock) error {
+func (a *acceptor) BanffCommitBlock(b *platform.BanffCommitBlock) error {
 	return a.optionBlock(b, "banff commit")
 }
 
-func (a *acceptor) BanffProposalBlock(b *block.BanffProposalBlock) error {
+func (a *acceptor) BanffProposalBlock(b *platform.BanffProposalBlock) error {
 	a.proposalBlock(b, "banff proposal")
 	return nil
 }
 
-func (a *acceptor) BanffStandardBlock(b *block.BanffStandardBlock) error {
+func (a *acceptor) BanffStandardBlock(b *platform.BanffStandardBlock) error {
 	return a.standardBlock(b, "banff standard")
 }
 
-func (a *acceptor) ApricotAbortBlock(b *block.ApricotAbortBlock) error {
+func (a *acceptor) ApricotAbortBlock(b *platform.ApricotAbortBlock) error {
 	return a.optionBlock(b, "apricot abort")
 }
 
-func (a *acceptor) ApricotCommitBlock(b *block.ApricotCommitBlock) error {
+func (a *acceptor) ApricotCommitBlock(b *platform.ApricotCommitBlock) error {
 	return a.optionBlock(b, "apricot commit")
 }
 
-func (a *acceptor) ApricotProposalBlock(b *block.ApricotProposalBlock) error {
+func (a *acceptor) ApricotProposalBlock(b *platform.ApricotProposalBlock) error {
 	a.proposalBlock(b, "apricot proposal")
 	return nil
 }
 
-func (a *acceptor) ApricotStandardBlock(b *block.ApricotStandardBlock) error {
+func (a *acceptor) ApricotStandardBlock(b *platform.ApricotStandardBlock) error {
 	return a.standardBlock(b, "apricot standard")
 }
 
-func (a *acceptor) ApricotAtomicBlock(b *block.ApricotAtomicBlock) error {
+func (a *acceptor) ApricotAtomicBlock(b *platform.ApricotAtomicBlock) error {
 	blkID := b.ID()
 	defer a.free(blkID)
-
-	if err := a.commonAccept(b); err != nil {
-		return err
-	}
 
 	blkState, ok := a.blkIDToState[blkID]
 	if !ok {
 		return fmt.Errorf("%w %s", errMissingBlockState, blkID)
+	}
+
+	if err := a.commonAccept(blkState); err != nil {
+		return err
 	}
 
 	// Update the state to reflect the changes made in [onAcceptState].
@@ -110,13 +108,13 @@ func (a *acceptor) ApricotAtomicBlock(b *block.ApricotAtomicBlock) error {
 		zap.Stringer("blkID", blkID),
 		zap.Uint64("height", b.Height()),
 		zap.Stringer("parentID", b.Parent()),
-		zap.Stringer("utxoChecksum", a.state.Checksum()),
+		zap.Stringer("checksum", a.state.Checksum()),
 	)
 
 	return nil
 }
 
-func (a *acceptor) optionBlock(b block.Block, blockType string) error {
+func (a *acceptor) optionBlock(b platform.Block, blockType string) error {
 	parentID := b.Parent()
 	parentState, ok := a.blkIDToState[parentID]
 	if !ok {
@@ -132,11 +130,7 @@ func (a *acceptor) optionBlock(b block.Block, blockType string) error {
 	}()
 
 	// Note that the parent must be accepted first.
-	if err := a.commonAccept(parentState.statelessBlock); err != nil {
-		return err
-	}
-
-	if err := a.commonAccept(b); err != nil {
+	if err := a.commonAccept(parentState); err != nil {
 		return err
 	}
 
@@ -150,6 +144,11 @@ func (a *acceptor) optionBlock(b block.Block, blockType string) error {
 	if !ok {
 		return fmt.Errorf("%w %s", errMissingBlockState, blkID)
 	}
+
+	if err := a.commonAccept(blkState); err != nil {
+		return err
+	}
+
 	if err := blkState.onAcceptState.Apply(a.state); err != nil {
 		return err
 	}
@@ -179,13 +178,13 @@ func (a *acceptor) optionBlock(b block.Block, blockType string) error {
 		zap.Stringer("blkID", blkID),
 		zap.Uint64("height", b.Height()),
 		zap.Stringer("parentID", parentID),
-		zap.Stringer("utxoChecksum", a.state.Checksum()),
+		zap.Stringer("checksum", a.state.Checksum()),
 	)
 
 	return nil
 }
 
-func (a *acceptor) proposalBlock(b block.Block, blockType string) {
+func (a *acceptor) proposalBlock(b platform.Block, blockType string) {
 	// Note that:
 	//
 	// * We don't free the proposal block in this method.
@@ -211,21 +210,21 @@ func (a *acceptor) proposalBlock(b block.Block, blockType string) {
 		zap.Stringer("blkID", blkID),
 		zap.Uint64("height", b.Height()),
 		zap.Stringer("parentID", b.Parent()),
-		zap.Stringer("utxoChecksum", a.state.Checksum()),
+		zap.Stringer("checksum", a.state.Checksum()),
 	)
 }
 
-func (a *acceptor) standardBlock(b block.Block, blockType string) error {
+func (a *acceptor) standardBlock(b platform.Block, blockType string) error {
 	blkID := b.ID()
 	defer a.free(blkID)
-
-	if err := a.commonAccept(b); err != nil {
-		return err
-	}
 
 	blkState, ok := a.blkIDToState[blkID]
 	if !ok {
 		return fmt.Errorf("%w %s", errMissingBlockState, blkID)
+	}
+
+	if err := a.commonAccept(blkState); err != nil {
+		return err
 	}
 
 	// Update the state to reflect the changes made in [onAcceptState].
@@ -258,23 +257,24 @@ func (a *acceptor) standardBlock(b block.Block, blockType string) error {
 		zap.Stringer("blkID", blkID),
 		zap.Uint64("height", b.Height()),
 		zap.Stringer("parentID", b.Parent()),
-		zap.Stringer("utxoChecksum", a.state.Checksum()),
+		zap.Stringer("checksum", a.state.Checksum()),
 	)
 
 	return nil
 }
 
-func (a *acceptor) commonAccept(b block.Block) error {
-	blkID := b.ID()
+func (a *acceptor) commonAccept(b *blockState) error {
+	blk := b.statelessBlock
+	blkID := blk.ID()
 
-	if err := a.metrics.MarkAccepted(b); err != nil {
+	if err := a.metrics.MarkAccepted(b.metrics); err != nil {
 		return fmt.Errorf("failed to accept block %s: %w", blkID, err)
 	}
 
 	a.backend.lastAccepted = blkID
 	a.state.SetLastAccepted(blkID)
-	a.state.SetHeight(b.Height())
-	a.state.AddStatelessBlock(b)
+	a.state.SetHeight(blk.Height())
+	a.state.AddStatelessBlock(blk)
 	a.validators.OnAcceptedBlockID(blkID)
 	return nil
 }

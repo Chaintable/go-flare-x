@@ -22,8 +22,21 @@ type rpcResponse struct {
 	Result json.RawMessage `json:"result"`
 }
 
+func publicIPTraceURL(networkID string) string {
+	switch n := strings.ToLower(networkID); n {
+	case "songbird", "coston":
+		return "https://" + n + "-bootstrap.flare.network/cdn-cgi/trace"
+	case "costwo":
+		return "https://coston2-bootstrap.flare.network/cdn-cgi/trace"
+	default:
+		return "https://flare-bootstrap.flare.network/cdn-cgi/trace"
+	}
+}
+
 func fetchPublicIP() (string, error) {
-	resp, err := http.Get("https://flare.network/cdn-cgi/trace")
+	url := publicIPTraceURL(os.Getenv("NETWORK_ID"))
+	fmt.Fprintf(os.Stderr, "  Using %s\n", url)
+	resp, err := http.Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -189,13 +202,16 @@ func main() {
 		os.Setenv("BOOTSTRAP_IDS", bootstrap_IDs)
 	}
 
+	path := "/app/build/avalanchego"
 	args := []string{
+		path, // argv[0] must be the program name
 		"--http-host", os.Getenv("HTTP_HOST"),
 		"--http-port", os.Getenv("HTTP_PORT"),
 		"--staking-port", os.Getenv("STAKING_PORT"),
 		"--public-ip", os.Getenv("PUBLIC_IP"),
 		"--db-dir", os.Getenv("DB_DIR"),
 		"--db-type", os.Getenv("DB_TYPE"),
+		"--chain-data-dir", os.Getenv("CHAIN_DATA_DIR"),
 		"--bootstrap-ips", os.Getenv("BOOTSTRAP_IPS"),
 		"--bootstrap-ids", os.Getenv("BOOTSTRAP_IDS"),
 		"--bootstrap-beacon-connection-timeout", os.Getenv("BOOTSTRAP_BEACON_CONNECTION_TIMEOUT"),
@@ -209,7 +225,6 @@ func main() {
 		args = append(args, strings.Fields(extra)...)
 	}
 	fmt.Fprintln(os.Stderr, args)
-	path := "/app/build/avalanchego"
 
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(os.Stderr, "file does not exist")

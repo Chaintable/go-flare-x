@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package registry
@@ -15,9 +15,11 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/filesystem"
+	"github.com/ava-labs/avalanchego/utils/filesystem/filesystemmock"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/resource"
 	"github.com/ava-labs/avalanchego/vms"
+	"github.com/ava-labs/avalanchego/vms/vmsmock"
 )
 
 var (
@@ -46,10 +48,6 @@ var (
 	}
 
 	// read dir results
-	oneValidVM = []fs.DirEntry{
-		directory,
-		registeredVM,
-	}
 	twoValidVMs = []fs.DirEntry{
 		directory,
 		registeredVM,
@@ -77,26 +75,9 @@ func TestGet_InvalidVMName(t *testing.T) {
 	resources := initVMGetterTest(t)
 
 	resources.mockReader.EXPECT().ReadDir(pluginDir).Times(1).Return(invalidVMs, nil)
-	// didn't find an alias, so we'll try using this invalid vm name
-	resources.mockManager.EXPECT().Lookup("invalid-vm").Times(1).Return(ids.Empty, errTest)
 
 	_, _, err := resources.getter.Get()
 	require.ErrorIs(t, err, errInvalidVMID)
-}
-
-// Get should fail if we can't get the VM factory
-func TestGet_GetFactoryFails(t *testing.T) {
-	resources := initVMGetterTest(t)
-
-	vm, _ := ids.FromString("vmId")
-
-	resources.mockReader.EXPECT().ReadDir(pluginDir).Times(1).Return(oneValidVM, nil)
-	resources.mockManager.EXPECT().Lookup(registeredVMName).Times(1).Return(vm, nil)
-	// Getting the factory fails
-	resources.mockManager.EXPECT().GetFactory(vm).Times(1).Return(nil, errTest)
-
-	_, _, err := resources.getter.Get()
-	require.ErrorIs(t, err, errTest)
 }
 
 // Get should return the correct registered and unregistered VMs.
@@ -108,13 +89,16 @@ func TestGet_Success(t *testing.T) {
 	registeredVMId := ids.GenerateTestID()
 	unregisteredVMId := ids.GenerateTestID()
 
-	registeredVMFactory := vms.NewMockFactory(resources.ctrl)
+	// Set up the registered VM: alias + factory
+	require.NoError(resources.manager.Alias(registeredVMId, registeredVMName))
+	registeredVMFactory := vmsmock.NewFactory(resources.ctrl)
+	registeredVMFactory.EXPECT().New(gomock.Any()).Return(nil, nil)
+	require.NoError(resources.manager.RegisterFactory(t.Context(), registeredVMId, registeredVMFactory))
+
+	// Set up the unregistered VM: alias only (no factory registered)
+	require.NoError(resources.manager.Alias(unregisteredVMId, unregisteredVMName))
 
 	resources.mockReader.EXPECT().ReadDir(pluginDir).Times(1).Return(twoValidVMs, nil)
-	resources.mockManager.EXPECT().Lookup(registeredVMName).Times(1).Return(registeredVMId, nil)
-	resources.mockManager.EXPECT().GetFactory(registeredVMId).Times(1).Return(registeredVMFactory, nil)
-	resources.mockManager.EXPECT().Lookup(unregisteredVMName).Times(1).Return(unregisteredVMId, nil)
-	resources.mockManager.EXPECT().GetFactory(unregisteredVMId).Times(1).Return(nil, vms.ErrNotFound)
 
 	registeredVMs, unregisteredVMs, err := resources.getter.Get()
 
@@ -129,17 +113,17 @@ func TestGet_Success(t *testing.T) {
 }
 
 type vmGetterTestResources struct {
-	ctrl        *gomock.Controller
-	mockReader  *filesystem.MockReader
-	mockManager *vms.MockManager
-	getter      VMGetter
+	ctrl       *gomock.Controller
+	mockReader *filesystemmock.Reader
+	manager    *vms.Manager
+	getter     VMGetter
 }
 
 func initVMGetterTest(t *testing.T) *vmGetterTestResources {
 	ctrl := gomock.NewController(t)
 
-	mockReader := filesystem.NewMockReader(ctrl)
-	mockManager := vms.NewMockManager(ctrl)
+	mockReader := filesystemmock.NewReader(ctrl)
+	manager := vms.NewManager(logging.NoLog{}, ids.NewAliaser())
 	mockRegistry := prometheus.NewRegistry()
 	mockCPUTracker, err := resource.NewManager(
 		logging.NoLog{},
@@ -154,16 +138,16 @@ func initVMGetterTest(t *testing.T) *vmGetterTestResources {
 	getter := NewVMGetter(
 		VMGetterConfig{
 			FileReader:      mockReader,
-			Manager:         mockManager,
+			Manager:         manager,
 			PluginDirectory: pluginDir,
 			CPUTracker:      mockCPUTracker,
 		},
 	)
 
 	return &vmGetterTestResources{
-		ctrl:        ctrl,
-		mockReader:  mockReader,
-		mockManager: mockManager,
-		getter:      getter,
+		ctrl:       ctrl,
+		mockReader: mockReader,
+		manager:    manager,
+		getter:     getter,
 	}
 }

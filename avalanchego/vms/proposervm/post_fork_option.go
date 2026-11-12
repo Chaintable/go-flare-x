@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package proposervm
@@ -10,7 +10,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/snow/choices"
 	"github.com/ava-labs/avalanchego/vms/proposervm/block"
 )
 
@@ -25,7 +24,7 @@ type postForkOption struct {
 }
 
 func (b *postForkOption) Timestamp() time.Time {
-	if b.Status() == choices.Accepted {
+	if b.Height() <= b.vm.lastAcceptedHeight {
 		return b.vm.lastAcceptedTime
 	}
 	return b.timestamp
@@ -39,9 +38,6 @@ func (b *postForkOption) Accept(ctx context.Context) error {
 }
 
 func (b *postForkOption) acceptOuterBlk() error {
-	// Update in-memory references
-	b.status = choices.Accepted
-
 	return b.vm.acceptPostForkBlock(b)
 }
 
@@ -56,15 +52,7 @@ func (b *postForkOption) Reject(context.Context) error {
 	// in the proposer block that causing this block to be rejected.
 
 	delete(b.vm.verifiedBlocks, b.ID())
-	b.status = choices.Rejected
 	return nil
-}
-
-func (b *postForkOption) Status() choices.Status {
-	if b.status == choices.Accepted && b.Height() > b.vm.lastAcceptedHeight {
-		return choices.Processing
-	}
-	return b.status
 }
 
 func (b *postForkOption) Parent() ids.ID {
@@ -93,10 +81,16 @@ func (b *postForkOption) verifyPostForkChild(ctx context.Context, child *postFor
 	if err != nil {
 		return err
 	}
+	parentEpoch, err := b.pChainEpoch(ctx)
+	if err != nil {
+		return err
+	}
+
 	return b.postForkCommonComponents.Verify(
 		ctx,
 		parentTimestamp,
 		parentPChainHeight,
+		parentEpoch,
 		child,
 	)
 }
@@ -117,11 +111,22 @@ func (b *postForkOption) buildChild(ctx context.Context) (Block, error) {
 		)
 		return nil, err
 	}
+	parentEpoch, err := b.pChainEpoch(ctx)
+	if err != nil {
+		b.vm.ctx.Log.Error("unexpected build block failure",
+			zap.String("reason", "failed to fetch parent's epoch"),
+			zap.Stringer("parentID", parentID),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
 	return b.postForkCommonComponents.buildChild(
 		ctx,
 		parentID,
 		b.Timestamp(),
 		parentPChainHeight,
+		parentEpoch,
 	)
 }
 
@@ -134,8 +139,21 @@ func (b *postForkOption) pChainHeight(ctx context.Context) (uint64, error) {
 	return parent.pChainHeight(ctx)
 }
 
-func (b *postForkOption) setStatus(status choices.Status) {
-	b.status = status
+func (b *postForkOption) pChainEpoch(ctx context.Context) (block.Epoch, error) {
+	parent, err := b.vm.getBlock(ctx, b.ParentID())
+	if err != nil {
+		return block.Epoch{}, err
+	}
+	return parent.pChainEpoch(ctx)
+}
+
+func (b *postForkOption) selectChildPChainHeight(ctx context.Context) (uint64, error) {
+	pChainHeight, err := b.pChainHeight(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	return b.vm.selectChildPChainHeight(ctx, pChainHeight)
 }
 
 func (b *postForkOption) getStatelessBlk() block.Block {

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package set
@@ -28,6 +28,15 @@ type Set[T comparable] map[T]struct{}
 func Of[T comparable](elts ...T) Set[T] {
 	s := NewSet[T](len(elts))
 	s.Add(elts...)
+	return s
+}
+
+// UnionOf returns a new Set that is the union of the provided sets.
+func UnionOf[T comparable](sets ...Set[T]) Set[T] {
+	var s Set[T]
+	for _, set := range sets {
+		s.Union(set)
+	}
 	return s
 }
 
@@ -191,4 +200,18 @@ func (s *Set[T]) Peek() (T, bool) {
 		return elt, true
 	}
 	return utils.Zero[T](), false
+}
+
+// Intersect returns the set intersection of s1 and s2
+func Intersect[T comparable](s1 Set[T], s2 Set[T]) Set[T] {
+	s := Set[T]{}
+	for k := range s1 {
+		if !s2.Contains(k) {
+			continue
+		}
+
+		s.Add(k)
+	}
+
+	return s
 }

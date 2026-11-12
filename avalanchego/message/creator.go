@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package message
@@ -9,8 +9,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/ava-labs/avalanchego/utils/compression"
-	"github.com/ava-labs/avalanchego/utils/logging"
-	"github.com/ava-labs/avalanchego/utils/metric"
 )
 
 var _ Creator = (*creator)(nil)
@@ -26,16 +24,11 @@ type creator struct {
 }
 
 func NewCreator(
-	log logging.Logger,
 	metrics prometheus.Registerer,
-	parentNamespace string,
 	compressionType compression.Type,
 	maxMessageTimeout time.Duration,
 ) (Creator, error) {
-	namespace := metric.AppendNamespace(parentNamespace, "codec")
 	builder, err := newMsgBuilder(
-		log,
-		namespace,
 		metrics,
 		maxMessageTimeout,
 	)

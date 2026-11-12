@@ -1,10 +1,9 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package verify
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -13,7 +12,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
-	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/snow/validators/validatorsmock"
 )
 
 var errMissing = errors.New("missing")
@@ -33,7 +32,7 @@ func TestSameSubnet(t *testing.T) {
 		{
 			name: "same chain",
 			ctxF: func(ctrl *gomock.Controller) *snow.Context {
-				state := validators.NewMockState(ctrl)
+				state := validatorsmock.NewState(ctrl)
 				return &snow.Context{
 					SubnetID:       subnetID0,
 					ChainID:        chainID0,
@@ -46,7 +45,7 @@ func TestSameSubnet(t *testing.T) {
 		{
 			name: "unknown chain",
 			ctxF: func(ctrl *gomock.Controller) *snow.Context {
-				state := validators.NewMockState(ctrl)
+				state := validatorsmock.NewState(ctrl)
 				state.EXPECT().GetSubnetID(gomock.Any(), chainID1).Return(subnetID1, errMissing)
 				return &snow.Context{
 					SubnetID:       subnetID0,
@@ -60,7 +59,7 @@ func TestSameSubnet(t *testing.T) {
 		{
 			name: "wrong subnet",
 			ctxF: func(ctrl *gomock.Controller) *snow.Context {
-				state := validators.NewMockState(ctrl)
+				state := validatorsmock.NewState(ctrl)
 				state.EXPECT().GetSubnetID(gomock.Any(), chainID1).Return(subnetID1, nil)
 				return &snow.Context{
 					SubnetID:       subnetID0,
@@ -74,7 +73,7 @@ func TestSameSubnet(t *testing.T) {
 		{
 			name: "same subnet",
 			ctxF: func(ctrl *gomock.Controller) *snow.Context {
-				state := validators.NewMockState(ctrl)
+				state := validatorsmock.NewState(ctrl)
 				state.EXPECT().GetSubnetID(gomock.Any(), chainID1).Return(subnetID0, nil)
 				return &snow.Context{
 					SubnetID:       subnetID0,
@@ -91,7 +90,7 @@ func TestSameSubnet(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			ctx := test.ctxF(ctrl)
 
-			result := SameSubnet(context.Background(), ctx, test.chainID)
+			result := SameSubnet(t.Context(), ctx, test.chainID)
 			require.ErrorIs(t, result, test.result)
 		})
 	}

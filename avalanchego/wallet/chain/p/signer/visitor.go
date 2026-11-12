@@ -1,0 +1,416 @@
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
+// See the file LICENSE for licensing terms.
+
+package signer
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/ava-labs/avalanchego/database"
+	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/utils/crypto/keychain"
+	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
+	"github.com/ava-labs/avalanchego/vms/components/avax"
+	"github.com/ava-labs/avalanchego/vms/components/verify"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
+	"github.com/ava-labs/avalanchego/vms/platformvm/stakeable"
+	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
+)
+
+var (
+	_ platform.TxVisitor = (*visitor)(nil)
+
+	ErrUnsupportedTxType     = errors.New("unsupported tx type")
+	ErrUnknownInputType      = errors.New("unknown input type")
+	ErrUnknownOutputType     = errors.New("unknown output type")
+	ErrInvalidUTXOSigIndex   = errors.New("invalid UTXO signature index")
+	ErrUnknownAuthType       = errors.New("unknown auth type")
+	ErrUnknownOwnerType      = errors.New("unknown owner type")
+	ErrUnknownCredentialType = errors.New("unknown credential type")
+
+	emptySig [secp256k1.SignatureLen]byte
+)
+
+// visitor handles signing transactions for the signer
+type visitor struct {
+	kc      keychain.Keychain
+	backend Backend
+	ctx     context.Context
+	tx      *platform.Tx
+}
+
+func (*visitor) AdvanceTimeTx(*platform.AdvanceTimeTx) error {
+	return ErrUnsupportedTxType
+}
+
+func (*visitor) RewardValidatorTx(*platform.RewardValidatorTx) error {
+	return ErrUnsupportedTxType
+}
+
+func (s *visitor) AddValidatorTx(tx *platform.AddValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) AddSubnetValidatorTx(tx *platform.AddSubnetValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	subnetAuthSigners, err := s.getAuthSigners(tx.SubnetValidator.Subnet, tx.SubnetAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, subnetAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) AddDelegatorTx(tx *platform.AddDelegatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) CreateChainTx(tx *platform.CreateChainTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	subnetAuthSigners, err := s.getAuthSigners(tx.SubnetID, tx.SubnetAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, subnetAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) CreateSubnetTx(tx *platform.CreateSubnetTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) ImportTx(tx *platform.ImportTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	txImportSigners, err := s.getSigners(tx.SourceChain, tx.ImportedInputs)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, txImportSigners...)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) ExportTx(tx *platform.ExportTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) RemoveSubnetValidatorTx(tx *platform.RemoveSubnetValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	subnetAuthSigners, err := s.getAuthSigners(tx.Subnet, tx.SubnetAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, subnetAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) TransformSubnetTx(tx *platform.TransformSubnetTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	subnetAuthSigners, err := s.getAuthSigners(tx.Subnet, tx.SubnetAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, subnetAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) AddPermissionlessValidatorTx(tx *platform.AddPermissionlessValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) AddPermissionlessDelegatorTx(tx *platform.AddPermissionlessDelegatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) TransferSubnetOwnershipTx(tx *platform.TransferSubnetOwnershipTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	subnetAuthSigners, err := s.getAuthSigners(tx.Subnet, tx.SubnetAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, subnetAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) BaseTx(tx *platform.BaseTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) ConvertSubnetToL1Tx(tx *platform.ConvertSubnetToL1Tx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	subnetAuthSigners, err := s.getAuthSigners(tx.Subnet, tx.SubnetAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, subnetAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) RegisterL1ValidatorTx(tx *platform.RegisterL1ValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) SetL1ValidatorWeightTx(tx *platform.SetL1ValidatorWeightTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) IncreaseL1ValidatorBalanceTx(tx *platform.IncreaseL1ValidatorBalanceTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) DisableL1ValidatorTx(tx *platform.DisableL1ValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	disableAuthSigners, err := s.getAuthSigners(tx.ValidationID, tx.DisableAuth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, disableAuthSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) AddAutoRenewedValidatorTx(tx *platform.AddAutoRenewedValidatorTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	return sign(s.tx, txSigners)
+}
+
+func (s *visitor) SetAutoRenewedValidatorConfigTx(tx *platform.SetAutoRenewedValidatorConfigTx) error {
+	txSigners, err := s.getSigners(constants.PlatformChainID, tx.Ins)
+	if err != nil {
+		return err
+	}
+	authSigners, err := s.getAuthSigners(tx.TxID, tx.Auth)
+	if err != nil {
+		return err
+	}
+	txSigners = append(txSigners, authSigners)
+	return sign(s.tx, txSigners)
+}
+
+func (*visitor) RewardAutoRenewedValidatorTx(*platform.RewardAutoRenewedValidatorTx) error {
+	return ErrUnsupportedTxType
+}
+
+func (s *visitor) getSigners(sourceChainID ids.ID, ins []*avax.TransferableInput) ([][]keychain.Signer, error) {
+	txSigners := make([][]keychain.Signer, len(ins))
+	for credIndex, transferInput := range ins {
+		inIntf := transferInput.In
+		if stakeableIn, ok := inIntf.(*stakeable.LockIn); ok {
+			inIntf = stakeableIn.TransferableIn
+		}
+
+		input, ok := inIntf.(*secp256k1fx.TransferInput)
+		if !ok {
+			return nil, ErrUnknownInputType
+		}
+
+		inputSigners := make([]keychain.Signer, len(input.SigIndices))
+		txSigners[credIndex] = inputSigners
+
+		utxoID := transferInput.InputID()
+		utxo, err := s.backend.GetUTXO(s.ctx, sourceChainID, utxoID)
+		if err == database.ErrNotFound {
+			// If we don't have access to the UTXO, then we can't sign this
+			// transaction. However, we can attempt to partially sign it.
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		outIntf := utxo.Out
+		if stakeableOut, ok := outIntf.(*stakeable.LockOut); ok {
+			outIntf = stakeableOut.TransferableOut
+		}
+
+		out, ok := outIntf.(*secp256k1fx.TransferOutput)
+		if !ok {
+			return nil, ErrUnknownOutputType
+		}
+
+		for sigIndex, addrIndex := range input.SigIndices {
+			if addrIndex >= uint32(len(out.Addrs)) {
+				return nil, ErrInvalidUTXOSigIndex
+			}
+
+			addr := out.Addrs[addrIndex]
+			key, ok := s.kc.Get(addr)
+			if !ok {
+				// If we don't have access to the key, then we can't sign this
+				// transaction. However, we can attempt to partially sign it.
+				continue
+			}
+			inputSigners[sigIndex] = key
+		}
+	}
+	return txSigners, nil
+}
+
+func (s *visitor) getAuthSigners(ownerID ids.ID, auth verify.Verifiable) ([]keychain.Signer, error) {
+	input, ok := auth.(*secp256k1fx.Input)
+	if !ok {
+		return nil, ErrUnknownAuthType
+	}
+
+	ownerIntf, err := s.backend.GetOwner(s.ctx, ownerID)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"failed to fetch owner for %q: %w",
+			ownerID,
+			err,
+		)
+	}
+	owner, ok := ownerIntf.(*secp256k1fx.OutputOwners)
+	if !ok {
+		return nil, ErrUnknownOwnerType
+	}
+
+	authSigners := make([]keychain.Signer, len(input.SigIndices))
+	for sigIndex, addrIndex := range input.SigIndices {
+		if addrIndex >= uint32(len(owner.Addrs)) {
+			return nil, ErrInvalidUTXOSigIndex
+		}
+
+		addr := owner.Addrs[addrIndex]
+		key, ok := s.kc.Get(addr)
+		if !ok {
+			// If we don't have access to the key, then we can't sign this
+			// transaction. However, we can attempt to partially sign it.
+			continue
+		}
+		authSigners[sigIndex] = key
+	}
+	return authSigners, nil
+}
+
+func sign(tx *platform.Tx, txSigners [][]keychain.Signer) error {
+	unsignedBytes, err := platform.Codec.Marshal(platform.CodecVersion, &tx.Unsigned)
+	if err != nil {
+		return fmt.Errorf("couldn't marshal unsigned tx: %w", err)
+	}
+
+	if expectedLen := len(txSigners); expectedLen != len(tx.Creds) {
+		tx.Creds = make([]verify.Verifiable, expectedLen)
+	}
+
+	sigCache := make(map[ids.ShortID][secp256k1.SignatureLen]byte)
+	for credIndex, inputSigners := range txSigners {
+		credIntf := tx.Creds[credIndex]
+		if credIntf == nil {
+			credIntf = &secp256k1fx.Credential{}
+			tx.Creds[credIndex] = credIntf
+		}
+
+		cred, ok := credIntf.(*secp256k1fx.Credential)
+		if !ok {
+			return ErrUnknownCredentialType
+		}
+		if expectedLen := len(inputSigners); expectedLen != len(cred.Sigs) {
+			cred.Sigs = make([][secp256k1.SignatureLen]byte, expectedLen)
+		}
+
+		for sigIndex, signer := range inputSigners {
+			if signer == nil {
+				// If we don't have access to the key, then we can't sign this
+				// transaction. However, we can attempt to partially sign it.
+				continue
+			}
+			addr := signer.Address()
+			if sig := cred.Sigs[sigIndex]; sig != emptySig {
+				// If this signature has already been populated, we can just
+				// copy the needed signature for the future.
+				sigCache[addr] = sig
+				continue
+			}
+
+			if sig, exists := sigCache[addr]; exists {
+				// If this key has already produced a signature, we can just
+				// copy the previous signature.
+				cred.Sigs[sigIndex] = sig
+				continue
+			}
+
+			sig, err := signer.Sign(unsignedBytes)
+			if err != nil {
+				return fmt.Errorf("problem signing tx: %w", err)
+			}
+			copy(cred.Sigs[sigIndex][:], sig)
+			sigCache[addr] = cred.Sigs[sigIndex]
+		}
+	}
+
+	signedBytes, err := platform.Codec.Marshal(platform.CodecVersion, tx)
+	if err != nil {
+		return fmt.Errorf("couldn't marshal tx: %w", err)
+	}
+	tx.SetBytes(unsignedBytes, signedBytes)
+	return nil
+}

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package peer
@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -16,43 +17,39 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
 	"github.com/ava-labs/avalanchego/network/throttling"
-	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	"github.com/ava-labs/avalanchego/snow/networking/router"
 	"github.com/ava-labs/avalanchego/snow/networking/tracker"
 	"github.com/ava-labs/avalanchego/snow/uptime"
 	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/staking"
+	"github.com/ava-labs/avalanchego/upgrade"
+	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
-	"github.com/ava-labs/avalanchego/utils/ips"
+	"github.com/ava-labs/avalanchego/utils/crypto/bls/signer/localsigner"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/math/meter"
 	"github.com/ava-labs/avalanchego/utils/resource"
 	"github.com/ava-labs/avalanchego/utils/set"
-	"github.com/ava-labs/avalanchego/utils/timer/mockable"
 	"github.com/ava-labs/avalanchego/version"
 )
 
 type testPeer struct {
-	Peer
-	inboundMsgChan <-chan message.InboundMessage
+	*Peer
+	inboundMsgChan <-chan *message.InboundMessage
 }
 
 type rawTestPeer struct {
 	config         *Config
-	conn           net.Conn
 	cert           *staking.Certificate
-	nodeID         ids.NodeID
-	inboundMsgChan <-chan message.InboundMessage
+	inboundMsgChan <-chan *message.InboundMessage
 }
 
 func newMessageCreator(t *testing.T) message.Creator {
 	t.Helper()
 
 	mc, err := message.NewCreator(
-		logging.NoLog{},
 		prometheus.NewRegistry(),
-		"",
 		constants.DefaultNetworkCompressionType,
 		10*time.Second,
 	)
@@ -61,30 +58,11 @@ func newMessageCreator(t *testing.T) message.Creator {
 	return mc
 }
 
-func makeRawTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*rawTestPeer, *rawTestPeer) {
+func newConfig(t *testing.T) *Config {
 	t.Helper()
 	require := require.New(t)
 
-	conn0, conn1 := net.Pipe()
-
-	tlsCert0, err := staking.NewTLSCert()
-	require.NoError(err)
-	cert0 := staking.CertificateFromX509(tlsCert0.Leaf)
-
-	tlsCert1, err := staking.NewTLSCert()
-	require.NoError(err)
-	cert1 := staking.CertificateFromX509(tlsCert1.Leaf)
-
-	nodeID0 := ids.NodeIDFromCert(cert0)
-	nodeID1 := ids.NodeIDFromCert(cert1)
-
-	mc := newMessageCreator(t)
-
-	metrics, err := NewMetrics(
-		logging.NoLog{},
-		"",
-		prometheus.NewRegistry(),
-	)
+	metrics, err := NewMetrics(prometheus.NewRegistry())
 	require.NoError(err)
 
 	resourceTracker, err := tracker.NewResourceTracker(
@@ -95,14 +73,17 @@ func makeRawTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*rawTestPee
 	)
 	require.NoError(err)
 
-	sharedConfig := Config{
+	return &Config{
+		ReadBufferSize:       constants.DefaultNetworkPeerReadBufferSize,
+		WriteBufferSize:      constants.DefaultNetworkPeerWriteBufferSize,
 		Metrics:              metrics,
-		MessageCreator:       mc,
+		MessageCreator:       newMessageCreator(t),
 		Log:                  logging.NoLog{},
 		InboundMsgThrottler:  throttling.NewNoInboundThrottler(),
-		VersionCompatibility: version.GetCompatibility(constants.LocalID),
-		MySubnets:            trackedSubnets,
-		UptimeCalculator:     uptime.NoOpCalculator,
+		Network:              TestNetwork,
+		Router:               nil,
+		VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
+		MySubnets:            nil,
 		Beacons:              validators.NewManager(),
 		Validators:           validators.NewManager(),
 		NetworkID:            constants.LocalID,
@@ -110,277 +91,231 @@ func makeRawTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*rawTestPee
 		PongTimeout:          constants.DefaultPingPongTimeout,
 		MaxClockDifference:   time.Minute,
 		ResourceTracker:      resourceTracker,
+		UptimeCalculator:     uptime.TestCalculator{},
+		IPSigner:             nil,
 	}
-	peerConfig0 := sharedConfig
-	peerConfig1 := sharedConfig
-
-	ip0 := ips.NewDynamicIPPort(net.IPv6loopback, 1)
-	tls0 := tlsCert0.PrivateKey.(crypto.Signer)
-	bls0, err := bls.NewSecretKey()
-	require.NoError(err)
-
-	peerConfig0.IPSigner = NewIPSigner(ip0, tls0, bls0)
-
-	peerConfig0.Network = TestNetwork
-	inboundMsgChan0 := make(chan message.InboundMessage)
-	peerConfig0.Router = router.InboundHandlerFunc(func(_ context.Context, msg message.InboundMessage) {
-		inboundMsgChan0 <- msg
-	})
-
-	ip1 := ips.NewDynamicIPPort(net.IPv6loopback, 2)
-	tls1 := tlsCert1.PrivateKey.(crypto.Signer)
-	bls1, err := bls.NewSecretKey()
-	require.NoError(err)
-
-	peerConfig1.IPSigner = NewIPSigner(ip1, tls1, bls1)
-
-	peerConfig1.Network = TestNetwork
-	inboundMsgChan1 := make(chan message.InboundMessage)
-	peerConfig1.Router = router.InboundHandlerFunc(func(_ context.Context, msg message.InboundMessage) {
-		inboundMsgChan1 <- msg
-	})
-
-	peer0 := &rawTestPeer{
-		config:         &peerConfig0,
-		conn:           conn0,
-		cert:           cert0,
-		nodeID:         nodeID0,
-		inboundMsgChan: inboundMsgChan0,
-	}
-	peer1 := &rawTestPeer{
-		config:         &peerConfig1,
-		conn:           conn1,
-		cert:           cert1,
-		nodeID:         nodeID1,
-		inboundMsgChan: inboundMsgChan1,
-	}
-	return peer0, peer1
 }
 
-func makeTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*testPeer, *testPeer) {
-	rawPeer0, rawPeer1 := makeRawTestPeers(t, trackedSubnets)
-
-	peer0 := &testPeer{
-		Peer: Start(
-			rawPeer0.config,
-			rawPeer0.conn,
-			rawPeer1.cert,
-			rawPeer1.nodeID,
-			NewThrottledMessageQueue(
-				rawPeer0.config.Metrics,
-				rawPeer1.nodeID,
-				logging.NoLog{},
-				throttling.NewNoOutboundThrottler(),
-			),
-		),
-		inboundMsgChan: rawPeer0.inboundMsgChan,
-	}
-	peer1 := &testPeer{
-		Peer: Start(
-			rawPeer1.config,
-			rawPeer1.conn,
-			rawPeer0.cert,
-			rawPeer0.nodeID,
-			NewThrottledMessageQueue(
-				rawPeer1.config.Metrics,
-				rawPeer0.nodeID,
-				logging.NoLog{},
-				throttling.NewNoOutboundThrottler(),
-			),
-		),
-		inboundMsgChan: rawPeer1.inboundMsgChan,
-	}
-	return peer0, peer1
-}
-
-func makeReadyTestPeers(t *testing.T, trackedSubnets set.Set[ids.ID]) (*testPeer, *testPeer) {
+func newRawTestPeer(t *testing.T, config *Config) *rawTestPeer {
 	t.Helper()
 	require := require.New(t)
 
-	peer0, peer1 := makeTestPeers(t, trackedSubnets)
+	tlsCert, err := staking.NewTLSCert()
+	require.NoError(err)
+	cert, err := staking.ParseCertificate(tlsCert.Leaf.Raw)
+	require.NoError(err)
+	config.MyNodeID = ids.NodeIDFromCert(cert)
 
-	require.NoError(peer0.AwaitReady(context.Background()))
-	require.True(peer0.Ready())
+	ip := utils.NewAtomic(netip.AddrPortFrom(
+		netip.IPv6Loopback(),
+		1,
+	))
+	tls := tlsCert.PrivateKey.(crypto.Signer)
+	bls, err := localsigner.New()
+	require.NoError(err)
 
-	require.NoError(peer1.AwaitReady(context.Background()))
-	require.True(peer1.Ready())
+	config.IPSigner = NewIPSigner(ip, tls, bls)
 
+	inboundMsgChan := make(chan *message.InboundMessage)
+	config.Router = router.InboundHandlerFunc(func(_ context.Context, msg *message.InboundMessage) {
+		inboundMsgChan <- msg
+	})
+
+	return &rawTestPeer{
+		config:         config,
+		cert:           cert,
+		inboundMsgChan: inboundMsgChan,
+	}
+}
+
+func startTestPeer(self *rawTestPeer, peer *rawTestPeer, conn net.Conn) *testPeer {
+	return &testPeer{
+		Peer: Start(
+			self.config,
+			conn,
+			peer.cert,
+			peer.config.MyNodeID,
+			NewThrottledMessageQueue(
+				self.config.Metrics,
+				peer.config.MyNodeID,
+				logging.NoLog{},
+				throttling.NewNoOutboundThrottler(),
+			),
+			false,
+		),
+		inboundMsgChan: self.inboundMsgChan,
+	}
+}
+
+func startTestPeers(rawPeer0 *rawTestPeer, rawPeer1 *rawTestPeer) (*testPeer, *testPeer) {
+	conn0, conn1 := net.Pipe()
+	peer0 := startTestPeer(rawPeer0, rawPeer1, conn0)
+	peer1 := startTestPeer(rawPeer1, rawPeer0, conn1)
 	return peer0, peer1
+}
+
+func awaitReady(t *testing.T, peers ...*testPeer) {
+	t.Helper()
+	require := require.New(t)
+
+	for _, peer := range peers {
+		require.NoError(peer.AwaitReady(t.Context()))
+		require.True(peer.Ready())
+	}
+}
+
+func must[T any](t *testing.T) func(T, error) T {
+	return func(val T, err error) T {
+		require.NoError(t, err)
+		return val
+	}
 }
 
 func TestReady(t *testing.T) {
 	require := require.New(t)
 
-	rawPeer0, rawPeer1 := makeRawTestPeers(t, set.Set[ids.ID]{})
-	peer0 := Start(
-		rawPeer0.config,
-		rawPeer0.conn,
-		rawPeer1.cert,
-		rawPeer1.nodeID,
-		NewThrottledMessageQueue(
-			rawPeer0.config.Metrics,
-			rawPeer1.nodeID,
-			logging.NoLog{},
-			throttling.NewNoOutboundThrottler(),
-		),
-	)
+	config0 := newConfig(t)
+	config1 := newConfig(t)
 
+	rawPeer0 := newRawTestPeer(t, config0)
+	rawPeer1 := newRawTestPeer(t, config1)
+
+	conn0, conn1 := net.Pipe()
+
+	peer0 := startTestPeer(rawPeer0, rawPeer1, conn0)
 	require.False(peer0.Ready())
 
-	peer1 := Start(
-		rawPeer1.config,
-		rawPeer1.conn,
-		rawPeer0.cert,
-		rawPeer0.nodeID,
-		NewThrottledMessageQueue(
-			rawPeer1.config.Metrics,
-			rawPeer0.nodeID,
-			logging.NoLog{},
-			throttling.NewNoOutboundThrottler(),
-		),
-	)
-
-	require.NoError(peer0.AwaitReady(context.Background()))
-	require.True(peer0.Ready())
-
-	require.NoError(peer1.AwaitReady(context.Background()))
-	require.True(peer1.Ready())
+	peer1 := startTestPeer(rawPeer1, rawPeer0, conn1)
+	awaitReady(t, peer0, peer1)
 
 	peer0.StartClose()
-	require.NoError(peer0.AwaitClosed(context.Background()))
-	require.NoError(peer1.AwaitClosed(context.Background()))
+	require.NoError(peer0.AwaitClosed(t.Context()))
+	require.NoError(peer1.AwaitClosed(t.Context()))
 }
 
 func TestSend(t *testing.T) {
 	require := require.New(t)
 
-	peer0, peer1 := makeReadyTestPeers(t, set.Set[ids.ID]{})
-	mc := newMessageCreator(t)
+	config0 := newConfig(t)
+	config1 := newConfig(t)
 
-	outboundGetMsg, err := mc.Get(ids.Empty, 1, time.Second, ids.Empty, p2p.EngineType_ENGINE_TYPE_SNOWMAN)
+	rawPeer0 := newRawTestPeer(t, config0)
+	rawPeer1 := newRawTestPeer(t, config1)
+
+	peer0, peer1 := startTestPeers(rawPeer0, rawPeer1)
+	awaitReady(t, peer0, peer1)
+
+	outboundGetMsg, err := config0.MessageCreator.Get(ids.Empty, 1, time.Second, ids.Empty)
 	require.NoError(err)
 
-	require.True(peer0.Send(context.Background(), outboundGetMsg))
+	require.True(peer0.Send(t.Context(), outboundGetMsg))
 
 	inboundGetMsg := <-peer1.inboundMsgChan
-	require.Equal(message.GetOp, inboundGetMsg.Op())
+	require.Equal(message.GetOp, inboundGetMsg.Op)
 
 	peer1.StartClose()
-	require.NoError(peer0.AwaitClosed(context.Background()))
-	require.NoError(peer1.AwaitClosed(context.Background()))
+	require.NoError(peer0.AwaitClosed(t.Context()))
+	require.NoError(peer1.AwaitClosed(t.Context()))
 }
 
 func TestPingUptimes(t *testing.T) {
-	trackedSubnetID := ids.GenerateTestID()
-	untrackedSubnetID := ids.GenerateTestID()
+	config0 := newConfig(t)
+	config1 := newConfig(t)
 
-	trackedSubnets := set.Of(trackedSubnetID)
+	// The raw peers are generated outside of the test cases to avoid generating
+	// many TLS keys.
+	rawPeer0 := newRawTestPeer(t, config0)
+	rawPeer1 := newRawTestPeer(t, config1)
 
-	mc := newMessageCreator(t)
+	require := require.New(t)
 
-	testCases := []struct {
-		name        string
-		msg         message.OutboundMessage
-		shouldClose bool
-		assertFn    func(*require.Assertions, *testPeer)
-	}{
-		{
-			name: "primary network only",
-			msg: func() message.OutboundMessage {
-				pingMsg, err := mc.Ping(1, nil)
-				require.NoError(t, err)
-				return pingMsg
-			}(),
-			assertFn: func(require *require.Assertions, peer *testPeer) {
-				uptime, ok := peer.ObservedUptime(constants.PrimaryNetworkID)
-				require.True(ok)
-				require.Equal(uint32(1), uptime)
-
-				uptime, ok = peer.ObservedUptime(trackedSubnetID)
-				require.False(ok)
-				require.Zero(uptime)
-			},
-		},
-		{
-			name: "primary network and subnet",
-			msg: func() message.OutboundMessage {
-				pingMsg, err := mc.Ping(
-					1,
-					[]*p2p.SubnetUptime{
-						{
-							SubnetId: trackedSubnetID[:],
-							Uptime:   1,
-						},
-					},
-				)
-				require.NoError(t, err)
-				return pingMsg
-			}(),
-			assertFn: func(require *require.Assertions, peer *testPeer) {
-				uptime, ok := peer.ObservedUptime(constants.PrimaryNetworkID)
-				require.True(ok)
-				require.Equal(uint32(1), uptime)
-
-				uptime, ok = peer.ObservedUptime(trackedSubnetID)
-				require.True(ok)
-				require.Equal(uint32(1), uptime)
-			},
-		},
-		{
-			name: "primary network and non tracked subnet",
-			msg: func() message.OutboundMessage {
-				pingMsg, err := mc.Ping(
-					1,
-					[]*p2p.SubnetUptime{
-						{
-							// Providing the untrackedSubnetID here should cause
-							// the remote peer to disconnect from us.
-							SubnetId: untrackedSubnetID[:],
-							Uptime:   1,
-						},
-						{
-							SubnetId: trackedSubnetID[:],
-							Uptime:   1,
-						},
-					},
-				)
-				require.NoError(t, err)
-				return pingMsg
-			}(),
-			shouldClose: true,
-		},
-	}
-
-	// Note: we reuse peers across tests because makeReadyTestPeers takes awhile
-	// to run.
-	peer0, peer1 := makeReadyTestPeers(t, trackedSubnets)
+	peer0, peer1 := startTestPeers(rawPeer0, rawPeer1)
+	awaitReady(t, peer0, peer1)
 	defer func() {
 		peer1.StartClose()
 		peer0.StartClose()
-		require.NoError(t, peer0.AwaitClosed(context.Background()))
-		require.NoError(t, peer1.AwaitClosed(context.Background()))
+		require.NoError(peer0.AwaitClosed(t.Context()))
+		require.NoError(peer1.AwaitClosed(t.Context()))
 	}()
+	pingMsg, err := config0.MessageCreator.Ping(1)
+	require.NoError(err)
+	require.True(peer0.Send(t.Context(), pingMsg))
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
+	// we send Get message after ping to ensure Ping is handled by the
+	// time Get is handled. This is because Get is routed to the handler
+	// whereas Ping is handled by the peer directly. We have no way to
+	// know when the peer has handled the Ping message.
+	sendAndFlush(t, peer0, peer1)
+
+	uptime := peer1.ObservedUptime()
+	require.Equal(uint32(1), uptime)
+}
+
+func TestTrackedSubnets(t *testing.T) {
+	rawPeer0 := newRawTestPeer(t, newConfig(t))
+	rawPeer1 := newRawTestPeer(t, newConfig(t))
+
+	makeSubnetIDs := func(numSubnets int) []ids.ID {
+		subnetIDs := make([]ids.ID, numSubnets)
+		for i := range subnetIDs {
+			subnetIDs[i] = ids.GenerateTestID()
+		}
+		return subnetIDs
+	}
+
+	tests := []struct {
+		name             string
+		trackedSubnets   []ids.ID
+		shouldDisconnect bool
+	}{
+		{
+			name:             "primary network only",
+			trackedSubnets:   makeSubnetIDs(0),
+			shouldDisconnect: false,
+		},
+		{
+			name:             "single subnet",
+			trackedSubnets:   makeSubnetIDs(1),
+			shouldDisconnect: false,
+		},
+		{
+			name:             "max subnets",
+			trackedSubnets:   makeSubnetIDs(maxNumTrackedSubnets),
+			shouldDisconnect: false,
+		},
+		{
+			name:             "too many subnets",
+			trackedSubnets:   makeSubnetIDs(maxNumTrackedSubnets + 1),
+			shouldDisconnect: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
 			require := require.New(t)
 
-			require.True(peer0.Send(context.Background(), tc.msg))
-
-			// Note: shouldClose can only be `true` for the last test because
-			// we reuse peers across tests.
-			if tc.shouldClose {
-				require.NoError(peer1.AwaitClosed(context.Background()))
+			rawPeer0.config.MySubnets = set.Of(test.trackedSubnets...)
+			peer0, peer1 := startTestPeers(rawPeer0, rawPeer1)
+			if test.shouldDisconnect {
+				require.NoError(peer0.AwaitClosed(t.Context()))
+				require.NoError(peer1.AwaitClosed(t.Context()))
 				return
 			}
 
-			// we send Get message after ping to ensure Ping is handled by the
-			// time Get is handled. This is because Get is routed to the handler
-			// whereas Ping is handled by the peer directly. We have no way to
-			// know when the peer has handled the Ping message.
-			sendAndFlush(t, peer0, peer1)
+			defer func() {
+				peer1.StartClose()
+				peer0.StartClose()
+				require.NoError(peer0.AwaitClosed(t.Context()))
+				require.NoError(peer1.AwaitClosed(t.Context()))
+			}()
 
-			tc.assertFn(require, peer1)
+			awaitReady(t, peer0, peer1)
+
+			require.Equal(set.Of(constants.PrimaryNetworkID), peer0.TrackedSubnets())
+
+			expectedTrackedSubnets := set.Of(test.trackedSubnets...)
+			expectedTrackedSubnets.Add(constants.PrimaryNetworkID)
+			require.Equal(expectedTrackedSubnets, peer1.TrackedSubnets())
 		})
 	}
 }
@@ -389,79 +324,85 @@ func TestPingUptimes(t *testing.T) {
 func TestInvalidBLSKeyDisconnects(t *testing.T) {
 	require := require.New(t)
 
-	rawPeer0, rawPeer1 := makeRawTestPeers(t, nil)
+	sharedConfig0 := newConfig(t)
+	sharedConfig1 := newConfig(t)
+
+	rawPeer0 := newRawTestPeer(t, sharedConfig0)
+	rawPeer1 := newRawTestPeer(t, sharedConfig1)
+
 	require.NoError(rawPeer0.config.Validators.AddStaker(
 		constants.PrimaryNetworkID,
-		rawPeer1.nodeID,
-		bls.PublicFromSecretKey(rawPeer1.config.IPSigner.blsSigner),
+		rawPeer1.config.MyNodeID,
+		rawPeer1.config.IPSigner.blsSigner.PublicKey(),
 		ids.GenerateTestID(),
 		1,
 	))
 
-	bogusBLSKey, err := bls.NewSecretKey()
+	bogusBLSKey, err := localsigner.New()
 	require.NoError(err)
 	require.NoError(rawPeer1.config.Validators.AddStaker(
 		constants.PrimaryNetworkID,
-		rawPeer0.nodeID,
-		bls.PublicFromSecretKey(bogusBLSKey), // This is the wrong BLS key for this peer
+		rawPeer0.config.MyNodeID,
+		bogusBLSKey.PublicKey(), // This is the wrong BLS key for this peer
 		ids.GenerateTestID(),
 		1,
 	))
-	peer0 := &testPeer{
-		Peer: Start(
-			rawPeer0.config,
-			rawPeer0.conn,
-			rawPeer1.cert,
-			rawPeer1.nodeID,
-			NewThrottledMessageQueue(
-				rawPeer0.config.Metrics,
-				rawPeer1.nodeID,
-				logging.NoLog{},
-				throttling.NewNoOutboundThrottler(),
-			),
-		),
-		inboundMsgChan: rawPeer0.inboundMsgChan,
-	}
-	peer1 := &testPeer{
-		Peer: Start(
-			rawPeer1.config,
-			rawPeer1.conn,
-			rawPeer0.cert,
-			rawPeer0.nodeID,
-			NewThrottledMessageQueue(
-				rawPeer1.config.Metrics,
-				rawPeer0.nodeID,
-				logging.NoLog{},
-				throttling.NewNoOutboundThrottler(),
-			),
-		),
-		inboundMsgChan: rawPeer1.inboundMsgChan,
-	}
+
+	peer0, peer1 := startTestPeers(rawPeer0, rawPeer1)
 
 	// Because peer1 thinks that peer0 is using the wrong BLS key, they should
 	// disconnect from each other.
-	require.NoError(peer0.AwaitClosed(context.Background()))
-	require.NoError(peer1.AwaitClosed(context.Background()))
+	require.NoError(peer0.AwaitClosed(t.Context()))
+	require.NoError(peer1.AwaitClosed(t.Context()))
+}
+
+// Test that the upgrade time is exchanged and exposed correctly after the
+// handshake finishes.
+func TestUpgradeTime(t *testing.T) {
+	require := require.New(t)
+
+	sharedConfig0 := newConfig(t)
+	sharedConfig0.VersionCompatibility.UpgradeTime = time.Unix(123, 0)
+
+	sharedConfig1 := newConfig(t)
+	sharedConfig1.VersionCompatibility.UpgradeTime = time.Unix(1234, 0)
+
+	peer0, peer1 := startTestPeers(
+		newRawTestPeer(t, sharedConfig0),
+		newRawTestPeer(t, sharedConfig1),
+	)
+	require.NoError(peer0.AwaitReady(t.Context()))
+	require.NoError(peer1.AwaitReady(t.Context()))
+
+	require.Equal(uint64(sharedConfig1.VersionCompatibility.UpgradeTime.Unix()), peer0.Info().UpgradeTime)
+	require.Equal(uint64(sharedConfig0.VersionCompatibility.UpgradeTime.Unix()), peer1.Info().UpgradeTime)
+
+	peer0.StartClose()
+	peer1.StartClose()
+
+	require.NoError(peer0.AwaitClosed(t.Context()))
+	require.NoError(peer1.AwaitClosed(t.Context()))
 }
 
 func TestShouldDisconnect(t *testing.T) {
 	peerID := ids.GenerateTestNodeID()
 	txID := ids.GenerateTestID()
-	blsKey, err := bls.NewSecretKey()
+	blsKey, err := localsigner.New()
 	require.NoError(t, err)
+	must := must[*bls.Signature](t)
 
 	tests := []struct {
 		name                     string
-		initialPeer              *peer
-		expectedPeer             *peer
+		initialPeer              *Peer
+		expectedPeer             *Peer
 		expectedShouldDisconnect bool
 	}{
 		{
 			name: "peer is reporting old version",
-			initialPeer: &peer{
+			initialPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 				},
 				version: &version.Application{
 					Name:  version.Client,
@@ -470,10 +411,10 @@ func TestShouldDisconnect(t *testing.T) {
 					Patch: 0,
 				},
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 				},
 				version: &version.Application{
 					Name:  version.Client,
@@ -486,30 +427,30 @@ func TestShouldDisconnect(t *testing.T) {
 		},
 		{
 			name: "peer is not a validator",
-			initialPeer: &peer{
+			initialPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators:           validators.NewManager(),
 				},
-				version: version.CurrentApp,
+				version: version.Current,
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators:           validators.NewManager(),
 				},
-				version: version.CurrentApp,
+				version: version.Current,
 			},
 			expectedShouldDisconnect: false,
 		},
 		{
 			name: "peer is a validator without a BLS key",
-			initialPeer: &peer{
+			initialPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
@@ -523,12 +464,12 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
@@ -542,22 +483,22 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 			},
 			expectedShouldDisconnect: false,
 		},
 		{
 			name: "already verified peer",
-			initialPeer: &peer{
+			initialPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -565,19 +506,19 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:                   peerID,
-				version:              version.CurrentApp,
+				version:              version.Current,
 				txIDOfVerifiedBLSKey: txID,
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -585,28 +526,23 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:                   peerID,
-				version:              version.CurrentApp,
+				version:              version.Current,
 				txIDOfVerifiedBLSKey: txID,
 			},
 			expectedShouldDisconnect: false,
 		},
 		{
-			name: "past durango without a signature",
-			initialPeer: &peer{
+			name: "peer without signature",
+			initialPeer: &Peer{
 				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(mockable.MaxTime)
-						return clk
-					}(),
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -614,24 +550,19 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 				ip:      &SignedIP{},
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(mockable.MaxTime)
-						return clk
-					}(),
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -639,28 +570,23 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 				ip:      &SignedIP{},
 			},
 			expectedShouldDisconnect: true,
 		},
 		{
-			name: "pre durango without a signature",
-			initialPeer: &peer{
+			name: "peer with invalid signature",
+			initialPeer: &Peer{
 				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(time.Time{})
-						return clk
-					}(),
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -668,80 +594,21 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
-				ip:      &SignedIP{},
-			},
-			expectedPeer: &peer{
-				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(time.Time{})
-						return clk
-					}(),
-					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
-					Validators: func() validators.Manager {
-						vdrs := validators.NewManager()
-						require.NoError(t, vdrs.AddStaker(
-							constants.PrimaryNetworkID,
-							peerID,
-							bls.PublicFromSecretKey(blsKey),
-							txID,
-							1,
-						))
-						return vdrs
-					}(),
-				},
-				id:      peerID,
-				version: version.CurrentApp,
-				ip:      &SignedIP{},
-			},
-			expectedShouldDisconnect: false,
-		},
-		{
-			name: "pre durango with an invalid signature",
-			initialPeer: &peer{
-				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(time.Time{})
-						return clk
-					}(),
-					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
-					Validators: func() validators.Manager {
-						vdrs := validators.NewManager()
-						require.NoError(t, vdrs.AddStaker(
-							constants.PrimaryNetworkID,
-							peerID,
-							bls.PublicFromSecretKey(blsKey),
-							txID,
-							1,
-						))
-						return vdrs
-					}(),
-				},
-				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 				ip: &SignedIP{
-					BLSSignature: bls.SignProofOfPossession(blsKey, []byte("wrong message")),
+					BLSSignature: must(blsKey.SignProofOfPossession([]byte("wrong message"))),
 				},
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(time.Time{})
-						return clk
-					}(),
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -749,30 +616,25 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 				ip: &SignedIP{
-					BLSSignature: bls.SignProofOfPossession(blsKey, []byte("wrong message")),
+					BLSSignature: must(blsKey.SignProofOfPossession([]byte("wrong message"))),
 				},
 			},
 			expectedShouldDisconnect: true,
 		},
 		{
-			name: "pre durango with a valid signature",
-			initialPeer: &peer{
+			name: "peer with valid signature",
+			initialPeer: &Peer{
 				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(time.Time{})
-						return clk
-					}(),
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -780,26 +642,21 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 				ip: &SignedIP{
-					BLSSignature: bls.SignProofOfPossession(blsKey, (&UnsignedIP{}).bytes()),
+					BLSSignature: must(blsKey.SignProofOfPossession((&UnsignedIP{}).bytes())),
 				},
 			},
-			expectedPeer: &peer{
+			expectedPeer: &Peer{
 				Config: &Config{
-					Clock: func() mockable.Clock {
-						clk := mockable.Clock{}
-						clk.Set(time.Time{})
-						return clk
-					}(),
 					Log:                  logging.NoLog{},
-					VersionCompatibility: version.GetCompatibility(constants.UnitTestID),
+					VersionCompatibility: version.GetCompatibility(constants.FlareID, upgrade.InitiallyActiveTime),
 					Validators: func() validators.Manager {
 						vdrs := validators.NewManager()
 						require.NoError(t, vdrs.AddStaker(
 							constants.PrimaryNetworkID,
 							peerID,
-							bls.PublicFromSecretKey(blsKey),
+							blsKey.PublicKey(),
 							txID,
 							1,
 						))
@@ -807,9 +664,9 @@ func TestShouldDisconnect(t *testing.T) {
 					}(),
 				},
 				id:      peerID,
-				version: version.CurrentApp,
+				version: version.Current,
 				ip: &SignedIP{
-					BLSSignature: bls.SignProofOfPossession(blsKey, (&UnsignedIP{}).bytes()),
+					BLSSignature: must(blsKey.SignProofOfPossession((&UnsignedIP{}).bytes())),
 				},
 				txIDOfVerifiedBLSKey: txID,
 			},
@@ -834,9 +691,9 @@ func TestShouldDisconnect(t *testing.T) {
 func sendAndFlush(t *testing.T, sender *testPeer, receiver *testPeer) {
 	t.Helper()
 	mc := newMessageCreator(t)
-	outboundGetMsg, err := mc.Get(ids.Empty, 1, time.Second, ids.Empty, p2p.EngineType_ENGINE_TYPE_SNOWMAN)
+	outboundGetMsg, err := mc.Get(ids.Empty, 1, time.Second, ids.Empty)
 	require.NoError(t, err)
-	require.True(t, sender.Send(context.Background(), outboundGetMsg))
+	require.True(t, sender.Send(t.Context(), outboundGetMsg))
 	inboundGetMsg := <-receiver.inboundMsgChan
-	require.Equal(t, message.GetOp, inboundGetMsg.Op())
+	require.Equal(t, message.GetOp, inboundGetMsg.Op)
 }

@@ -1,9 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package peer
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/ava-labs/avalanchego/ids"
@@ -32,14 +33,16 @@ type Config struct {
 	InboundMsgThrottler  throttling.InboundMsgThrottler
 	Network              Network
 	Router               router.InboundHandler
-	VersionCompatibility version.Compatibility
-	MySubnets            set.Set[ids.ID]
-	Beacons              validators.Manager
-	Validators           validators.Manager
-	NetworkID            uint32
-	PingFrequency        time.Duration
-	PongTimeout          time.Duration
-	MaxClockDifference   time.Duration
+	VersionCompatibility *version.Compatibility
+	MyNodeID             ids.NodeID
+	// MySubnets does not include the primary network ID
+	MySubnets          set.Set[ids.ID]
+	Beacons            validators.Manager
+	Validators         validators.Manager
+	NetworkID          uint32
+	PingFrequency      time.Duration
+	PongTimeout        time.Duration
+	MaxClockDifference time.Duration
 
 	SupportedACPs []uint32
 	ObjectedACPs  []uint32
@@ -56,4 +59,11 @@ type Config struct {
 
 	// Signs my IP so I can send my signed IP address in the Handshake message
 	IPSigner *IPSigner
+
+	// IngressConnectionCount counts the ingress (to us) connections.
+	IngressConnectionCount atomic.Int64
+
+	// If true, connects to all validators regardless of primary network validator
+	// status or of configured tracked subnets.
+	ConnectToAllValidators bool
 }

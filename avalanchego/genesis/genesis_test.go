@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package genesis
@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ava-labs/libevm/core"
 	"github.com/stretchr/testify/require"
 
 	_ "embed"
@@ -30,6 +31,9 @@ var (
 	invalidGenesisConfigJSON = []byte(`{
 		"networkID": 9999}}}}
 	}`)
+
+	//go:embed genesis_test_invalid_allocations.json
+	customGenesisConfigInvalidAllocationsJSON []byte
 
 	genesisStakingCfg = &StakingConfig{
 		MaxStakeDuration: 365 * 24 * time.Hour,
@@ -210,6 +214,11 @@ func TestGenesisFromFile(t *testing.T) {
 			missingFilepath: "missing.json",
 			expectedErr:     os.ErrNotExist,
 		},
+		"custom (locked allocations amount too low)": {
+			networkID:    9999,
+			customConfig: customGenesisConfigInvalidAllocationsJSON,
+			expectedErr:  errAllocationsLockedAmountTooLow,
+		},
 	}
 
 	for name, test := range tests {
@@ -305,8 +314,6 @@ func TestGenesisFromFlag(t *testing.T) {
 				case constants.LocalID:
 					genBytes, err = json.Marshal(&LocalConfig)
 					require.NoError(err)
-				default:
-					genBytes = make([]byte, 0)
 				}
 			} else {
 				genBytes = test.customConfig
@@ -328,24 +335,23 @@ func TestGenesisFromFlag(t *testing.T) {
 
 func TestGenesis(t *testing.T) {
 	tests := []struct {
-		networkID  uint32
+		config     *Config
 		expectedID string
 	}{
 		{
-			networkID:  constants.FlareID,
+			config:     &FlareConfig,
 			expectedID: "frq8jezXkuL4PmuBt6FDcpULh2sCsFHPgWq3ZGP1G8R8UnnoU",
 		},
 		{
-			networkID:  constants.SongbirdID,
+			config:     &SongbirdConfig,
 			expectedID: "2ACyRqRc8H5VT7DDGn4qadKfct4iTPe9buQKhAjiDyotSVkeoi",
 		},
 	}
 	for _, test := range tests {
-		t.Run(constants.NetworkIDToNetworkName[test.networkID], func(t *testing.T) {
+		t.Run(constants.NetworkIDToNetworkName[test.config.NetworkID], func(t *testing.T) {
 			require := require.New(t)
 
-			config := GetConfig(test.networkID)
-			genesisBytes, _, err := FromConfig(config)
+			genesisBytes, _, err := FromConfig(test.config)
 			require.NoError(err)
 
 			var genesisID ids.ID = hashing.ComputeHash256Array(genesisBytes)
@@ -476,6 +482,42 @@ func TestAVAXAssetID(t *testing.T) {
 				test.expectedID,
 				avaxAssetID.String(),
 				"AVAX assetID with networkID %d mismatch",
+				test.networkID,
+			)
+		})
+	}
+}
+
+func TestCChainGenesisTimestamp(t *testing.T) {
+	tests := []struct {
+		networkID           uint32
+		expectedGenesisTime uint64
+	}{
+		{
+			networkID:           constants.MainnetID,
+			expectedGenesisTime: 0,
+		},
+		{
+			networkID:           constants.FlareID,
+			expectedGenesisTime: 0,
+		},
+		{
+			networkID:           constants.LocalID,
+			expectedGenesisTime: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(constants.NetworkIDToNetworkName[test.networkID], func(t *testing.T) {
+			require := require.New(t)
+
+			config := GetConfig(test.networkID)
+			var cChainGenesis core.Genesis
+			require.NoError(json.Unmarshal([]byte(config.CChainGenesis), &cChainGenesis))
+			require.Equal(
+				test.expectedGenesisTime,
+				cChainGenesis.Timestamp,
+				"C-Chain genesis time with networkID %d mismatch",
 				test.networkID,
 			)
 		})

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package tmpnet
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ava-labs/avalanchego/config"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs/executor"
 )
 
@@ -29,39 +30,46 @@ const (
 	DefaultPreFundedKeyCount = 50
 
 	// A short minimum stake duration enables testing of staking logic.
-	DefaultMinStakeDuration = time.Second
+	DefaultMinStakeDuration        = "2s"
+	DefaultHeliconMinStakeDuration = "1s"
 
 	defaultConfigFilename = "config.json"
 )
 
-// A set of flags appropriate for testing.
-func DefaultFlags() FlagsMap {
-	// Supply only non-default configuration to ensure that default values will be used.
+// Flags suggested for temporary networks. Applied by default.
+func DefaultTmpnetFlags() FlagsMap {
 	return FlagsMap{
-		config.NetworkPeerListGossipFreqKey: "250ms",
-		config.NetworkMaxReconnectDelayKey:  "1s",
-		config.PublicIPKey:                  "127.0.0.1",
-		config.HTTPHostKey:                  "127.0.0.1",
-		config.StakingHostKey:               "127.0.0.1",
-		config.HealthCheckFreqKey:           "2s",
-		config.AdminAPIEnabledKey:           true,
-		config.IpcAPIEnabledKey:             true,
-		config.IndexEnabledKey:              true,
-		config.LogDisplayLevelKey:           "INFO",
-		config.LogLevelKey:                  "DEBUG",
-		config.MinStakeDurationKey:          DefaultMinStakeDuration.String(),
+		config.NetworkPeerListPullGossipFreqKey: "250ms",
+		config.NetworkMaxReconnectDelayKey:      "1s",
+		config.HealthCheckFreqKey:               "2s",
+		config.AdminAPIEnabledKey:               "true",
+		config.IndexEnabledKey:                  "true",
+		// Disable disk checks by default since temporary networks often run in
+		// resource-constrained environments that commonly have low disk space.
+		config.SystemTrackerRequiredAvailableDiskSpacePercentageKey: "0",
+		config.SystemTrackerWarningAvailableDiskSpacePercentageKey:  "0",
+	}
+}
+
+// Flags suggested for e2e testing
+func DefaultE2EFlags() FlagsMap {
+	return FlagsMap{
+		config.ProposerVMUseCurrentHeightKey: "true",
+		// Reducing this from the 1s default speeds up tx acceptance
+		config.ProposerVMMinBlockDelayKey: "0s",
+		config.LogLevelKey:                logging.Debug.String(),
 	}
 }
 
 // A set of chain configurations appropriate for testing.
-func DefaultChainConfigs() map[string]FlagsMap {
-	return map[string]FlagsMap{
+func DefaultChainConfigs() map[string]ConfigMap {
+	return map[string]ConfigMap{
 		// Supply only non-default configuration to ensure that default
 		// values will be used. Available C-Chain configuration options are
-		// defined in the `github.com/ava-labs/coreth/evm` package.
+		// defined in the `github.com/ava-labs/avalanchego/graft/coreth/evm` package.
 		"C": {
 			"warp-api-enabled": true,
-			"log-level":        "trace",
+			"log-level":        logging.Trace.String(),
 		},
 	}
 }

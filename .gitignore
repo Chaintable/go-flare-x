@@ -1,0 +1,6 @@
+.DS_Store
+.idea/
+local-scripts/
+plans/
+audits/
+.pnpm-store

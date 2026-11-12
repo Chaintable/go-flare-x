@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package handler
@@ -7,6 +7,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/utils/set"
 )
 
 var ErrNotConnectedEnoughStake = errors.New("not connected to enough stake")
@@ -39,13 +42,20 @@ func (h *handler) HealthCheck(ctx context.Context) (interface{}, error) {
 
 func (h *handler) networkHealthCheck() (interface{}, error) {
 	percentConnected := h.peerTracker.ConnectedPercent()
-	details := map[string]float64{
-		"percentConnected": percentConnected,
+	details := map[string]interface{}{
+		"percentConnected":       percentConnected,
+		"disconnectedValidators": h.getDisconnectedValidators(),
+	}
+
+	subnetConfig := h.subnet.Config()
+
+	// SnowParameters can be nil if the subnet is configured for Simplex consensus
+	if subnetConfig.SnowParameters == nil {
+		return details, nil
 	}
 
 	var err error
-	subnetConfig := h.subnet.Config()
-	minPercentConnected := subnetConfig.ConsensusParameters.MinPercentConnectedHealthy()
+	minPercentConnected := subnetConfig.SnowParameters.MinPercentConnectedHealthy()
 	if percentConnected < minPercentConnected {
 		err = fmt.Errorf("%w: connected to %f%%; required at least %f%%",
 			ErrNotConnectedEnoughStake,
@@ -55,4 +65,12 @@ func (h *handler) networkHealthCheck() (interface{}, error) {
 	}
 
 	return details, err
+}
+
+func (h *handler) getDisconnectedValidators() set.Set[ids.NodeID] {
+	vdrs := h.peerTracker.GetValidators()
+	connectedVdrs := h.peerTracker.ConnectedValidators()
+	// vdrs - connectedVdrs is equal to the disconnectedVdrs
+	vdrs.Difference(connectedVdrs)
+	return vdrs
 }

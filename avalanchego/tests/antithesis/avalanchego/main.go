@@ -1,0 +1,1100 @@
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
+// See the file LICENSE for licensing terms.
+
+package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"math/big"
+	"strconv"
+	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+	"github.com/antithesishq/antithesis-sdk-go/lifecycle"
+	"github.com/ava-labs/libevm/core/types"
+	"github.com/ava-labs/libevm/crypto"
+	"github.com/ava-labs/libevm/ethclient"
+	"github.com/ava-labs/libevm/params"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/ava-labs/avalanchego/api/info"
+	"github.com/ava-labs/avalanchego/database"
+	"github.com/ava-labs/avalanchego/genesis"
+	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/tests"
+	"github.com/ava-labs/avalanchego/tests/antithesis"
+	"github.com/ava-labs/avalanchego/tests/fixture/e2e"
+	"github.com/ava-labs/avalanchego/tests/fixture/tmpnet"
+	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
+	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/set"
+	"github.com/ava-labs/avalanchego/utils/units"
+	"github.com/ava-labs/avalanchego/vms/avm"
+	"github.com/ava-labs/avalanchego/vms/components/avax"
+	"github.com/ava-labs/avalanchego/vms/components/verify"
+	"github.com/ava-labs/avalanchego/vms/platformvm"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
+	"github.com/ava-labs/avalanchego/vms/propertyfx"
+	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
+	"github.com/ava-labs/avalanchego/wallet/subnet/primary"
+	"github.com/ava-labs/avalanchego/wallet/subnet/primary/common"
+
+	timerpkg "github.com/ava-labs/avalanchego/utils/timer"
+	xtxs "github.com/ava-labs/avalanchego/vms/avm/txs"
+	xbuilder "github.com/ava-labs/avalanchego/wallet/chain/x/builder"
+	ethcommon "github.com/ava-labs/libevm/common"
+)
+
+const NumKeys = 5
+
+const (
+	// initialCChainFunding is the per-worker C-Chain top-up in wei (10 AVAX),
+	// enough for over 100k self-transfers at typical gas prices. A 4-hour
+	// Antithesis run peaked around 120 self-transfers per worker.
+	initialCChainFunding = 10 * params.Ether
+	cChainTransferAmount = 10_000 // wei
+	// txConfirmationTimeout bounds the total time spent waiting for a tx receipt
+	// across all nodes.
+	txConfirmationTimeout = 60 * time.Second
+)
+
+// TODO(marun) Extract the common elements of test execution for reuse across test setups
+
+func main() {
+	// TODO(marun) Support choosing the log format
+	tc := antithesis.NewInstrumentedTestContext(tests.NewDefaultLogger(""))
+	defer tc.RecoverAndExit()
+	require := require.New(tc)
+
+	c := antithesis.NewConfig(
+		tc,
+		&tmpnet.Network{
+			Owner: "antithesis-avalanchego",
+		},
+	)
+	ctx := tests.DefaultNotifyContext(c.Duration, tc.DeferCleanup)
+	// Ensure contexts sourced from the test context use the notify context as their parent
+	tc.SetDefaultContextParent(ctx)
+
+	kc := secp256k1fx.NewKeychain(genesis.EWOQKey)
+	walletSyncStartTime := time.Now()
+	setupURI := c.URIs[0]
+	wallet := e2e.NewWallet(tc, kc, tmpnet.NodeURI{URI: setupURI})
+	tc.Log().Info("synced wallet",
+		zap.Duration("duration", time.Since(walletSyncStartTime)),
+	)
+
+	genesisWorkload := &workload{
+		id:        0,
+		log:       tests.NewDefaultLogger(fmt.Sprintf("worker %d", 0)),
+		wallet:    wallet,
+		addrs:     set.Of(genesis.EWOQKey.Address()),
+		uris:      c.URIs,
+		cChainKey: genesis.EWOQKey.ToECDSA(),
+	}
+	require.NoError(genesisWorkload.initializeCChain(ctx, nil), "failed to initialize genesis C-Chain clients")
+
+	workloads := make([]*workload, NumKeys)
+	workloads[0] = genesisWorkload
+
+	var (
+		genesisXWallet  = wallet.X()
+		genesisXBuilder = genesisXWallet.Builder()
+		genesisXContext = genesisXBuilder.Context()
+		avaxAssetID     = genesisXContext.AVAXAssetID
+	)
+	for i := 1; i < NumKeys; i++ {
+		key, err := secp256k1.NewPrivateKey()
+		require.NoError(err, "failed to generate key")
+
+		var (
+			addr          = key.Address()
+			baseStartTime = time.Now()
+		)
+		baseTx, err := genesisXWallet.IssueBaseTx([]*avax.TransferableOutput{{
+			Asset: avax.Asset{
+				ID: avaxAssetID,
+			},
+			Out: &secp256k1fx.TransferOutput{
+				Amt: 100 * units.KiloAvax,
+				OutputOwners: secp256k1fx.OutputOwners{
+					Threshold: 1,
+					Addrs: []ids.ShortID{
+						addr,
+					},
+				},
+			},
+		}})
+		require.NoError(err, "failed to issue initial funding X-chain baseTx")
+		tc.Log().Info("issued initial funding X-chain baseTx",
+			zap.Stringer("txID", baseTx.ID()),
+			zap.Duration("duration", time.Since(baseStartTime)),
+		)
+
+		require.NoError(genesisWorkload.confirmXChainTx(ctx, baseTx), "failed to confirm initial funding X-chain baseTx")
+
+		uri := c.URIs[i%len(c.URIs)]
+		kc := secp256k1fx.NewKeychain(key)
+		walletSyncStartTime := time.Now()
+		wallet := e2e.NewWallet(tc, kc, tmpnet.NodeURI{URI: uri})
+		tc.Log().Info("synced wallet",
+			zap.Duration("duration", time.Since(walletSyncStartTime)),
+		)
+
+		cChainKey, err := crypto.ToECDSA(crypto.Keccak256([]byte("C-Chain worker"), []byte(strconv.Itoa(i))))
+		require.NoError(err, "failed to generate C-Chain key")
+		require.NoError(
+			genesisWorkload.fundCChainAddress(ctx, crypto.PubkeyToAddress(cChainKey.PublicKey), initialCChainFunding),
+			"failed to fund C-Chain worker",
+		)
+
+		worker := &workload{
+			id:        i,
+			log:       tests.NewDefaultLogger(fmt.Sprintf("worker %d", i)),
+			wallet:    wallet,
+			addrs:     set.Of(addr),
+			uris:      c.URIs,
+			cChainKey: cChainKey,
+		}
+		require.NoError(worker.initializeCChain(ctx, genesisWorkload.cChainID), "failed to initialize C-Chain clients")
+		workloads[i] = worker
+	}
+
+	upgrades, err := info.NewClient(setupURI).Upgrades(ctx)
+	require.NoError(err, "failed to fetch the upgrade schedule")
+	timeUntilHelicon := time.Until(upgrades.HeliconTime)
+	assert.Always(
+		timeUntilHelicon > 0,
+		"Helicon activates after worker initialization",
+		map[string]any{
+			"heliconTime":      upgrades.HeliconTime,
+			"timeUntilHelicon": timeUntilHelicon.String(),
+		},
+	)
+
+	lifecycle.SetupComplete(map[string]any{
+		"msg":              "initialized workers",
+		"numWorkers":       NumKeys,
+		"timeUntilHelicon": timeUntilHelicon.String(),
+	})
+
+	go awaitHeliconActivation(ctx, upgrades.HeliconTime)
+
+	for _, w := range workloads[1:] {
+		go w.run(ctx)
+	}
+	genesisWorkload.run(ctx)
+}
+
+// awaitHeliconActivation reports that Helicon activated. Nothing is reported if
+// ctx is canceled first, failing the reachability assertion for runs that end
+// before the activation.
+func awaitHeliconActivation(ctx context.Context, heliconTime time.Time) {
+	timer := time.NewTimer(time.Until(heliconTime))
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		assert.Reachable("Helicon activating", map[string]any{
+			"heliconTime": heliconTime,
+		})
+	case <-ctx.Done():
+	}
+}
+
+type workload struct {
+	id     int
+	log    logging.Logger
+	wallet *primary.Wallet
+	addrs  set.Set[ids.ShortID]
+	uris   []string
+
+	cChainKey     *ecdsa.PrivateKey
+	cChainID      *big.Int
+	cChainClients map[string]*ethclient.Client
+}
+
+// newTestContext returns a test context that ensures that log output and assertions are
+// associated with this worker.
+func (w *workload) newTestContext(ctx context.Context) *tests.SimpleTestContext {
+	return antithesis.NewInstrumentedTestContextWithArgs(
+		ctx,
+		w.log,
+		map[string]any{
+			"worker": w.id,
+		},
+	)
+}
+
+func (w *workload) initializeCChain(ctx context.Context, chainID *big.Int) error {
+	w.cChainClients = make(map[string]*ethclient.Client, len(w.uris))
+	for _, uri := range w.uris {
+		client, err := ethclient.Dial(uri + "/ext/bc/C/rpc")
+		if err != nil {
+			return fmt.Errorf("failed to dial C-Chain RPC on %s: %w", uri, err)
+		}
+		w.cChainClients[uri] = client
+	}
+
+	if chainID == nil {
+		uri := w.uris[0]
+		client, err := w.cChainClient(uri)
+		if err != nil {
+			return fmt.Errorf("failed to get C-Chain RPC client for %s: %w", uri, err)
+		}
+		chainID, err = client.ChainID(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to fetch C-Chain chain ID: %w", err)
+		}
+	}
+	w.cChainID = new(big.Int).Set(chainID)
+	return nil
+}
+
+func (w *workload) cChainClient(uri string) (*ethclient.Client, error) {
+	if client, ok := w.cChainClients[uri]; ok {
+		return client, nil
+	}
+	err := errors.New("missing C-Chain RPC client")
+	assert.Unreachable("missing C-Chain RPC client", map[string]any{
+		"worker": w.id,
+		"uri":    uri,
+	})
+	return nil, err
+}
+
+func (w *workload) run(ctx context.Context) {
+	timer := timerpkg.StoppedTimer()
+
+	tc := w.newTestContext(ctx)
+	// Any assertion failure from this test context will result in process exit due to the
+	// panic being rethrown. This ensures that failures in test setup are fatal.
+	defer tc.RecoverAndRethrow()
+	require := require.New(tc)
+
+	xAVAX, pAVAX := e2e.GetWalletBalances(tc, w.wallet)
+	assert.Reachable("wallet starting", map[string]any{
+		"worker":   w.id,
+		"xBalance": xAVAX,
+		"pBalance": pAVAX,
+	})
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		w.executeTest(ctx)
+
+		val, err := rand.Int(rand.Reader, big.NewInt(int64(time.Second)))
+		require.NoError(err, "failed to read randomness")
+
+		timer.Reset(time.Duration(val.Int64()))
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// executeTest executes a test at random.
+func (w *workload) executeTest(ctx context.Context) {
+	tc := w.newTestContext(ctx)
+	// Panics will be recovered without being rethrown, ensuring that test failures are not fatal.
+	defer tc.Recover()
+	require := require.New(tc)
+
+	tests := []struct {
+		name string
+		fn   func(ctx context.Context)
+	}{
+		{"issueXChainBaseTx", w.issueXChainBaseTx},
+		{"issueXChainCreateAssetTx", w.issueXChainCreateAssetTx},
+		{"issueXChainOperationTx", w.issueXChainOperationTx},
+		{"issueXToPTransfer", w.issueXToPTransfer},
+		{"issuePToXTransfer", w.issuePToXTransfer},
+		{"issueCChainTransfer", w.issueCChainTransfer},
+		{"sleep", nil},
+	}
+
+	val, err := rand.Int(rand.Reader, big.NewInt(int64(len(tests))))
+	require.NoError(err, "failed to read randomness")
+
+	test := tests[val.Int64()]
+	w.log.Info("executing " + test.name)
+	if test.fn != nil {
+		test.fn(ctx)
+	}
+
+	// TODO(marun) Enable execution of the banff e2e test as part of https://github.com/ava-labs/avalanchego/issues/4049
+	// w.log.Info("executing banff.TestCustomAssetTransfer")
+	// addr, _ := w.addrs.Peek()
+	// banff.TestCustomAssetTransfer(tc, *w.wallet, addr)
+}
+
+func (w *workload) issueXChainBaseTx(ctx context.Context) {
+	var (
+		xWallet  = w.wallet.X()
+		xBuilder = xWallet.Builder()
+	)
+	balances, err := xBuilder.GetFTBalance()
+	if err != nil {
+		w.log.Error("failed to fetch X-chain balances",
+			zap.Error(err),
+		)
+		assert.Unreachable("failed to fetch X-chain balances", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return
+	}
+
+	var (
+		xContext      = xBuilder.Context()
+		avaxAssetID   = xContext.AVAXAssetID
+		avaxBalance   = balances[avaxAssetID]
+		baseTxFee     = xContext.BaseTxFee
+		neededBalance = baseTxFee + units.Schmeckle
+	)
+	if avaxBalance < neededBalance {
+		w.log.Info("skipping X-chain tx issuance due to insufficient balance",
+			zap.Uint64("balance", avaxBalance),
+			zap.Uint64("neededBalance", neededBalance),
+		)
+		return
+	}
+
+	var (
+		owner         = w.makeOwner()
+		baseStartTime = time.Now()
+	)
+	baseTx, err := xWallet.IssueBaseTx(
+		[]*avax.TransferableOutput{
+			{
+				Asset: avax.Asset{
+					ID: avaxAssetID,
+				},
+				Out: &secp256k1fx.TransferOutput{
+					Amt:          units.Schmeckle,
+					OutputOwners: owner,
+				},
+			},
+		},
+	)
+	if err != nil {
+		w.log.Warn("failed to issue X-chain baseTx",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("issued new X-chain baseTx",
+		zap.Stringer("txID", baseTx.ID()),
+		zap.Duration("duration", time.Since(baseStartTime)),
+	)
+
+	if err := w.confirmXChainTx(ctx, baseTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "X"),
+			zap.String("txType", "base"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyXChainTxConsumedUTXOs(ctx, baseTx)
+}
+
+func (w *workload) issueXChainCreateAssetTx(ctx context.Context) {
+	var (
+		xWallet  = w.wallet.X()
+		xBuilder = xWallet.Builder()
+	)
+	balances, err := xBuilder.GetFTBalance()
+	if err != nil {
+		w.log.Error("failed to fetch X-chain balances",
+			zap.Error(err),
+		)
+		assert.Unreachable("failed to fetch X-chain balances", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return
+	}
+
+	var (
+		xContext      = xBuilder.Context()
+		avaxAssetID   = xContext.AVAXAssetID
+		avaxBalance   = balances[avaxAssetID]
+		neededBalance = xContext.CreateAssetTxFee
+	)
+	if avaxBalance < neededBalance {
+		w.log.Info("skipping X-chain tx issuance due to insufficient balance",
+			zap.Uint64("balance", avaxBalance),
+			zap.Uint64("neededBalance", neededBalance),
+		)
+		return
+	}
+
+	var (
+		owner                = w.makeOwner()
+		createAssetStartTime = time.Now()
+	)
+	createAssetTx, err := xWallet.IssueCreateAssetTx(
+		"HI",
+		"HI",
+		1,
+		map[uint32][]verify.State{
+			0: {
+				&secp256k1fx.TransferOutput{
+					Amt:          units.Schmeckle,
+					OutputOwners: owner,
+				},
+			},
+		},
+	)
+	if err != nil {
+		w.log.Warn("failed to issue X-chain create asset transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("created new X-chain asset",
+		zap.Stringer("txID", createAssetTx.ID()),
+		zap.Duration("duration", time.Since(createAssetStartTime)),
+	)
+
+	if err := w.confirmXChainTx(ctx, createAssetTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "X"),
+			zap.String("txType", "createAsset"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyXChainTxConsumedUTXOs(ctx, createAssetTx)
+}
+
+func (w *workload) issueXChainOperationTx(ctx context.Context) {
+	var (
+		xWallet  = w.wallet.X()
+		xBuilder = xWallet.Builder()
+	)
+	balances, err := xBuilder.GetFTBalance()
+	if err != nil {
+		w.log.Error("failed to fetch X-chain balances",
+			zap.Error(err),
+		)
+		assert.Unreachable("failed to fetch X-chain balances", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return
+	}
+
+	var (
+		xContext         = xBuilder.Context()
+		avaxAssetID      = xContext.AVAXAssetID
+		avaxBalance      = balances[avaxAssetID]
+		createAssetTxFee = xContext.CreateAssetTxFee
+		baseTxFee        = xContext.BaseTxFee
+		neededBalance    = createAssetTxFee + baseTxFee
+	)
+	if avaxBalance < neededBalance {
+		w.log.Info("skipping X-chain tx issuance due to insufficient balance",
+			zap.Uint64("balance", avaxBalance),
+			zap.Uint64("neededBalance", neededBalance),
+		)
+		return
+	}
+
+	var (
+		owner                = w.makeOwner()
+		createAssetStartTime = time.Now()
+	)
+	createAssetTx, err := xWallet.IssueCreateAssetTx(
+		"HI",
+		"HI",
+		1,
+		map[uint32][]verify.State{
+			2: {
+				&propertyfx.MintOutput{
+					OutputOwners: owner,
+				},
+			},
+		},
+	)
+	if err != nil {
+		w.log.Warn("failed to issue X-chain create asset transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("created new X-chain asset",
+		zap.Stringer("txID", createAssetTx.ID()),
+		zap.Duration("duration", time.Since(createAssetStartTime)),
+	)
+
+	operationStartTime := time.Now()
+	operationTx, err := xWallet.IssueOperationTxMintProperty(
+		createAssetTx.ID(),
+		&owner,
+	)
+	if err != nil {
+		w.log.Warn("failed to issue X-chain operation transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("issued X-chain operation transaction",
+		zap.Stringer("txID", operationTx.ID()),
+		zap.Duration("duration", time.Since(operationStartTime)),
+	)
+
+	if err := w.confirmXChainTx(ctx, createAssetTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "X"),
+			zap.String("txType", "createAsset"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyXChainTxConsumedUTXOs(ctx, createAssetTx)
+
+	if err := w.confirmXChainTx(ctx, operationTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "X"),
+			zap.String("txType", "operation"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyXChainTxConsumedUTXOs(ctx, operationTx)
+}
+
+func (w *workload) issueXToPTransfer(ctx context.Context) {
+	var (
+		xWallet  = w.wallet.X()
+		pWallet  = w.wallet.P()
+		xBuilder = xWallet.Builder()
+	)
+	balances, err := xBuilder.GetFTBalance()
+	if err != nil {
+		w.log.Error("failed to fetch X-chain balances",
+			zap.Error(err),
+		)
+		assert.Unreachable("failed to fetch X-chain balances", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return
+	}
+
+	var (
+		xContext      = xBuilder.Context()
+		avaxAssetID   = xContext.AVAXAssetID
+		avaxBalance   = balances[avaxAssetID]
+		xBaseTxFee    = xContext.BaseTxFee
+		neededBalance = xBaseTxFee + units.Avax
+	)
+	if avaxBalance < neededBalance {
+		w.log.Info("skipping X-chain tx issuance due to insufficient balance",
+			zap.Uint64("balance", avaxBalance),
+			zap.Uint64("neededBalance", neededBalance),
+		)
+		return
+	}
+
+	var (
+		owner           = w.makeOwner()
+		exportStartTime = time.Now()
+	)
+	exportTx, err := xWallet.IssueExportTx(
+		constants.PlatformChainID,
+		[]*avax.TransferableOutput{{
+			Asset: avax.Asset{
+				ID: avaxAssetID,
+			},
+			Out: &secp256k1fx.TransferOutput{
+				Amt: units.Avax,
+			},
+		}},
+	)
+	if err != nil {
+		w.log.Warn("failed to issue X-chain export transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("created X-chain export transaction",
+		zap.Stringer("txID", exportTx.ID()),
+		zap.Duration("duration", time.Since(exportStartTime)),
+	)
+
+	var (
+		xChainID        = xContext.BlockchainID
+		importStartTime = time.Now()
+	)
+	importTx, err := pWallet.IssueImportTx(
+		xChainID,
+		&owner,
+	)
+	if err != nil {
+		w.log.Warn("failed to issue P-chain import transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("created P-chain import transaction",
+		zap.Stringer("txID", importTx.ID()),
+		zap.Duration("duration", time.Since(importStartTime)),
+	)
+
+	if err := w.confirmXChainTx(ctx, exportTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "X"),
+			zap.String("txType", "export"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyXChainTxConsumedUTXOs(ctx, exportTx)
+
+	if err := w.confirmPChainTx(ctx, importTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "P"),
+			zap.String("txType", "import"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyPChainTxConsumedUTXOs(ctx, importTx)
+}
+
+func (w *workload) issuePToXTransfer(ctx context.Context) {
+	var (
+		xWallet  = w.wallet.X()
+		pWallet  = w.wallet.P()
+		xBuilder = xWallet.Builder()
+		pBuilder = pWallet.Builder()
+	)
+	balances, err := pBuilder.GetBalance()
+	if err != nil {
+		w.log.Error("failed to fetch P-chain balances",
+			zap.Error(err),
+		)
+		assert.Unreachable("failed to fetch P-chain balances", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return
+	}
+
+	var (
+		xContext      = xBuilder.Context()
+		pContext      = pBuilder.Context()
+		avaxAssetID   = pContext.AVAXAssetID
+		avaxBalance   = balances[avaxAssetID]
+		txFees        = xContext.BaseTxFee
+		neededBalance = txFees + units.Schmeckle
+	)
+	if avaxBalance < neededBalance {
+		w.log.Info("skipping P-chain tx issuance due to insufficient balance",
+			zap.Uint64("balance", avaxBalance),
+			zap.Uint64("neededBalance", neededBalance),
+		)
+		return
+	}
+
+	var (
+		xChainID        = xContext.BlockchainID
+		owner           = w.makeOwner()
+		exportStartTime = time.Now()
+	)
+	exportTx, err := pWallet.IssueExportTx(
+		xChainID,
+		[]*avax.TransferableOutput{{
+			Asset: avax.Asset{
+				ID: avaxAssetID,
+			},
+			Out: &secp256k1fx.TransferOutput{
+				Amt: units.Schmeckle,
+			},
+		}},
+	)
+	if err != nil {
+		w.log.Warn("failed to issue P-chain export transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("created P-chain export transaction",
+		zap.Stringer("txID", exportTx.ID()),
+		zap.Duration("duration", time.Since(exportStartTime)),
+	)
+
+	importStartTime := time.Now()
+	importTx, err := xWallet.IssueImportTx(
+		constants.PlatformChainID,
+		&owner,
+	)
+	if err != nil {
+		w.log.Warn("failed to issue X-chain import transaction",
+			zap.Error(err),
+		)
+		return
+	}
+	w.log.Info("created X-chain import transaction",
+		zap.Stringer("txID", importTx.ID()),
+		zap.Duration("duration", time.Since(importStartTime)),
+	)
+
+	if err := w.confirmPChainTx(ctx, exportTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "P"),
+			zap.String("txType", "export"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyPChainTxConsumedUTXOs(ctx, exportTx)
+
+	if err := w.confirmXChainTx(ctx, importTx); err != nil {
+		w.log.Warn("failed to confirm transaction",
+			zap.String("chain", "X"),
+			zap.String("txType", "import"),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.verifyXChainTxConsumedUTXOs(ctx, importTx)
+}
+
+func (w *workload) makeOwner() secp256k1fx.OutputOwners {
+	addr, _ := w.addrs.Peek()
+	return secp256k1fx.OutputOwners{
+		Threshold: 1,
+		Addrs: []ids.ShortID{
+			addr,
+		},
+	}
+}
+
+func (w *workload) confirmXChainTx(ctx context.Context, tx *xtxs.Tx) error {
+	ctx, cancel := context.WithTimeout(ctx, txConfirmationTimeout)
+	defer cancel()
+
+	txID := tx.ID()
+	for _, uri := range w.uris {
+		client := avm.NewClient(uri, "X")
+		if err := client.AwaitTxAccepted(ctx, txID, 100*time.Millisecond); err != nil {
+			return fmt.Errorf("failed to confirm X-chain transaction %s on %s: %w", txID, uri, err)
+		}
+		w.log.Info("confirmed X-chain transaction",
+			zap.Stringer("txID", txID),
+			zap.String("uri", uri),
+		)
+	}
+	w.log.Info("confirmed X-chain transaction",
+		zap.Stringer("txID", txID),
+	)
+	return nil
+}
+
+func (w *workload) confirmPChainTx(ctx context.Context, tx *platform.Tx) error {
+	ctx, cancel := context.WithTimeout(ctx, txConfirmationTimeout)
+	defer cancel()
+
+	txID := tx.ID()
+	for _, uri := range w.uris {
+		client := platformvm.NewClient(uri)
+		if err := client.AwaitTxAccepted(ctx, txID, 100*time.Millisecond); err != nil {
+			return fmt.Errorf("failed to confirm P-chain transaction %s on %s: %w", txID, uri, err)
+		}
+		w.log.Info("confirmed P-chain transaction",
+			zap.Stringer("txID", txID),
+			zap.String("uri", uri),
+		)
+	}
+	w.log.Info("confirmed P-chain transaction",
+		zap.Stringer("txID", txID),
+	)
+	return nil
+}
+
+func (w *workload) verifyXChainTxConsumedUTXOs(ctx context.Context, tx *xtxs.Tx) {
+	txID := tx.ID()
+	chainID := w.wallet.X().Builder().Context().BlockchainID
+	for _, uri := range w.uris {
+		client := avm.NewClient(uri, "X")
+
+		utxos := common.NewUTXOs()
+		err := primary.AddAllUTXOs(
+			ctx,
+			utxos,
+			client,
+			xbuilder.Parser.Codec(),
+			chainID,
+			chainID,
+			w.addrs.List(),
+		)
+		if err != nil {
+			w.log.Warn("failed to fetch X-chain UTXOs",
+				zap.String("uri", uri),
+				zap.Error(err),
+			)
+			return
+		}
+
+		inputs := tx.Unsigned.InputIDs()
+		for input := range inputs {
+			_, err := utxos.GetUTXO(ctx, chainID, chainID, input)
+			if err != database.ErrNotFound {
+				w.log.Error("failed to verify that X-chain UTXO was deleted",
+					zap.String("uri", uri),
+					zap.Stringer("txID", txID),
+					zap.Stringer("utxoID", input),
+					zap.Error(err),
+				)
+				assert.Unreachable("failed to verify that X-chain UTXO was deleted", map[string]any{
+					"worker": w.id,
+					"uri":    uri,
+					"txID":   txID,
+					"utxoID": input,
+					"err":    err,
+				})
+				return
+			}
+		}
+		w.log.Info("confirmed all X-chain UTXOs consumed by tx are not present on node",
+			zap.Stringer("txID", txID),
+			zap.String("uri", uri),
+		)
+	}
+	w.log.Info("confirmed all X-chain UTXOs consumed by tx are not present on all nodes",
+		zap.Stringer("txID", txID),
+	)
+}
+
+func (w *workload) verifyPChainTxConsumedUTXOs(ctx context.Context, tx *platform.Tx) {
+	txID := tx.ID()
+	for _, uri := range w.uris {
+		client := platformvm.NewClient(uri)
+
+		utxos := common.NewUTXOs()
+		err := primary.AddAllUTXOs(
+			ctx,
+			utxos,
+			client,
+			platform.Codec,
+			constants.PlatformChainID,
+			constants.PlatformChainID,
+			w.addrs.List(),
+		)
+		if err != nil {
+			w.log.Warn("failed to fetch P-chain UTXOs",
+				zap.String("uri", uri),
+				zap.Error(err),
+			)
+			return
+		}
+
+		inputs := tx.Unsigned.InputIDs()
+		for input := range inputs {
+			_, err := utxos.GetUTXO(ctx, constants.PlatformChainID, constants.PlatformChainID, input)
+			if err != database.ErrNotFound {
+				w.log.Error("failed to verify that P-chain UTXO was deleted",
+					zap.String("uri", uri),
+					zap.Stringer("txID", txID),
+					zap.Stringer("utxoID", input),
+					zap.Error(err),
+				)
+				assert.Unreachable("failed to verify that P-chain UTXO was deleted", map[string]any{
+					"worker": w.id,
+					"uri":    uri,
+					"txID":   txID,
+					"utxoID": input,
+					"err":    err,
+				})
+				return
+			}
+		}
+		w.log.Info("confirmed all P-chain UTXOs consumed by tx are not present on node",
+			zap.Stringer("txID", txID),
+			zap.String("uri", uri),
+		)
+	}
+	w.log.Info("confirmed all P-chain UTXOs consumed by tx are not present on all nodes",
+		zap.Stringer("txID", txID),
+	)
+}
+
+func (w *workload) issueCChainTransfer(ctx context.Context) {
+	uri := w.uris[w.id%len(w.uris)]
+	client, err := w.cChainClient(uri)
+	if err != nil {
+		w.log.Error("failed to get C-Chain RPC client", zap.String("uri", uri), zap.Error(err))
+		return
+	}
+
+	tx, err := w.sendCChainTx(ctx, client, crypto.PubkeyToAddress(w.cChainKey.PublicKey), big.NewInt(cChainTransferAmount))
+	if err != nil {
+		w.log.Warn("failed to send C-Chain transfer", zap.Error(err))
+		return
+	}
+
+	startTime := time.Now()
+	w.log.Info("issued C-Chain transfer",
+		zap.Stringer("txID", tx.Hash()),
+		zap.Uint64("nonce", tx.Nonce()),
+	)
+
+	if err := w.confirmCChainTx(ctx, tx); err != nil {
+		w.log.Warn("failed to confirm C-Chain transaction",
+			zap.Stringer("txID", tx.Hash()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	w.log.Info("accepted C-Chain transaction",
+		zap.Stringer("txID", tx.Hash()),
+		zap.Duration("duration", time.Since(startTime)),
+	)
+}
+
+func (w *workload) confirmCChainTx(ctx context.Context, tx *types.Transaction) error {
+	ctx, cancel := context.WithTimeout(ctx, txConfirmationTimeout)
+	defer cancel()
+
+	txHash := tx.Hash()
+	for _, uri := range w.uris {
+		client, err := w.cChainClient(uri)
+		if err != nil {
+			return fmt.Errorf("failed to get C-Chain RPC client for %s: %w", uri, err)
+		}
+
+		receipt, err := e2e.AwaitEthReceipt(ctx, client, tx)
+		if err != nil {
+			return fmt.Errorf("awaiting tx %s on %s: %w", txHash, uri, err)
+		}
+
+		if receipt.Status != types.ReceiptStatusSuccessful {
+			// A failed receipt should be unreachable for this workload. These are
+			// funded EOA self-transfers with the accepted nonce, no calldata, and
+			// the intrinsic transfer gas limit, so once included they have no
+			// contract/revert path and are expected to succeed.
+			assert.Unreachable("C-Chain transaction failed", map[string]any{
+				"worker": w.id,
+				"uri":    uri,
+				"txID":   txHash,
+				"status": receipt.Status,
+			})
+			return fmt.Errorf("tx %s failed on %s with status %d", txHash, uri, receipt.Status)
+		}
+
+		w.log.Info("confirmed C-Chain transaction",
+			zap.Stringer("txID", txHash),
+			zap.String("uri", uri),
+		)
+	}
+
+	w.log.Info("confirmed C-Chain transaction on all nodes",
+		zap.Stringer("txID", txHash),
+	)
+	assert.Reachable("confirmed C-Chain transaction on all nodes", map[string]any{
+		"worker": w.id,
+		"txID":   txHash,
+	})
+	return nil
+}
+
+func (w *workload) sendCChainTx(ctx context.Context, client *ethclient.Client, to ethcommon.Address, value *big.Int) (*types.Transaction, error) {
+	senderAddr := crypto.PubkeyToAddress(w.cChainKey.PublicKey)
+
+	if w.cChainID == nil {
+		err := errors.New("missing C-Chain chain ID")
+		assert.Unreachable("missing C-Chain chain ID", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return nil, err
+	}
+	nonce, err := client.NonceAt(ctx, senderAddr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch nonce: %w", err)
+	}
+	gasTipCap, err := client.SuggestGasTipCap(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch suggested gas tip: %w", err)
+	}
+	gasPrice, err := client.SuggestGasPrice(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch suggested gas price: %w", err)
+	}
+	// Double the suggested price to absorb base fee increases before inclusion.
+	gasFeeCap := new(big.Int).Mul(gasPrice, big.NewInt(2))
+
+	chainID := new(big.Int).Set(w.cChainID)
+	signer := types.LatestSignerForChainID(chainID)
+	tx, err := types.SignNewTx(w.cChainKey, signer, &types.DynamicFeeTx{
+		ChainID:   chainID,
+		Nonce:     nonce,
+		GasTipCap: gasTipCap,
+		GasFeeCap: gasFeeCap,
+		Gas:       params.TxGas,
+		To:        &to,
+		Value:     value,
+	})
+	if err != nil {
+		assert.Unreachable("failed to sign C-Chain transaction", map[string]any{
+			"worker": w.id,
+			"err":    err,
+		})
+		return nil, fmt.Errorf("failed to sign transaction: %w", err)
+	}
+
+	if err := client.SendTransaction(ctx, tx); err != nil {
+		return nil, fmt.Errorf("failed to send transaction: %w", err)
+	}
+	return tx, nil
+}
+
+func (w *workload) fundCChainAddress(ctx context.Context, recipientAddr ethcommon.Address, amount uint64) error {
+	uri := w.uris[0]
+	client, err := w.cChainClient(uri)
+	if err != nil {
+		return fmt.Errorf("failed to get C-Chain RPC client for %s: %w", uri, err)
+	}
+
+	tx, err := w.sendCChainTx(ctx, client, recipientAddr, new(big.Int).SetUint64(amount))
+	if err != nil {
+		return fmt.Errorf("failed to send funding tx: %w", err)
+	}
+
+	w.log.Info("sent C-Chain funding transaction",
+		zap.Stringer("txID", tx.Hash()),
+		zap.Uint64("nonce", tx.Nonce()),
+	)
+
+	if err := w.confirmCChainTx(ctx, tx); err != nil {
+		return fmt.Errorf("failed to confirm funding tx: %w", err)
+	}
+	w.log.Info("confirmed C-Chain funding transaction",
+		zap.Stringer("txID", tx.Hash()),
+	)
+	return nil
+}

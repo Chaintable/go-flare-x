@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package proposervm
@@ -11,10 +11,13 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
-	"github.com/ava-labs/avalanchego/snow/choices"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
+	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/vms/proposervm/acp181"
 	"github.com/ava-labs/avalanchego/vms/proposervm/block"
 	"github.com/ava-labs/avalanchego/vms/proposervm/proposer"
 
@@ -23,7 +26,8 @@ import (
 
 const (
 	// allowable block issuance in the future
-	maxSkew = 10 * time.Second
+	maxSkew                         = 10 * time.Second
+	bootstrappingWarningGracePeriod = 5 * time.Minute
 )
 
 var (
@@ -34,10 +38,13 @@ var (
 	errPChainHeightNotMonotonic = errors.New("non monotonically increasing P-chain height")
 	errPChainHeightNotReached   = errors.New("block P-chain height larger than current P-chain height")
 	errTimeTooAdvanced          = errors.New("time is too far advanced")
+	errEpochMismatch            = errors.New("epoch mismatch")
 	errProposerWindowNotStarted = errors.New("proposer window hasn't started")
 	errUnexpectedProposer       = errors.New("unexpected proposer for current window")
+	errProposerMismatch         = errors.New("proposer mismatch")
 	errProposersNotActivated    = errors.New("proposers haven't been activated yet")
 	errPChainHeightTooLow       = errors.New("block P-chain height is too low")
+	errEpochNotZero             = errors.New("epoch must not be provided prior to granite")
 )
 
 type Block interface {
@@ -59,12 +66,13 @@ type Block interface {
 	buildChild(context.Context) (Block, error)
 
 	pChainHeight(context.Context) (uint64, error)
+	pChainEpoch(context.Context) (block.Epoch, error)
+	selectChildPChainHeight(context.Context) (uint64, error)
 }
 
 type PostForkBlock interface {
 	Block
 
-	setStatus(choices.Status)
 	getStatelessBlk() block.Block
 	setInnerBlk(snowman.Block)
 }
@@ -73,7 +81,6 @@ type PostForkBlock interface {
 type postForkCommonComponents struct {
 	vm       *VM
 	innerBlk snowman.Block
-	status   choices.Status
 }
 
 // Return the inner block's height
@@ -91,10 +98,12 @@ func (p *postForkCommonComponents) Height() uint64 {
 // 7) [child]'s timestamp is within its proposer's window
 // 8) [child] has a valid signature from its proposer
 // 9) [child]'s inner block is valid
+// 10) [child] has the expected epoch
 func (p *postForkCommonComponents) Verify(
 	ctx context.Context,
 	parentTimestamp time.Time,
 	parentPChainHeight uint64,
+	parentEpoch block.Epoch,
 	child *postForkBlock,
 ) error {
 	if err := verifyIsNotOracleBlock(ctx, p.innerBlk); err != nil {
@@ -122,15 +131,22 @@ func (p *postForkCommonComponents) Verify(
 		return errTimeTooAdvanced
 	}
 
-	// If the node is currently syncing - we don't assume that the P-chain has
-	// been synced up to this point yet.
+	childEpoch := child.PChainEpoch()
 	if p.vm.consensusState == snow.NormalOp {
+		// Some L1s that missed the Granite upgrade accepted blocks without
+		// epochs enabled. By enforcing this check only after syncing, new nodes
+		// are able to join the network.
+		if expected := acp181.NewEpoch(p.vm.Upgrades, parentPChainHeight, parentEpoch, parentTimestamp, childTimestamp); childEpoch != expected {
+			return fmt.Errorf("%w: epoch %v != expected %v", errEpochMismatch, childEpoch, expected)
+		}
+
+		// If the node is currently syncing - we don't assume that the P-chain
+		// has been synced up to this point yet.
 		currentPChainHeight, err := p.vm.ctx.ValidatorState.GetCurrentHeight(ctx)
 		if err != nil {
-			p.vm.ctx.Log.Error("block verification failed",
+			logUnexpectedPChainError(p.vm.ctx.Log, err, "block verification failed",
 				zap.String("reason", "failed to get current P-Chain height"),
 				zap.Stringer("blkID", child.ID()),
-				zap.Error(err),
 			)
 			return err
 		}
@@ -143,7 +159,7 @@ func (p *postForkCommonComponents) Verify(
 		}
 
 		var shouldHaveProposer bool
-		if p.vm.IsDurangoActivated(parentTimestamp) {
+		if p.vm.Upgrades.IsDurangoActivated(parentTimestamp) {
 			shouldHaveProposer, err = p.verifyPostDurangoBlockDelay(ctx, parentTimestamp, parentPChainHeight, child)
 		} else {
 			shouldHaveProposer, err = p.verifyPreDurangoBlockDelay(ctx, parentTimestamp, parentPChainHeight, child)
@@ -152,22 +168,36 @@ func (p *postForkCommonComponents) Verify(
 			return err
 		}
 
-		// Verify the signature of the node
-		if err := child.SignedBlock.Verify(shouldHaveProposer, p.vm.ctx.ChainID); err != nil {
-			return err
+		hasProposer := child.SignedBlock.Proposer() != ids.EmptyNodeID
+		if shouldHaveProposer != hasProposer {
+			return fmt.Errorf("%w: shouldHaveProposer (%v) != hasProposer (%v)", errProposerMismatch, shouldHaveProposer, hasProposer)
 		}
 
 		p.vm.ctx.Log.Debug("verified post-fork block",
 			zap.Stringer("blkID", child.ID()),
 			zap.Time("parentTimestamp", parentTimestamp),
 			zap.Time("blockTimestamp", childTimestamp),
+			zap.Uint64("pChainHeight", childPChainHeight),
+			zap.Reflect("epoch", childEpoch),
 		)
+	}
+
+	var contextPChainHeight uint64
+	switch {
+	case p.vm.Upgrades.IsGraniteActivated(childTimestamp):
+		contextPChainHeight = childEpoch.PChainHeight
+	case p.vm.Upgrades.IsEtnaActivated(childTimestamp):
+		contextPChainHeight = childPChainHeight
+	default:
+		contextPChainHeight = parentPChainHeight
 	}
 
 	return p.vm.verifyAndRecordInnerBlk(
 		ctx,
 		&smblock.Context{
-			PChainHeight: parentPChainHeight,
+			PChainHeight: contextPChainHeight,
+			// Flare: the outer block's own P-chain height, verified above.
+			ProposerPChainHeight: childPChainHeight,
 		},
 		child,
 	)
@@ -179,6 +209,7 @@ func (p *postForkCommonComponents) buildChild(
 	parentID ids.ID,
 	parentTimestamp time.Time,
 	parentPChainHeight uint64,
+	parentEpoch block.Epoch,
 ) (Block, error) {
 	// Child's timestamp is the later of now and this block's timestamp
 	newTimestamp := p.vm.Time().Truncate(time.Second)
@@ -188,18 +219,17 @@ func (p *postForkCommonComponents) buildChild(
 
 	// The child's P-Chain height is proposed as the optimal P-Chain height that
 	// is at least the parent's P-Chain height
-	pChainHeight, err := p.vm.optimalPChainHeight(ctx, parentPChainHeight)
+	pChainHeight, err := p.vm.selectChildPChainHeight(ctx, parentPChainHeight)
 	if err != nil {
-		p.vm.ctx.Log.Error("unexpected build block failure",
+		logUnexpectedPChainError(p.vm.ctx.Log, err, "unexpected build block failure",
 			zap.String("reason", "failed to calculate optimal P-chain height"),
 			zap.Stringer("parentID", parentID),
-			zap.Error(err),
 		)
 		return nil, err
 	}
 
 	var shouldBuildSignedBlock bool
-	if p.vm.IsDurangoActivated(parentTimestamp) {
+	if p.vm.Upgrades.IsDurangoActivated(parentTimestamp) {
 		shouldBuildSignedBlock, err = p.shouldBuildSignedBlockPostDurango(
 			ctx,
 			parentID,
@@ -220,10 +250,24 @@ func (p *postForkCommonComponents) buildChild(
 		return nil, err
 	}
 
+	epoch := acp181.NewEpoch(p.vm.Upgrades, parentPChainHeight, parentEpoch, parentTimestamp, newTimestamp)
+
+	var contextPChainHeight uint64
+	switch {
+	case p.vm.Upgrades.IsGraniteActivated(newTimestamp):
+		contextPChainHeight = epoch.PChainHeight
+	case p.vm.Upgrades.IsEtnaActivated(newTimestamp):
+		contextPChainHeight = pChainHeight
+	default:
+		contextPChainHeight = parentPChainHeight
+	}
+
 	var innerBlock snowman.Block
 	if p.vm.blockBuilderVM != nil {
 		innerBlock, err = p.vm.blockBuilderVM.BuildBlockWithContext(ctx, &smblock.Context{
-			PChainHeight: parentPChainHeight,
+			PChainHeight: contextPChainHeight,
+			// Flare: the P-chain height sealed into this outer block.
+			ProposerPChainHeight: pChainHeight,
 		})
 	} else {
 		innerBlock, err = p.vm.ChainVM.BuildBlock(ctx)
@@ -239,6 +283,7 @@ func (p *postForkCommonComponents) buildChild(
 			parentID,
 			newTimestamp,
 			pChainHeight,
+			epoch,
 			p.vm.StakingCertLeaf,
 			innerBlock.Bytes(),
 			p.vm.ctx.ChainID,
@@ -249,6 +294,7 @@ func (p *postForkCommonComponents) buildChild(
 			parentID,
 			newTimestamp,
 			pChainHeight,
+			epoch,
 			innerBlock.Bytes(),
 		)
 	}
@@ -267,7 +313,6 @@ func (p *postForkCommonComponents) buildChild(
 		postForkCommonComponents: postForkCommonComponents{
 			vm:       p.vm,
 			innerBlk: innerBlock,
-			status:   choices.Processing,
 		},
 	}
 
@@ -275,8 +320,10 @@ func (p *postForkCommonComponents) buildChild(
 		zap.Stringer("blkID", child.ID()),
 		zap.Stringer("innerBlkID", innerBlock.ID()),
 		zap.Uint64("height", child.Height()),
+		zap.Uint64("pChainHeight", pChainHeight),
 		zap.Time("parentTimestamp", parentTimestamp),
 		zap.Time("blockTimestamp", newTimestamp),
+		zap.Reflect("epoch", epoch),
 	)
 	return child, nil
 }
@@ -367,7 +414,10 @@ func (p *postForkCommonComponents) verifyPostDurangoBlockDelay(
 		currentSlot  = proposer.TimeToSlot(parentTimestamp, blkTimestamp)
 		proposerID   = blk.Proposer()
 	)
+	// populate the slot for the block.
+	blk.slot = &currentSlot
 
+	// find the expected proposer
 	expectedProposerID, err := p.vm.Windower.ExpectedProposer(
 		ctx,
 		blkHeight,
@@ -378,10 +428,9 @@ func (p *postForkCommonComponents) verifyPostDurangoBlockDelay(
 	case errors.Is(err, proposer.ErrAnyoneCanPropose):
 		return false, nil // block should be unsigned
 	case err != nil:
-		p.vm.ctx.Log.Error("unexpected block verification failure",
+		logUnexpectedPChainError(p.vm.ctx.Log, err, "unexpected block verification failure",
 			zap.String("reason", "failed to calculate expected proposer"),
 			zap.Stringer("blkID", blk.ID()),
-			zap.Error(err),
 		)
 		return false, err
 	case expectedProposerID == proposerID:
@@ -409,11 +458,18 @@ func (p *postForkCommonComponents) shouldBuildSignedBlockPostDurango(
 	switch {
 	case errors.Is(err, proposer.ErrAnyoneCanPropose):
 		return false, nil // build an unsigned block
-	case err != nil:
-		p.vm.ctx.Log.Error("unexpected build block failure",
+	case errors.Is(err, validators.ErrUnfinalizedHeight):
+		p.logWarnOrError()("build block failed, validator set not yet finalized",
 			zap.String("reason", "failed to calculate expected proposer"),
+			zap.Uint64("parentPChainHeight", parentPChainHeight),
 			zap.Stringer("parentID", parentID),
 			zap.Error(err),
+		)
+		return false, err
+	case err != nil:
+		logUnexpectedPChainError(p.vm.ctx.Log, err, "unexpected build block failure",
+			zap.String("reason", "failed to calculate expected proposer"),
+			zap.Stringer("parentID", parentID),
 		)
 		return false, err
 	case expectedProposerID == p.vm.ctx.NodeID:
@@ -429,32 +485,6 @@ func (p *postForkCommonComponents) shouldBuildSignedBlockPostDurango(
 		zap.Uint64("slot", currentSlot),
 		zap.Stringer("expectedProposer", expectedProposerID),
 	)
-
-	// We need to reschedule the block builder to the next time we can try to
-	// build a block.
-	//
-	// TODO: After Durango activates, restructure this logic to separate
-	// updating the scheduler from verifying the proposerID.
-	nextStartTime, err := p.vm.getPostDurangoSlotTime(
-		ctx,
-		parentHeight+1,
-		parentPChainHeight,
-		currentSlot+1, // We know we aren't the proposer for the current slot
-		parentTimestamp,
-	)
-	if err != nil {
-		p.vm.ctx.Log.Error("failed to reset block builder scheduler",
-			zap.String("reason", "failed to calculate expected proposer"),
-			zap.Stringer("parentID", parentID),
-			zap.Error(err),
-		)
-		return false, err
-	}
-	p.vm.Scheduler.SetBuildBlockTime(nextStartTime)
-
-	// In case the inner VM only issued one pendingTxs message, we should
-	// attempt to re-handle that once it is our turn to build the block.
-	p.vm.notifyInnerBlockReady()
 	return false, fmt.Errorf("%w: slot %d expects %s", errUnexpectedProposer, currentSlot, expectedProposerID)
 }
 
@@ -496,9 +526,31 @@ func (p *postForkCommonComponents) shouldBuildSignedBlockPreDurango(
 		zap.Duration("minDelay", minDelay),
 		zap.Time("blockTimestamp", newTimestamp),
 	)
-
-	// In case the inner VM only issued one pendingTxs message, we should
-	// attempt to re-handle that once it is our turn to build the block.
-	p.vm.notifyInnerBlockReady()
 	return false, fmt.Errorf("%w: delay %s < minDelay %s", errProposerWindowNotStarted, delay, minDelay)
+}
+
+func (p *postForkCommonComponents) logWarnOrError() func(msg string, fields ...zap.Field) {
+	timeSinceBootstrapping := p.vm.Clock.Time().Sub(p.vm.finishedBootstrappingAt)
+	if p.vm.finishedBootstrappingAt.IsZero() || timeSinceBootstrapping < bootstrappingWarningGracePeriod {
+		return p.vm.ctx.Log.Warn
+	}
+	return p.vm.ctx.Log.Error
+}
+
+// logUnexpectedPChainError logs an unexpected P-chain failure: Warn when err
+// wraps database.ErrClosed, Error otherwise.
+//
+// ErrClosed is expected during VM shutdown because the P-chain can stop and
+// close its DB before chains that consult it finish stopping. Logging at Warn
+// avoids noise in that normal path. If ErrClosed happens during normal
+// operation, the failure will still be surfaced elsewhere.
+func logUnexpectedPChainError(log logging.Logger, err error, msg string, fields ...zap.Field) {
+	// Caller skip so the caller field points at the call site, not here.
+	log = log.WithOptions(zap.AddCallerSkip(1))
+	fields = append(fields, zap.Error(err))
+	if errors.Is(err, database.ErrClosed) {
+		log.Warn(msg, fields...)
+		return
+	}
+	log.Error(msg, fields...)
 }

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package common
@@ -11,7 +11,7 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/message"
-	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/proto/pb/p2p"
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/version"
@@ -28,6 +28,7 @@ var (
 	_ ChitsHandler                = (*noOpChitsHandler)(nil)
 	_ AppHandler                  = (*noOpAppHandler)(nil)
 	_ InternalHandler             = (*noOpInternalHandler)(nil)
+	_ SimplexHandler              = (*noOpSimplexHandler)(nil)
 )
 
 type noOpStateSummaryFrontierHandler struct {
@@ -180,21 +181,12 @@ func NewNoOpPutHandler(log logging.Logger) PutHandler {
 }
 
 func (nop *noOpPutHandler) Put(_ context.Context, nodeID ids.NodeID, requestID uint32, _ []byte) error {
-	if requestID == constants.GossipMsgRequestID {
-		nop.log.Verbo("dropping request",
-			zap.String("reason", "unhandled by this gear"),
-			zap.Stringer("messageOp", message.PutOp),
-			zap.Stringer("nodeID", nodeID),
-			zap.Uint32("requestID", requestID),
-		)
-	} else {
-		nop.log.Debug("dropping request",
-			zap.String("reason", "unhandled by this gear"),
-			zap.Stringer("messageOp", message.PutOp),
-			zap.Stringer("nodeID", nodeID),
-			zap.Uint32("requestID", requestID),
-		)
-	}
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.PutOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+	)
 	return nil
 }
 
@@ -247,7 +239,7 @@ func NewNoOpChitsHandler(log logging.Logger) ChitsHandler {
 	return &noOpChitsHandler{log: log}
 }
 
-func (nop *noOpChitsHandler) Chits(_ context.Context, nodeID ids.NodeID, requestID uint32, preferredID, preferredIDAtHeight, acceptedID ids.ID) error {
+func (nop *noOpChitsHandler) Chits(_ context.Context, nodeID ids.NodeID, requestID uint32, preferredID, preferredIDAtHeight, acceptedID ids.ID, acceptedHeight uint64) error {
 	nop.log.Debug("dropping request",
 		zap.String("reason", "unhandled by this gear"),
 		zap.Stringer("messageOp", message.ChitsOp),
@@ -256,6 +248,7 @@ func (nop *noOpChitsHandler) Chits(_ context.Context, nodeID ids.NodeID, request
 		zap.Stringer("preferredID", preferredID),
 		zap.Stringer("preferredIDAtHeight", preferredIDAtHeight),
 		zap.Stringer("acceptedID", acceptedID),
+		zap.Uint64("acceptedHeight", acceptedHeight),
 	)
 	return nil
 }
@@ -276,37 +269,6 @@ type noOpAppHandler struct {
 
 func NewNoOpAppHandler(log logging.Logger) AppHandler {
 	return &noOpAppHandler{log: log}
-}
-
-func (nop *noOpAppHandler) CrossChainAppRequest(_ context.Context, chainID ids.ID, requestID uint32, _ time.Time, _ []byte) error {
-	nop.log.Debug("dropping request",
-		zap.String("reason", "unhandled by this gear"),
-		zap.Stringer("messageOp", message.CrossChainAppRequestOp),
-		zap.Stringer("chainID", chainID),
-		zap.Uint32("requestID", requestID),
-	)
-	return nil
-}
-
-func (nop *noOpAppHandler) CrossChainAppRequestFailed(_ context.Context, chainID ids.ID, requestID uint32, appErr *AppError) error {
-	nop.log.Debug("dropping request",
-		zap.String("reason", "unhandled by this gear"),
-		zap.Stringer("messageOp", message.CrossChainAppErrorOp),
-		zap.Stringer("chainID", chainID),
-		zap.Uint32("requestID", requestID),
-		zap.Error(appErr),
-	)
-	return nil
-}
-
-func (nop *noOpAppHandler) CrossChainAppResponse(_ context.Context, chainID ids.ID, requestID uint32, _ []byte) error {
-	nop.log.Debug("dropping request",
-		zap.String("reason", "unhandled by this gear"),
-		zap.Stringer("messageOp", message.CrossChainAppResponseOp),
-		zap.Stringer("chainID", chainID),
-		zap.Uint32("requestID", requestID),
-	)
-	return nil
 }
 
 func (nop *noOpAppHandler) AppRequest(_ context.Context, nodeID ids.NodeID, requestID uint32, _ time.Time, _ []byte) error {
@@ -380,27 +342,12 @@ func (nop *noOpInternalHandler) Disconnected(_ context.Context, nodeID ids.NodeI
 	return nil
 }
 
-func (nop *noOpInternalHandler) Timeout(context.Context) error {
-	nop.log.Debug("dropping request",
-		zap.String("reason", "unhandled by this gear"),
-		zap.Stringer("messageOp", message.TimeoutOp),
-	)
-	return nil
-}
-
 func (nop *noOpInternalHandler) Gossip(context.Context) error {
 	nop.log.Debug("dropping request",
 		zap.String("reason", "unhandled by this gear"),
 		zap.Stringer("messageOp", message.GossipRequestOp),
 	)
 	return nil
-}
-
-func (nop *noOpInternalHandler) Halt(context.Context) {
-	nop.log.Debug("dropping request",
-		zap.String("reason", "unhandled by this gear"),
-		zap.String("messageOp", "halt"),
-	)
 }
 
 func (nop *noOpInternalHandler) Shutdown(context.Context) error {
@@ -416,6 +363,95 @@ func (nop *noOpInternalHandler) Notify(_ context.Context, msg Message) error {
 		zap.String("reason", "unhandled by this gear"),
 		zap.Stringer("messageOp", message.NotifyOp),
 		zap.Stringer("message", msg),
+	)
+	return nil
+}
+
+type noOpSimplexHandler struct {
+	log logging.Logger
+}
+
+func NewNoOpSimplexHandler(log logging.Logger) SimplexHandler {
+	return &noOpSimplexHandler{log: log}
+}
+
+func (nop *noOpSimplexHandler) Simplex(_ context.Context, nodeID ids.NodeID, _ *p2p.Simplex) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.SimplexOp),
+		zap.Stringer("nodeID", nodeID),
+	)
+	return nil
+}
+
+var _ AllGetsServer = (*noOpAllGetsServer)(nil)
+
+type noOpAllGetsServer struct {
+	log logging.Logger
+}
+
+func NewNoOpAllGetsServer(log logging.Logger) AllGetsServer {
+	return &noOpAllGetsServer{log: log}
+}
+
+func (nop *noOpAllGetsServer) GetStateSummaryFrontier(_ context.Context, nodeID ids.NodeID, requestID uint32) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.GetStateSummaryFrontierOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+	)
+	return nil
+}
+
+func (nop *noOpAllGetsServer) GetAcceptedStateSummary(_ context.Context, nodeID ids.NodeID, requestID uint32, _ set.Set[uint64]) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.GetAcceptedStateSummaryOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+	)
+	return nil
+}
+
+func (nop *noOpAllGetsServer) GetAcceptedFrontier(_ context.Context, nodeID ids.NodeID, requestID uint32) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.GetAcceptedFrontierOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+	)
+	return nil
+}
+
+func (nop *noOpAllGetsServer) GetAccepted(_ context.Context, nodeID ids.NodeID, requestID uint32, _ set.Set[ids.ID]) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.GetAcceptedOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+	)
+	return nil
+}
+
+func (nop *noOpAllGetsServer) GetAncestors(_ context.Context, nodeID ids.NodeID, requestID uint32, containerID ids.ID) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.GetAncestorsOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+		zap.Stringer("containerID", containerID),
+	)
+	return nil
+}
+
+func (nop *noOpAllGetsServer) Get(_ context.Context, nodeID ids.NodeID, requestID uint32, containerID ids.ID) error {
+	nop.log.Debug("dropping request",
+		zap.String("reason", "unhandled by this gear"),
+		zap.Stringer("messageOp", message.GetOp),
+		zap.Stringer("nodeID", nodeID),
+		zap.Uint32("requestID", requestID),
+		zap.Stringer("containerID", containerID),
 	)
 	return nil
 }

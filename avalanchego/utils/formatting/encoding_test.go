@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package formatting
@@ -17,7 +17,7 @@ func TestEncodingMarshalJSON(t *testing.T) {
 	enc := Hex
 	jsonBytes, err := enc.MarshalJSON()
 	require.NoError(err)
-	require.Equal(`"hex"`, string(jsonBytes))
+	require.JSONEq(`"hex"`, string(jsonBytes))
 }
 
 func TestEncodingUnmarshalJSON(t *testing.T) {

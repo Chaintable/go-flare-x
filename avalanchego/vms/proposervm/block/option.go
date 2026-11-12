@@ -1,11 +1,9 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package block
 
 import (
-	"time"
-
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/hashing"
 )
@@ -34,8 +32,12 @@ func (b *option) Bytes() []byte {
 	return b.bytes
 }
 
-func (b *option) initialize(bytes []byte, _ time.Time) error {
+func (b *option) initialize(bytes []byte) error {
 	b.id = hashing.ComputeHash256Array(bytes)
 	b.bytes = bytes
+	return nil
+}
+
+func (*option) verify(ids.ID) error {
 	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package state
@@ -14,12 +14,11 @@ import (
 	"github.com/ava-labs/avalanchego/database"
 	"github.com/ava-labs/avalanchego/database/memdb"
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/snow/choices"
 	"github.com/ava-labs/avalanchego/staking"
 	"github.com/ava-labs/avalanchego/vms/proposervm/block"
 )
 
-func testBlockState(a *require.Assertions, bs BlockState) {
+func testBlockState(require *require.Assertions, bs BlockState) {
 	parentID := ids.ID{1}
 	timestamp := time.Unix(123, 0)
 	pChainHeight := uint64(2)
@@ -27,40 +26,39 @@ func testBlockState(a *require.Assertions, bs BlockState) {
 	chainID := ids.ID{4}
 
 	tlsCert, err := staking.NewTLSCert()
-	a.NoError(err)
+	require.NoError(err)
 
-	cert := staking.CertificateFromX509(tlsCert.Leaf)
+	cert, err := staking.ParseCertificate(tlsCert.Leaf.Raw)
+	require.NoError(err)
 	key := tlsCert.PrivateKey.(crypto.Signer)
 
 	b, err := block.Build(
 		parentID,
 		timestamp,
 		pChainHeight,
+		block.Epoch{},
 		cert,
 		innerBlockBytes,
 		chainID,
 		key,
 	)
-	a.NoError(err)
+	require.NoError(err)
 
-	_, _, err = bs.GetBlock(b.ID())
-	a.Equal(database.ErrNotFound, err)
+	_, err = bs.GetBlock(b.ID())
+	require.Equal(database.ErrNotFound, err)
 
-	_, _, err = bs.GetBlock(b.ID())
-	a.Equal(database.ErrNotFound, err)
+	_, err = bs.GetBlock(b.ID())
+	require.Equal(database.ErrNotFound, err)
 
-	err = bs.PutBlock(b, choices.Accepted)
-	a.NoError(err)
+	require.NoError(bs.PutBlock(b))
 
-	fetchedBlock, fetchedStatus, err := bs.GetBlock(b.ID())
-	a.NoError(err)
-	a.Equal(choices.Accepted, fetchedStatus)
-	a.Equal(b.Bytes(), fetchedBlock.Bytes())
+	fetchedBlock, err := bs.GetBlock(b.ID())
+	require.NoError(err)
+	require.Equal(b.Bytes(), fetchedBlock.Bytes())
 
-	fetchedBlock, fetchedStatus, err = bs.GetBlock(b.ID())
-	a.NoError(err)
-	a.Equal(choices.Accepted, fetchedStatus)
-	a.Equal(b.Bytes(), fetchedBlock.Bytes())
+	fetchedBlock, err = bs.GetBlock(b.ID())
+	require.NoError(err)
+	require.Equal(b.Bytes(), fetchedBlock.Bytes())
 }
 
 func TestBlockState(t *testing.T) {

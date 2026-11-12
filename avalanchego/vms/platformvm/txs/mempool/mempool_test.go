@@ -1,299 +1,885 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package mempool
 
 import (
+	"errors"
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
-	"github.com/ava-labs/avalanchego/utils/crypto/secp256k1"
+	"github.com/ava-labs/avalanchego/snow/snowtest"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/vms/components/avax"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
+	"github.com/ava-labs/avalanchego/vms/platformvm/utxo"
 	"github.com/ava-labs/avalanchego/vms/secp256k1fx"
+
+	txmempool "github.com/ava-labs/avalanchego/vms/txs/mempool"
 )
 
-var preFundedKeys = secp256k1.TestKeys()
-
-// shows that valid tx is not added to mempool if this would exceed its maximum
-// size
-func TestBlockBuilderMaxMempoolSizeHandling(t *testing.T) {
-	require := require.New(t)
-
-	registerer := prometheus.NewRegistry()
-	mpool, err := New("mempool", registerer, nil)
-	require.NoError(err)
-
-	decisionTxs, err := createTestDecisionTxs(1)
-	require.NoError(err)
-	tx := decisionTxs[0]
-
-	// shortcut to simulated almost filled mempool
-	mpool.(*mempool).bytesAvailable = len(tx.Bytes()) - 1
-
-	err = mpool.Add(tx)
-	require.ErrorIs(err, ErrMempoolFull)
-
-	// tx should not be marked as dropped if the mempool is full
-	txID := tx.ID()
-	mpool.MarkDropped(txID, err)
-	require.NoError(mpool.GetDropReason(txID))
-
-	// shortcut to simulated almost filled mempool
-	mpool.(*mempool).bytesAvailable = len(tx.Bytes())
-
-	err = mpool.Add(tx)
-	require.NoError(err, "should have added tx to mempool")
-}
-
-func TestDecisionTxsInMempool(t *testing.T) {
-	require := require.New(t)
-
-	registerer := prometheus.NewRegistry()
-	mpool, err := New("mempool", registerer, nil)
-	require.NoError(err)
-
-	decisionTxs, err := createTestDecisionTxs(2)
-	require.NoError(err)
-
-	for _, tx := range decisionTxs {
-		// tx not already there
-		_, ok := mpool.Get(tx.ID())
-		require.False(ok)
-
-		// we can insert
-		require.NoError(mpool.Add(tx))
-
-		// we can get it
-		got, ok := mpool.Get(tx.ID())
-		require.True(ok)
-		require.Equal(tx, got)
-
-		// once removed it cannot be there
-		mpool.Remove(tx)
-
-		_, ok = mpool.Get(tx.ID())
-		require.False(ok)
-
-		// we can reinsert it again to grow the mempool
-		require.NoError(mpool.Add(tx))
+func newAVAXInput(txID ids.ID, amount uint64) *avax.TransferableInput {
+	return &avax.TransferableInput{
+		UTXOID: avax.UTXOID{
+			TxID: txID,
+		},
+		Asset: avax.Asset{
+			ID: snowtest.AVAXAssetID,
+		},
+		In: &secp256k1fx.TransferInput{
+			Amt: amount,
+		},
 	}
 }
 
-func TestProposalTxsInMempool(t *testing.T) {
-	require := require.New(t)
-
-	registerer := prometheus.NewRegistry()
-	mpool, err := New("mempool", registerer, nil)
-	require.NoError(err)
-
-	// The proposal txs are ordered by decreasing start time. This means after
-	// each insertion, the last inserted transaction should be on the top of the
-	// heap.
-	proposalTxs, err := createTestProposalTxs(2)
-	require.NoError(err)
-
-	for _, tx := range proposalTxs {
-		_, ok := mpool.Get(tx.ID())
-		require.False(ok)
-
-		// we can insert
-		require.NoError(mpool.Add(tx))
-
-		// we can get it
-		got, ok := mpool.Get(tx.ID())
-		require.Equal(tx, got)
-		require.True(ok)
-
-		// once removed it cannot be there
-		mpool.Remove(tx)
-
-		_, ok = mpool.Get(tx.ID())
-		require.False(ok)
-
-		// we can reinsert it again to grow the mempool
-		require.NoError(mpool.Add(tx))
+func newAVAXOutput(amount uint64) *avax.TransferableOutput {
+	return &avax.TransferableOutput{
+		Asset: avax.Asset{
+			ID: snowtest.AVAXAssetID,
+		},
+		Out: &secp256k1fx.TransferOutput{
+			Amt: amount,
+		},
 	}
 }
 
-func createTestDecisionTxs(count int) ([]*txs.Tx, error) {
-	decisionTxs := make([]*txs.Tx, 0, count)
-	for i := uint32(0); i < uint32(count); i++ {
-		utx := &txs.CreateChainTx{
-			BaseTx: txs.BaseTx{BaseTx: avax.BaseTx{
-				NetworkID:    10,
-				BlockchainID: ids.Empty.Prefix(uint64(i)),
-				Ins: []*avax.TransferableInput{{
-					UTXOID: avax.UTXOID{
-						TxID:        ids.ID{'t', 'x', 'I', 'D'},
-						OutputIndex: i,
-					},
-					Asset: avax.Asset{ID: ids.ID{'a', 's', 's', 'e', 'r', 't'}},
-					In: &secp256k1fx.TransferInput{
-						Amt:   uint64(5678),
-						Input: secp256k1fx.Input{SigIndices: []uint32{i}},
-					},
-				}},
-				Outs: []*avax.TransferableOutput{{
-					Asset: avax.Asset{ID: ids.ID{'a', 's', 's', 'e', 'r', 't'}},
-					Out: &secp256k1fx.TransferOutput{
-						Amt: uint64(1234),
-						OutputOwners: secp256k1fx.OutputOwners{
-							Threshold: 1,
-							Addrs:     []ids.ShortID{preFundedKeys[0].PublicKey().Address()},
+func newTx(txID ids.ID) *platform.Tx {
+	return newTxWithUTXOs(
+		txID,
+		[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 2)},
+		1,
+	)
+}
+
+func newTxWithUTXOs(
+	txID ids.ID,
+	inputs []*avax.TransferableInput,
+	outputAmount uint64,
+) *platform.Tx {
+	tx := avax.BaseTx{
+		Ins: inputs,
+	}
+
+	if outputAmount > 0 {
+		tx.Outs = []*avax.TransferableOutput{
+			newAVAXOutput(outputAmount),
+		}
+	}
+
+	return &platform.Tx{
+		Unsigned: &platform.BaseTx{
+			BaseTx: tx,
+		},
+		TxID: txID,
+	}
+}
+
+// Txs should be prioritized by highest gas price
+func TestMempoolOrdering(t *testing.T) {
+	require := require.New(t)
+
+	weights := gas.Dimensions{gas.Bandwidth: 1}
+
+	m, err := New(
+		"",
+		weights,
+		1_000_000,
+		snowtest.AVAXAssetID,
+		prometheus.NewRegistry(),
+	)
+	require.NoError(err)
+
+	lowTx := newTxWithUTXOs(
+		ids.GenerateTestID(),
+		[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 5)},
+		4,
+	)
+	require.NoError(m.Add(lowTx))
+
+	highTx := newTxWithUTXOs(
+		ids.GenerateTestID(),
+		[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 5)},
+		1,
+	)
+	require.NoError(m.Add(highTx))
+
+	gotTx, ok := m.Peek()
+	require.True(ok)
+	require.Equal(highTx, gotTx)
+	m.Remove(gotTx.ID())
+
+	gotTx, ok = m.Peek()
+	require.True(ok)
+	require.Equal(lowTx, gotTx)
+}
+
+func TestMempoolAdd(t *testing.T) {
+	tests := []struct {
+		name           string
+		weights        gas.Dimensions
+		maxGasCapacity gas.Gas
+		prevTxs        []*platform.Tx
+		tx             *platform.Tx
+		wantErr        error
+		wantTxIDs      []ids.ID
+	}{
+		{
+			name:    "dropped - no gas",
+			weights: gas.Dimensions{},
+			tx:      newTx(ids.GenerateTestID()),
+			wantErr: errNoGasUsed,
+		},
+		{
+			name: "dropped - AdvanceTimeTx",
+			tx: &platform.Tx{
+				Unsigned: &platform.AdvanceTimeTx{},
+			},
+			wantErr: utxo.ErrUnsupportedTxType,
+		},
+		{
+			name: "dropped - RewardValidatorTx",
+			tx: &platform.Tx{
+				Unsigned: &platform.RewardValidatorTx{},
+			},
+			wantErr: utxo.ErrUnsupportedTxType,
+		},
+		{
+			name:           "not enough gas - lower paying tx is not added",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 2)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{2}, 1)},
+				0,
+			),
+			wantErr: ErrNotEnoughGas,
+			wantTxIDs: []ids.ID{
+				{1},
+			},
+		},
+		{
+			name:           "not enough gas - equal paying tx is not added",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 2)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{2}, 2)},
+				0,
+			),
+			wantErr: ErrNotEnoughGas,
+			wantTxIDs: []ids.ID{
+				{1},
+			},
+		},
+		{
+			name:           "evict - higher paying tx is added",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{2}, 10)},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{2},
+			},
+		},
+		{
+			name:           "evict - higher paying tx without conflicts is added",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 5)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 10)},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{2},
+			},
+		},
+		{
+			name:           "evict - higher paying tx conflicts with multiple txs",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 500,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+					0,
+				),
+				newTxWithUTXOs(
+					ids.ID{2},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{2}, 10)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{3},
+				[]*avax.TransferableInput{
+					newAVAXInput(ids.ID{1}, 2),
+					newAVAXInput(ids.ID{2}, 2),
+				},
+				0,
+			),
+			wantErr: txmempool.ErrConflictsWithOtherTx,
+			wantTxIDs: []ids.ID{
+				{1},
+				{2},
+			},
+		},
+		{
+			name:           "evict - higher paying tx evicts multiple txs",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 400,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 10)},
+					0,
+				),
+				newTxWithUTXOs(
+					ids.ID{2},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{2}, 5)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{3},
+				[]*avax.TransferableInput{
+					newAVAXInput(ids.ID{3}, 20),
+					newAVAXInput(ids.ID{4}, 20),
+					newAVAXInput(ids.ID{5}, 20),
+				},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{3},
+			},
+		},
+		{
+			name:           "cannot evict - not enough gas capacity",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 400,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 10)},
+					0,
+				),
+				newTxWithUTXOs(
+					ids.ID{2},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{2}, 5)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{3},
+				[]*avax.TransferableInput{
+					newAVAXInput(ids.ID{3}, 20),
+					newAVAXInput(ids.ID{4}, 20),
+					newAVAXInput(ids.ID{5}, 20),
+					newAVAXInput(ids.ID{6}, 20),
+				},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{1},
+				{2},
+			},
+			wantErr: ErrNotEnoughGas,
+		},
+		{
+			name:           "conflict - higher paying tx is dropped",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 10)},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{1},
+			},
+			wantErr: txmempool.ErrConflictsWithOtherTx,
+		},
+		{
+			name:           "conflict - equal paying tx is dropped",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{1},
+			},
+			wantErr: txmempool.ErrConflictsWithOtherTx,
+		},
+		{
+			name:           "conflict - lower paying tx is dropped",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			prevTxs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 10)},
+					0,
+				),
+			},
+			tx: newTxWithUTXOs(
+				ids.ID{2},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{1},
+			},
+			wantErr: txmempool.ErrConflictsWithOtherTx,
+		},
+		{
+			name:           "AVAX minted",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			tx: newTxWithUTXOs(
+				ids.ID{1},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+				2,
+			),
+			wantErr: errAVAXMinted,
+		},
+		{
+			name:           "tx added",
+			weights:        gas.Dimensions{1, 1, 1, 1},
+			maxGasCapacity: 200,
+			tx: newTxWithUTXOs(
+				ids.ID{1},
+				[]*avax.TransferableInput{newAVAXInput(ids.ID{1}, 1)},
+				0,
+			),
+			wantTxIDs: []ids.ID{
+				{1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			m, err := New(
+				"",
+				tt.weights,
+				tt.maxGasCapacity,
+				snowtest.AVAXAssetID,
+				prometheus.NewRegistry(),
+			)
+			require.NoError(err)
+
+			for _, tx := range tt.prevTxs {
+				require.NoError(m.Add(tx))
+			}
+
+			err = m.Add(tt.tx)
+			require.ErrorIs(err, tt.wantErr)
+
+			for _, wantTxID := range tt.wantTxIDs {
+				_, ok := m.Get(wantTxID)
+				require.True(ok)
+			}
+
+			require.Equal(len(tt.wantTxIDs), m.Len())
+		})
+	}
+}
+
+func TestMempool_Remove(t *testing.T) {
+	tests := []struct {
+		name         string
+		txs          []*platform.Tx
+		txIDToRemove ids.ID
+		wantRemove   bool
+	}{
+		{
+			name:         "remove tx not in mempool - empty",
+			txIDToRemove: ids.GenerateTestID(),
+		},
+		{
+			name: "remove tx not in mempool - populated",
+			txs: []*platform.Tx{
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.GenerateTestID(),
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
 						},
 					},
-				}},
-			}},
-			SubnetID:    ids.GenerateTestID(),
-			ChainName:   "chainName",
-			VMID:        ids.GenerateTestID(),
-			FxIDs:       []ids.ID{ids.GenerateTestID()},
-			GenesisData: []byte{'g', 'e', 'n', 'D', 'a', 't', 'a'},
-			SubnetAuth:  &secp256k1fx.Input{SigIndices: []uint32{1}},
-		}
-
-		tx, err := txs.NewSigned(utx, txs.Codec, nil)
-		if err != nil {
-			return nil, err
-		}
-		decisionTxs = append(decisionTxs, tx)
-	}
-	return decisionTxs, nil
-}
-
-// Proposal txs are sorted by decreasing start time
-func createTestProposalTxs(count int) ([]*txs.Tx, error) {
-	now := time.Now()
-	proposalTxs := make([]*txs.Tx, 0, count)
-	for i := 0; i < count; i++ {
-		tx, err := generateAddValidatorTx(
-			uint64(now.Add(time.Duration(count-i)*time.Second).Unix()), // startTime
-			0, // endTime
-		)
-		if err != nil {
-			return nil, err
-		}
-		proposalTxs = append(proposalTxs, tx)
-	}
-	return proposalTxs, nil
-}
-
-func generateAddValidatorTx(startTime uint64, endTime uint64) (*txs.Tx, error) {
-	utx := &txs.AddValidatorTx{
-		BaseTx: txs.BaseTx{},
-		Validator: txs.Validator{
-			NodeID: ids.GenerateTestNodeID(),
-			Start:  startTime,
-			End:    endTime,
+					TxID: ids.GenerateTestID(),
+				},
+			},
+			txIDToRemove: ids.GenerateTestID(),
 		},
-		StakeOuts:        nil,
-		RewardsOwner:     &secp256k1fx.OutputOwners{},
-		DelegationShares: 100,
+		{
+			name: "remove tx in mempool",
+			txs: []*platform.Tx{
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.GenerateTestID(),
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{1, 2, 3},
+				},
+			},
+			txIDToRemove: ids.ID{1, 2, 3},
+			wantRemove:   true,
+		},
 	}
 
-	return txs.NewSigned(utx, txs.Codec, nil)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			m, err := New(
+				"",
+				gas.Dimensions{1, 1, 1, 1},
+				1_000_000,
+				snowtest.AVAXAssetID,
+				prometheus.NewRegistry(),
+			)
+			require.NoError(err)
+
+			for _, tx := range tt.txs {
+				require.NoError(m.Add(tx))
+			}
+
+			m.Remove(tt.txIDToRemove)
+			_, gotOk := m.Get(tt.txIDToRemove)
+			require.False(gotOk)
+		})
+	}
 }
 
-func TestPeekTxs(t *testing.T) {
-	require := require.New(t)
+func TestMempool_RemoveConflicts(t *testing.T) {
+	tests := []struct {
+		name              string
+		txs               []*platform.Tx
+		conflictsToRemove []avax.UTXOID
+		wantTxs           []ids.ID
+	}{
+		{
+			name:              "remove conflicts from empty mempool",
+			conflictsToRemove: []avax.UTXOID{{TxID: ids.ID{1}}},
+		},
+		{
+			name: "remove conflicts in mempool",
+			txs: []*platform.Tx{
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.ID{1},
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{1},
+				},
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.ID{2},
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{2},
+				},
+			},
+			conflictsToRemove: []avax.UTXOID{{TxID: ids.ID{1}}},
+			wantTxs:           []ids.ID{{2}},
+		},
+		{
+			name: "remove multiple conflicts in mempool",
+			txs: []*platform.Tx{
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.ID{1},
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{1},
+				},
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.ID{2},
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{2},
+				},
+			},
+			conflictsToRemove: []avax.UTXOID{
+				{TxID: ids.ID{1}},
+				{TxID: ids.ID{2}},
+			},
+		},
+		{
+			name: "remove conflicts not in mempool",
+			txs: []*platform.Tx{
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.ID{1},
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{1},
+				},
+				{
+					Unsigned: &platform.BaseTx{
+						BaseTx: avax.BaseTx{
+							Ins: []*avax.TransferableInput{
+								{
+									UTXOID: avax.UTXOID{
+										TxID: ids.ID{3},
+									},
+									Asset: avax.Asset{
+										ID: snowtest.AVAXAssetID,
+									},
+									In: &secp256k1fx.TransferInput{
+										Amt: 1,
+									},
+								},
+							},
+						},
+					},
+					TxID: ids.ID{2},
+				},
+			},
+			conflictsToRemove: []avax.UTXOID{
+				{TxID: ids.ID{123}},
+			},
+			wantTxs: []ids.ID{{1}, {2}},
+		},
+	}
 
-	registerer := prometheus.NewRegistry()
-	toEngine := make(chan common.Message, 100)
-	mempool, err := New("mempool", registerer, toEngine)
-	require.NoError(err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
 
-	testDecisionTxs, err := createTestDecisionTxs(1)
-	require.NoError(err)
-	testProposalTxs, err := createTestProposalTxs(1)
-	require.NoError(err)
+			m, err := New(
+				"",
+				gas.Dimensions{1, 1, 1, 1},
+				1_000_000,
+				snowtest.AVAXAssetID,
+				prometheus.NewRegistry(),
+			)
+			require.NoError(err)
 
-	tx, exists := mempool.Peek()
-	require.False(exists)
-	require.Nil(tx)
+			for _, tx := range tt.txs {
+				require.NoError(m.Add(tx))
+			}
 
-	require.NoError(mempool.Add(testDecisionTxs[0]))
-	require.NoError(mempool.Add(testProposalTxs[0]))
+			conflictsToRemove := set.Set[ids.ID]{}
+			for _, conflict := range tt.conflictsToRemove {
+				conflictsToRemove.Add(conflict.InputID())
+			}
 
-	tx, exists = mempool.Peek()
-	require.True(exists)
-	require.Equal(tx, testDecisionTxs[0])
-	require.NotEqual(tx, testProposalTxs[0])
+			m.RemoveConflicts(conflictsToRemove)
 
-	mempool.Remove(testDecisionTxs[0])
-
-	tx, exists = mempool.Peek()
-	require.True(exists)
-	require.NotEqual(tx, testDecisionTxs[0])
-	require.Equal(tx, testProposalTxs[0])
-
-	mempool.Remove(testProposalTxs[0])
-
-	tx, exists = mempool.Peek()
-	require.False(exists)
-	require.Nil(tx)
+			require.Equal(len(tt.wantTxs), m.Len())
+			for _, wantTxID := range tt.wantTxs {
+				_, ok := m.Get(wantTxID)
+				require.True(ok)
+			}
+		})
+	}
 }
 
-func TestRemoveConflicts(t *testing.T) {
-	require := require.New(t)
+func TestMempool_Drop(t *testing.T) {
+	errFoo := errors.New("foo")
 
-	registerer := prometheus.NewRegistry()
-	toEngine := make(chan common.Message, 100)
-	mempool, err := New("mempool", registerer, toEngine)
-	require.NoError(err)
+	tests := []struct {
+		name       string
+		droppedTxs map[ids.ID]error
+		addTxs     []ids.ID
+		tx         ids.ID
+		wantErr    error
+	}{
+		{
+			name: "tx is dropped",
+			droppedTxs: map[ids.ID]error{
+				ids.Empty: errFoo,
+			},
+			tx:      ids.Empty,
+			wantErr: errFoo,
+		},
+		{
+			name: "tx dropped then added",
+			droppedTxs: map[ids.ID]error{
+				ids.Empty: errFoo,
+			},
+			addTxs: []ids.ID{ids.Empty},
+			tx:     ids.Empty,
+		},
+		{
+			name: "tx not dropped",
+		},
+	}
 
-	txs, err := createTestDecisionTxs(1)
-	require.NoError(err)
-	conflictTxs, err := createTestDecisionTxs(1)
-	require.NoError(err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
 
-	require.NoError(mempool.Add(txs[0]))
+			m, err := New(
+				"",
+				gas.Dimensions{1, 1, 1, 1},
+				1_000_000,
+				snowtest.AVAXAssetID,
+				prometheus.NewRegistry(),
+			)
+			require.NoError(err)
 
-	tx, exists := mempool.Peek()
-	require.True(exists)
-	require.Equal(tx, txs[0])
+			for txID, dropReason := range tt.droppedTxs {
+				m.MarkDropped(txID, dropReason)
+			}
 
-	mempool.Remove(conflictTxs[0])
+			for _, txID := range tt.addTxs {
+				require.NoError(m.Add(newTx(txID)))
+			}
 
-	_, exists = mempool.Peek()
-	require.False(exists)
+			err = m.GetDropReason(tt.tx)
+			require.ErrorIs(err, tt.wantErr)
+		})
+	}
 }
 
-func TestIterate(t *testing.T) {
+func TestMempool_WaitForEvent(t *testing.T) {
 	require := require.New(t)
 
-	registerer := prometheus.NewRegistry()
-	toEngine := make(chan common.Message, 100)
-	mempool, err := New("mempool", registerer, toEngine)
-	require.NoError(err)
-
-	testDecisionTxs, err := createTestDecisionTxs(1)
-	require.NoError(err)
-	decisionTx := testDecisionTxs[0]
-
-	testProposalTxs, err := createTestProposalTxs(1)
-	require.NoError(err)
-	proposalTx := testProposalTxs[0]
-
-	require.NoError(mempool.Add(decisionTx))
-	require.NoError(mempool.Add(proposalTx))
-
-	expectedSet := set.Of(
-		decisionTx.ID(),
-		proposalTx.ID(),
+	m, err := New(
+		"",
+		gas.Dimensions{1, 1, 1, 1},
+		1_000_000,
+		snowtest.AVAXAssetID,
+		prometheus.NewRegistry(),
 	)
+	require.NoError(err)
 
-	set := set.NewSet[ids.ID](2)
-	mempool.Iterate(func(tx *txs.Tx) bool {
-		set.Add(tx.ID())
-		return true
+	eg := &errgroup.Group{}
+	eg.Go(func() error {
+		tx := newTxWithUTXOs(
+			ids.GenerateTestID(),
+			[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 5)},
+			1,
+		)
+
+		return m.Add(tx)
 	})
 
-	require.Equal(expectedSet, set)
+	gotMsg, err := m.WaitForEvent(t.Context())
+	require.NoError(err)
+	require.Equal(common.PendingTxs, gotMsg)
+
+	require.NoError(eg.Wait())
+}
+
+func TestMempool_Iterate(t *testing.T) {
+	tests := []struct {
+		name    string
+		txs     []*platform.Tx
+		wantTxs []ids.ID
+	}{
+		{
+			name: "no txs",
+		},
+		{
+			name: "one tx",
+			txs: []*platform.Tx{
+				newTx(ids.ID{1}),
+			},
+			wantTxs: []ids.ID{
+				{1},
+			},
+		},
+		{
+			// txs should be ordered in descending gas price
+			name: "multiple txs",
+			txs: []*platform.Tx{
+				newTxWithUTXOs(
+					ids.ID{1},
+					[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 10)},
+					0,
+				),
+				newTxWithUTXOs(
+					ids.ID{3},
+					[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 1000)},
+					0,
+				),
+				newTxWithUTXOs(
+					ids.ID{2},
+					[]*avax.TransferableInput{newAVAXInput(ids.GenerateTestID(), 100)},
+					0,
+				),
+			},
+			wantTxs: []ids.ID{
+				{3},
+				{2},
+				{1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			m, err := New(
+				"",
+				gas.Dimensions{1, 1, 1, 1},
+				1_000_000,
+				snowtest.AVAXAssetID,
+				prometheus.NewRegistry(),
+			)
+			require.NoError(err)
+
+			for _, tx := range tt.txs {
+				require.NoError(m.Add(tx))
+			}
+
+			var gotTxs []ids.ID
+			m.Iterate(func(tx *platform.Tx) bool {
+				gotTxs = append(gotTxs, tx.ID())
+				return true
+			})
+
+			require.Equal(tt.wantTxs, gotTxs)
+		})
+	}
 }

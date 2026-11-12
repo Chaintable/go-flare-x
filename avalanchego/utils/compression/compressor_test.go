@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package compression
@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 
 	_ "embed"
@@ -24,18 +25,13 @@ var (
 		TypeNone: func(int64) (Compressor, error) { //nolint:unparam // an error is needed to be returned to compile
 			return NewNoCompressor(), nil
 		},
-		TypeGzip: NewGzipCompressor,
 		TypeZstd: NewZstdCompressor,
 	}
-
-	//go:embed gzip_zip_bomb.bin
-	gzipZipBomb []byte
 
 	//go:embed zstd_zip_bomb.bin
 	zstdZipBomb []byte
 
 	zipBombs = map[Type][]byte{
-		TypeGzip: gzipZipBomb,
 		TypeZstd: zstdZipBomb,
 	}
 )
@@ -61,7 +57,7 @@ func TestDecompressZipBombs(t *testing.T) {
 			_, err = compressor.Decompress(zipBomb)
 			runtime.ReadMemStats(&afterDecompressionStats)
 
-			require.ErrorIs(err, ErrDecompressedMsgTooLarge)
+			require.ErrorIs(err, zstd.ErrDecoderSizeExceeded)
 
 			// Make sure that we didn't allocate significantly more memory than
 			// the max message size.
@@ -134,28 +130,58 @@ func TestSizeLimiting(t *testing.T) {
 			require.NoError(err)
 
 			_, err = compressor.Decompress(dataCompressed) // should be too large
-			require.ErrorIs(err, ErrDecompressedMsgTooLarge)
+			require.ErrorIs(err, zstd.ErrDecoderSizeExceeded)
 		})
 	}
 }
 
-// Attempts to create a compressor with math.MaxInt64
-// which leads to undefined decompress behavior due to integer overflow
-// in limit reader creation.
-func TestNewCompressorWithInvalidLimit(t *testing.T) {
+func TestNewCompressor(t *testing.T) {
+	tests := []struct {
+		maxSize int64
+		want    error
+	}{
+		{
+			maxSize: -1,
+			want:    ErrInvalidMaxSizeCompressor,
+		},
+		{
+			maxSize: 0,
+			want:    ErrInvalidMaxSizeCompressor,
+		},
+		{
+			maxSize: 100,
+		},
+		{
+			maxSize: math.MaxInt64,
+			want:    ErrInvalidMaxSizeCompressor,
+		},
+	}
+
 	for compressionType, compressorFunc := range newCompressorFuncs {
 		if compressionType == TypeNone {
 			continue
 		}
-		t.Run(compressionType.String(), func(t *testing.T) {
-			_, err := compressorFunc(math.MaxInt64)
-			require.ErrorIs(t, err, ErrInvalidMaxSizeCompressor)
-		})
+
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s_with_max_size_%d", compressionType.String(), tt.maxSize), func(t *testing.T) {
+				_, err := compressorFunc(tt.maxSize)
+				require.ErrorIs(t, err, tt.want)
+			})
+		}
 	}
 }
 
-func FuzzGzipCompressor(f *testing.F) {
-	fuzzHelper(f, TypeGzip)
+func TestNewZstdCompressorWithLevel(t *testing.T) {
+	compressor, err := NewZstdCompressorWithLevel(maxMessageSize, zstd.SpeedFastest)
+	require.NoError(t, err)
+
+	data := utils.RandomBytes(4096)
+	compressed, err := compressor.Compress(data)
+	require.NoError(t, err)
+
+	decompressed, err := compressor.Decompress(compressed)
+	require.NoError(t, err)
+	require.Equal(t, data, decompressed)
 }
 
 func FuzzZstdCompressor(f *testing.F) {
@@ -168,14 +194,11 @@ func fuzzHelper(f *testing.F, compressionType Type) {
 		err        error
 	)
 	switch compressionType {
-	case TypeGzip:
-		compressor, err = NewGzipCompressor(maxMessageSize)
-		require.NoError(f, err)
 	case TypeZstd:
 		compressor, err = NewZstdCompressor(maxMessageSize)
 		require.NoError(f, err)
 	default:
-		require.FailNow(f, "Unknown compression type")
+		f.Fatal("Unknown compression type")
 	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {

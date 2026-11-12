@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package syncer
@@ -6,7 +6,7 @@ package syncer
 import (
 	"context"
 	"fmt"
-	"math"
+	"math/big"
 
 	"go.uber.org/zap"
 
@@ -20,8 +20,6 @@ import (
 	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/set"
 	"github.com/ava-labs/avalanchego/version"
-
-	safemath "github.com/ava-labs/avalanchego/utils/math"
 )
 
 // maxOutstandingBroadcastRequests is the maximum number of requests to have
@@ -33,7 +31,7 @@ var _ common.StateSyncer = (*stateSyncer)(nil)
 // summary content as received from network, along with accumulated weight.
 type weightedSummary struct {
 	summary block.StateSummary
-	weight  uint64
+	weight  *big.Int
 }
 
 type stateSyncer struct {
@@ -47,6 +45,7 @@ type stateSyncer struct {
 	common.QueryHandler
 	common.ChitsHandler
 	common.AppHandler
+	common.SimplexHandler
 
 	started bool
 
@@ -103,21 +102,18 @@ func New(
 		PutHandler:              common.NewNoOpPutHandler(cfg.Ctx.Log),
 		QueryHandler:            common.NewNoOpQueryHandler(cfg.Ctx.Log),
 		ChitsHandler:            common.NewNoOpChitsHandler(cfg.Ctx.Log),
+		SimplexHandler:          common.NewNoOpSimplexHandler(cfg.Ctx.Log),
 		AppHandler:              cfg.VM,
 		stateSyncVM:             ssVM,
 		onDoneStateSyncing:      onDoneStateSyncing,
 	}
 }
 
-func (ss *stateSyncer) Context() *snow.ConsensusContext {
-	return ss.Ctx
-}
-
 func (ss *stateSyncer) Start(ctx context.Context, startReqID uint32) error {
 	ss.Ctx.Log.Info("starting state sync")
 
 	ss.Ctx.State.Set(snow.EngineState{
-		Type:  p2p.EngineType_ENGINE_TYPE_SNOWMAN,
+		Type:  p2p.EngineType_ENGINE_TYPE_CHAIN,
 		State: snow.StateSyncing,
 	})
 	if err := ss.VM.SetState(ctx, snow.StateSyncing); err != nil {
@@ -187,6 +183,7 @@ func (ss *stateSyncer) StateSummaryFrontier(ctx context.Context, nodeID ids.Node
 	if summary, err := ss.stateSyncVM.ParseStateSummary(ctx, summaryBytes); err == nil {
 		ss.weightedSummaries[summary.ID()] = &weightedSummary{
 			summary: summary,
+			weight:  big.NewInt(0),
 		}
 
 		height := summary.Height()
@@ -195,16 +192,11 @@ func (ss *stateSyncer) StateSummaryFrontier(ctx context.Context, nodeID ids.Node
 			ss.uniqueSummariesHeights = append(ss.uniqueSummariesHeights, height)
 		}
 	} else {
+		fields := []zap.Field{zap.Error(err)}
 		if ss.Ctx.Log.Enabled(logging.Verbo) {
-			ss.Ctx.Log.Verbo("failed to parse summary",
-				zap.Binary("summary", summaryBytes),
-				zap.Error(err),
-			)
-		} else {
-			ss.Ctx.Log.Debug("failed to parse summary",
-				zap.Error(err),
-			)
+			fields = append(fields, zap.Binary("summary", summaryBytes))
 		}
+		ss.Ctx.Log.Debug("failed to parse summary", fields...)
 	}
 
 	return ss.receivedStateSummaryFrontier(ctx)
@@ -243,22 +235,15 @@ func (ss *stateSyncer) receivedStateSummaryFrontier(ctx context.Context) error {
 	// If we got too many timeouts, we restart state syncing hoping that network
 	// problems will go away and we can collect a qualified frontier.
 	// We assume the frontier is qualified after an alpha proportion of frontier seeders have responded
-	frontiersTotalWeight, err := ss.frontierSeeders.TotalWeight(ss.Ctx.SubnetID)
-	if err != nil {
-		return fmt.Errorf("failed to get total weight of frontier seeders for subnet %s: %w", ss.Ctx.SubnetID, err)
-	}
-	beaconsTotalWeight, err := ss.StateSyncBeacons.TotalWeight(ss.Ctx.SubnetID)
-	if err != nil {
-		return fmt.Errorf("failed to get total weight of state sync beacons for subnet %s: %w", ss.Ctx.SubnetID, err)
-	}
-	frontierAlpha := float64(frontiersTotalWeight*ss.Alpha) / float64(beaconsTotalWeight)
-	failedBeaconWeight, err := ss.StateSyncBeacons.SubsetWeight(ss.Ctx.SubnetID, ss.failedSeeders)
-	if err != nil {
-		return fmt.Errorf("failed to get total weight of failed beacons: %w", err)
-	}
+	frontiersTotalWeight := ss.frontierSeeders.TotalWeight(ss.Ctx.SubnetID)
+	beaconsTotalWeight := ss.StateSyncBeacons.TotalWeight(ss.Ctx.SubnetID)
+	beaconsTotalWeightFloat, _ := beaconsTotalWeight.Float64()
+	frontierAlphaNumerator, _ := new(big.Int).Mul(frontiersTotalWeight, ss.Alpha).Float64()
+	frontierAlpha := frontierAlphaNumerator / beaconsTotalWeightFloat
+	failedBeaconWeight := ss.StateSyncBeacons.SubsetWeight(ss.Ctx.SubnetID, ss.failedSeeders)
 
-	frontierStake := frontiersTotalWeight - failedBeaconWeight
-	if float64(frontierStake) < frontierAlpha {
+	frontierStakeFloat, _ := new(big.Int).Sub(frontiersTotalWeight, failedBeaconWeight).Float64()
+	if frontierStakeFloat < frontierAlpha {
 		ss.Ctx.Log.Debug("restarting state sync",
 			zap.String("reason", "didn't receive enough frontiers"),
 			zap.Int("numFailedValidators", ss.failedSeeders.Len()),
@@ -310,25 +295,14 @@ func (ss *stateSyncer) AcceptedStateSummary(ctx context.Context, nodeID ids.Node
 			continue
 		}
 
-		newWeight, err := safemath.Add64(nodeWeight, ws.weight)
-		if err != nil {
-			ss.Ctx.Log.Error("failed to calculate new summary weight",
-				zap.Stringer("nodeID", nodeID),
-				zap.Stringer("summaryID", summaryID),
-				zap.Uint64("height", ws.summary.Height()),
-				zap.Uint64("nodeWeight", nodeWeight),
-				zap.Uint64("previousWeight", ws.weight),
-				zap.Error(err),
-			)
-			newWeight = math.MaxUint64
-		}
+		newWeight := new(big.Int).Add(ws.weight, big.NewInt(int64(nodeWeight)))
 
 		ss.Ctx.Log.Verbo("updating summary weight",
 			zap.Stringer("nodeID", nodeID),
 			zap.Stringer("summaryID", summaryID),
 			zap.Uint64("height", ws.summary.Height()),
-			zap.Uint64("previousWeight", ws.weight),
-			zap.Uint64("newWeight", newWeight),
+			zap.Stringer("previousWeight", ws.weight),
+			zap.Stringer("newWeight", newWeight),
 		)
 		ws.weight = newWeight
 	}
@@ -343,13 +317,13 @@ func (ss *stateSyncer) AcceptedStateSummary(ctx context.Context, nodeID ids.Node
 	// We've received the filtered accepted frontier from every state sync validator
 	// Drop all summaries without a sufficient weight behind them
 	for summaryID, ws := range ss.weightedSummaries {
-		if ws.weight < ss.Alpha {
+		if ws.weight.Cmp(ss.Alpha) < 0 {
 			ss.Ctx.Log.Debug("removing summary",
 				zap.String("reason", "insufficient weight"),
 				zap.Stringer("summaryID", summaryID),
 				zap.Uint64("height", ws.summary.Height()),
-				zap.Uint64("currentWeight", ws.weight),
-				zap.Uint64("requiredWeight", ss.Alpha),
+				zap.Stringer("currentWeight", ws.weight),
+				zap.Stringer("requiredWeight", ss.Alpha),
 			)
 			delete(ss.weightedSummaries, summaryID)
 		}
@@ -359,25 +333,19 @@ func (ss *stateSyncer) AcceptedStateSummary(ctx context.Context, nodeID ids.Node
 	size := len(ss.weightedSummaries)
 	if size == 0 {
 		// retry the state sync if the weight is not enough to state sync
-		failedVotersWeight, err := ss.StateSyncBeacons.SubsetWeight(ss.Ctx.SubnetID, ss.failedVoters)
-		if err != nil {
-			return fmt.Errorf("failed to get total weight of failed voters: %w", err)
-		}
+		failedVotersWeight := ss.StateSyncBeacons.SubsetWeight(ss.Ctx.SubnetID, ss.failedVoters)
 
 		// if we had too many timeouts when asking for validator votes, we should restart
 		// state sync hoping for the network problems to go away; otherwise, we received
 		// enough (>= ss.Alpha) responses, but no state summary was supported by a majority
 		// of validators (i.e. votes are split between minorities supporting different state
 		// summaries), so there is no point in retrying state sync; we should move ahead to bootstrapping
-		beaconsTotalWeight, err := ss.StateSyncBeacons.TotalWeight(ss.Ctx.SubnetID)
-		if err != nil {
-			return fmt.Errorf("failed to get total weight of state sync beacons for subnet %s: %w", ss.Ctx.SubnetID, err)
-		}
-		votingStakes := beaconsTotalWeight - failedVotersWeight
-		if votingStakes < ss.Alpha {
+		beaconsTotalWeight := ss.StateSyncBeacons.TotalWeight(ss.Ctx.SubnetID)
+		votingStakes := new(big.Int).Sub(beaconsTotalWeight, failedVotersWeight)
+		if votingStakes.Cmp(ss.Alpha) < 0 {
 			ss.Ctx.Log.Debug("restarting state sync",
 				zap.String("reason", "not enough votes received"),
-				zap.Int("numBeacons", ss.StateSyncBeacons.Count(ss.Ctx.SubnetID)),
+				zap.Int("numBeacons", ss.StateSyncBeacons.NumValidators(ss.Ctx.SubnetID)),
 				zap.Int("numFailedSyncers", ss.failedVoters.Len()),
 			)
 			return ss.startup(ctx)
@@ -523,6 +491,7 @@ func (ss *stateSyncer) startup(ctx context.Context) error {
 		ss.locallyAvailableSummary = localSummary
 		ss.weightedSummaries[localSummary.ID()] = &weightedSummary{
 			summary: localSummary,
+			weight:  big.NewInt(0),
 		}
 
 		height := localSummary.Height()
@@ -581,7 +550,7 @@ func (ss *stateSyncer) sendGetAcceptedStateSummaries(ctx context.Context) {
 
 func (ss *stateSyncer) Notify(ctx context.Context, msg common.Message) error {
 	if msg != common.StateSyncDone {
-		ss.Ctx.Log.Warn("received an unexpected message from the VM",
+		ss.Ctx.Log.Info("received an unexpected message from the VM",
 			zap.Stringer("msg", msg),
 		)
 		return nil
@@ -603,8 +572,6 @@ func (ss *stateSyncer) Shutdown(ctx context.Context) error {
 
 	return ss.VM.Shutdown(ctx)
 }
-
-func (*stateSyncer) Halt(context.Context) {}
 
 func (*stateSyncer) Timeout(context.Context) error {
 	return nil

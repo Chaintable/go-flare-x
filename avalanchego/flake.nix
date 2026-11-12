@@ -1,0 +1,101 @@
+{
+  # To use:
+  #  - install nix: `./scripts/run_task.sh install-nix`
+  #    - see CONTRIBUTING.md#nix for setup details
+  #  - run `nix develop` or use direnv
+  #    - see CONTRIBUTING.md#direnv for how direnv enables flake usage
+
+  description = "AvalancheGo development environment";
+
+  # Flake inputs
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    # promtail is deprecated and is not provided by 26.05. Source promtail from 25.11
+    # pending a switch to Grafana Alloy.
+    # Tracking issue: https://github.com/ava-labs/avalanchego/issues/5550
+    nixpkgs-promtail.url = "github:NixOS/nixpkgs/nixos-25.11";
+  };
+
+  # Flake outputs
+  outputs = { self, nixpkgs, nixpkgs-promtail }:
+    let
+      # Systems supported
+      allSystems = [
+        "x86_64-linux" # 64-bit Intel/AMD Linux
+        "aarch64-linux" # 64-bit ARM Linux
+        "x86_64-darwin" # 64-bit Intel macOS
+        "aarch64-darwin" # 64-bit ARM macOS
+      ];
+
+      # Helper to provide system-specific attributes
+      forAllSystems = f: nixpkgs.lib.genAttrs allSystems (system: f {
+        pkgs = import nixpkgs { inherit system; };
+        pkgsPromtail = import nixpkgs-promtail { inherit system; };
+      });
+    in
+    {
+      # Development environment output
+      devShells = forAllSystems ({ pkgs, pkgsPromtail }: {
+        default = pkgs.mkShell {
+          # The Nix packages provided in the environment
+          packages = with pkgs; [
+            # Build requirements
+            bazelisk
+            (runCommand "bazel" {} ''mkdir -p $out/bin && ln -s ${bazelisk}/bin/bazelisk $out/bin/bazel'')
+            git
+
+            # Task runner
+            go-task
+
+            # Local Go package
+            (import ./nix/go { inherit pkgs; })
+
+            # Monitoring tools
+            pkgsPromtail.promtail                      # Loki log shipper
+            prometheus                                 # Metrics collector
+
+            # Kube tools
+            kubectl                                    # Kubernetes CLI
+            k9s                                        # Kubernetes TUI
+            kind                                       # Kubernetes-in-Docker
+            kubernetes-helm                            # Helm CLI (Kubernetes package manager)
+
+            # Config processing
+            jq                                         # JSON
+            yq                                         # YAML
+
+            # Linters
+            shellcheck
+            buildifier
+            yamlfmt
+
+            # Protobuf
+            buf
+            protoc-gen-go
+            protoc-gen-go-grpc
+            protoc-gen-connect-go
+
+            # Line-oriented search tool
+            ripgrep
+
+            # Solidity compiler
+            solc
+
+            # s5cmd for rapid s3 interactions
+            s5cmd
+          ];
+
+          # Add scripts/ directory to PATH so kind-with-registry.sh is accessible
+          shellHook = ''
+            export PATH="$PWD/scripts:$PATH"
+
+            # Ensure golang bin is in the path
+            GOBIN="$(go env GOPATH)/bin"
+            if [[ ":$PATH:" != *":$GOBIN:"* ]]; then
+              export PATH="$GOBIN:$PATH"
+            fi
+          '';
+        };
+      });
+    };
+}

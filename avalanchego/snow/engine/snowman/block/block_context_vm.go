@@ -1,25 +1,46 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package block
 
+//go:generate go tool canoto $GOFILE
+
 import (
 	"context"
 
+	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowman"
 )
 
 // Context defines the block context that will be optionally provided by the
 // proposervm to an underlying vm.
 type Context struct {
-	// PChainHeight is the height that this block will use to verify it's state.
+	// PChainHeight is the height that this block will use to verify its state.
 	// In the proposervm, blocks verify the proposer based on the P-chain height
-	// recorded in the parent block. The P-chain height provided here is also
-	// the parent's P-chain height, not this block's P-chain height.
+	// recorded in the parent block.
+	//
+	// Post-Granite this is the ACP-181 epoch P-chain height, which is pinned
+	// for the whole epoch and used by warp predicate verification. Between
+	// Etna and Granite it was the P-chain height encoded into this block, and
+	// pre-Etna it matched the parent block's P-chain height.
 	//
 	// Because PreForkBlocks and PostForkOptions do not verify their execution
 	// against the P-chain's state, this context is undefined for those blocks.
-	PChainHeight uint64
+	PChainHeight uint64 `canoto:"uint,1" json:"pChainHeight"`
+
+	// ProposerPChainHeight is the P-chain height sealed into the proposervm
+	// block that wraps this block: chosen by the proposer (at least ~30s old
+	// via GetMinimumHeight), monotonic across blocks, never below
+	// PChainHeight, and already accepted by the local P-chain when the block
+	// is verified in normal operation. It advances with every block, unlike
+	// the epoch-pinned PChainHeight.
+	//
+	// Flare addition: the SAE C-chain commits it into the block header to
+	// bound the P-chain gateway precompile's reads. Undefined for
+	// PreForkBlocks and PostForkOptions.
+	ProposerPChainHeight uint64 `canoto:"uint,2" json:"proposerPChainHeight"`
+
+	canotoData canotoData_Context
 }
 
 // BuildBlockWithContextChainVM defines the interface a ChainVM can optionally
@@ -31,6 +52,12 @@ type BuildBlockWithContextChainVM interface {
 	// This method will be called if and only if the proposervm is activated.
 	// Otherwise [BuildBlock] will be called.
 	BuildBlockWithContext(ctx context.Context, blockCtx *Context) (snowman.Block, error)
+}
+
+// SetPreferenceWithContextChainVM defines the interface a ChainVM can optionally
+// implement to consider the P-Chain height when setting preference.
+type SetPreferenceWithContextChainVM interface {
+	SetPreferenceWithContext(ctx context.Context, blkID ids.ID, blockCtx *Context) error
 }
 
 // WithVerifyContext defines the interface a Block can optionally implement to

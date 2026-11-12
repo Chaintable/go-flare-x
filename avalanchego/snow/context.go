@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package snow
@@ -8,11 +8,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/ava-labs/avalanchego/api/keystore"
 	"github.com/ava-labs/avalanchego/api/metrics"
 	"github.com/ava-labs/avalanchego/chains/atomic"
 	"github.com/ava-labs/avalanchego/ids"
+	"github.com/ava-labs/avalanchego/snow/pchain"
 	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/upgrade"
 	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
 	"github.com/ava-labs/avalanchego/utils/logging"
@@ -31,27 +32,36 @@ type ContextInitializable interface {
 // [ChainID] is the ID of the chain this context exists within.
 // [NodeID] is the ID of this node
 type Context struct {
-	NetworkID uint32
-	SubnetID  ids.ID
-	ChainID   ids.ID
-	NodeID    ids.NodeID
-	PublicKey *bls.PublicKey
+	NetworkID       uint32
+	SubnetID        ids.ID
+	ChainID         ids.ID
+	NodeID          ids.NodeID
+	PublicKey       *bls.PublicKey
+	NetworkUpgrades upgrade.Config
 
 	XChainID    ids.ID
 	CChainID    ids.ID
 	AVAXAssetID ids.ID
 
-	Log          logging.Logger
+	Log logging.Logger
+	// Deprecated: This lock should not be used unless absolutely necessary.
+	// This lock will be removed in a future release once it is replaced with
+	// more granular locks.
+	//
+	// Warning: This lock is not correctly implemented over the rpcchainvm.
 	Lock         sync.RWMutex
-	Keystore     keystore.BlockchainKeystore
 	SharedMemory atomic.SharedMemory
 	BCLookup     ids.AliaserReader
-	Metrics      metrics.OptionalGatherer
+	Metrics      metrics.MultiGatherer
 
 	WarpSigner warp.Signer
 
 	// snowman++ attributes
 	ValidatorState validators.State // interface for P-Chain validators
+	// PChainReader exposes accepted P-chain blocks and staking transactions
+	// to other in-process chains (Flare P-chain gateway precompile). It is
+	// nil for the P-chain itself and for plugin (rpcchainvm) VMs.
+	PChainReader pchain.Reader
 	// Chain-specific directory where arbitrary data can be written
 	ChainDataDir string
 }
@@ -65,15 +75,12 @@ type Registerer interface {
 type ConsensusContext struct {
 	*Context
 
-	// Registers all common and snowman consensus metrics. Unlike the avalanche
-	// consensus engine metrics, we do not prefix the name with the engine name,
-	// as snowman is used for all chains by default.
+	// PrimaryAlias is the primary alias of the chain this context exists
+	// within.
+	PrimaryAlias string
+
+	// Registers all consensus metrics.
 	Registerer Registerer
-	// Only used to register Avalanche consensus metrics. Previously, all
-	// metrics were prefixed with "avalanche_{chainID}_". Now we add avalanche
-	// to the prefix, "avalanche_{chainID}_avalanche_", to differentiate
-	// consensus operations after the DAG linearization.
-	AvalancheRegisterer Registerer
 
 	// BlockAcceptor is the callback that will be fired whenever a VM is
 	// notified that their block was accepted.

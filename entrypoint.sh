@@ -7,7 +7,13 @@ then
 	if [ -z "$PUBLIC_IP" ];
 	then
 		echo "Autoconfiguring public IP"
-		PUBLIC_IP=$(curl -s -m 10 https://flare.network/cdn-cgi/trace | grep 'ip=' | cut -d'=' -f2)
+		case "${NETWORK_ID,,}" in
+			songbird|coston) __TRACE_URL="https://${NETWORK_ID,,}-bootstrap.flare.network/cdn-cgi/trace" ;;
+			costwo) __TRACE_URL="https://coston2-bootstrap.flare.network/cdn-cgi/trace" ;;
+			*) __TRACE_URL="https://flare-bootstrap.flare.network/cdn-cgi/trace" ;;
+		esac
+		echo "  Using $__TRACE_URL"
+		PUBLIC_IP=$(curl -s -m 10 "$__TRACE_URL" | grep 'ip=' | cut -d'=' -f2)
 		echo "  Got public address '${PUBLIC_IP}'" 
 	else
 		echo "/!\\ AUTOCONFIGURE_PUBLIC_IP is enabled, but PUBLIC_IP is already set to '$PUBLIC_IP'! Skipping autoconfigure and using current PUBLIC_IP value!"
@@ -16,29 +22,48 @@ fi
 
 if [ "$AUTOCONFIGURE_BOOTSTRAP" = "1" ];
 then
-
-
-    __BOOTSTRAP_ENDPOINTS=("${AUTOCONFIGURE_BOOTSTRAP_ENDPOINT}" ${AUTOCONFIGURE_FALLBACK_ENDPOINTS//,/ })
+	__BOOTSTRAP_ENDPOINTS=()
+	if [ -n "$AUTOCONFIGURE_BOOTSTRAP_ENDPOINT" ]; then
+		__BOOTSTRAP_ENDPOINTS+=("$AUTOCONFIGURE_BOOTSTRAP_ENDPOINT")
+	fi
+	if [ -n "$AUTOCONFIGURE_FALLBACK_ENDPOINTS" ]; then
+		IFS=',' read -r -a __FALLBACKS <<< "$AUTOCONFIGURE_FALLBACK_ENDPOINTS"
+		__BOOTSTRAP_ENDPOINTS+=("${__FALLBACKS[@]}")
+	fi
 
 	echo "Trying provided bootstrap endpoints"
 	for __ENDPOINT in "${__BOOTSTRAP_ENDPOINTS[@]}"; do
-        echo "  Trying endpoint $__ENDPOINT"
+		echo "  Trying endpoint $__ENDPOINT"
 
-        RESPONSE_CODE=$(curl -X POST -m 5 -s -o /dev/null -w '%{http_code}' "$__ENDPOINT" -H 'Content-Type: application/json' --data '{ "jsonrpc":"2.0", "id":1, "method":"info.getNodeIP" }' || true)
-        if [ "$RESPONSE_CODE" = "200" ]; then
-            __BOOTSTRAP_ENDPOINT="$__ENDPOINT"
-            break
-        else
-			echo "    Failed! The endpoint is unreachable."
-            continue
-        fi
-    done
+		# Capture both status code and response body for better error reporting
+		TEMP_RESPONSE=$(mktemp)
+		RESPONSE_CODE=$(curl -X POST -m 5 -s -w '%{http_code}' -o "$TEMP_RESPONSE" "$__ENDPOINT" -H 'Content-Type: application/json' --data '{ "jsonrpc":"2.0", "id":1, "method":"info.getNodeIP" }' 2>/dev/null || echo "NETWORK_ERROR")
+		
+		if [ "$RESPONSE_CODE" = "200" ]; then
+			__BOOTSTRAP_ENDPOINT="$__ENDPOINT"
+			rm -f "$TEMP_RESPONSE"
+			break
+		elif [ "$RESPONSE_CODE" = "NETWORK_ERROR" ]; then
+			echo "    Failed! Network error (connection timeout, DNS failure, or unreachable host)"
+			rm -f "$TEMP_RESPONSE"
+			continue
+		else
+			# Read response body for additional context (limit to first 200 chars)
+			RESPONSE_BODY=$(head -c 200 "$TEMP_RESPONSE" 2>/dev/null || echo "")
+			if [ -n "$RESPONSE_BODY" ]; then
+				echo "    Failed! HTTP $RESPONSE_CODE, response body: $RESPONSE_BODY"
+			else
+				echo "    Failed! HTTP $RESPONSE_CODE"
+			fi
+			rm -f "$TEMP_RESPONSE"
+			continue
+		fi
+	done
 
 	if [ -z "$__BOOTSTRAP_ENDPOINT" ]; then
-        echo "  None of provided bootstrap endpoints worked!"
-        exit 1
-    fi
-
+		echo "  None of provided bootstrap endpoints worked!"
+		exit 1
+	fi
 
 	echo "Autoconfiguring bootstrap IPs and IDs"
 
@@ -49,6 +74,7 @@ then
 	echo "  Got bootstrap ids: '${BOOTSTRAP_IDS}'"
 fi
 
+# shellcheck disable=SC2086
 exec /app/build/avalanchego \
 	--http-host="$HTTP_HOST" \
 	--http-port="$HTTP_PORT" \
@@ -56,6 +82,7 @@ exec /app/build/avalanchego \
 	--public-ip="$PUBLIC_IP" \
 	--db-dir="$DB_DIR" \
 	--db-type="$DB_TYPE" \
+	--chain-data-dir="$CHAIN_DATA_DIR" \
 	--bootstrap-ips="$BOOTSTRAP_IPS" \
 	--bootstrap-ids="$BOOTSTRAP_IDS" \
 	--bootstrap-beacon-connection-timeout="$BOOTSTRAP_BEACON_CONNECTION_TIMEOUT" \

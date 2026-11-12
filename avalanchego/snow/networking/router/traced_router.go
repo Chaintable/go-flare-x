@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package router
@@ -40,15 +40,14 @@ func Trace(router Router, tracer trace.Tracer) Router {
 func (r *tracedRouter) Initialize(
 	nodeID ids.NodeID,
 	log logging.Logger,
-	timeoutManager timeout.Manager,
+	timeoutManager *timeout.Manager,
 	closeTimeout time.Duration,
 	criticalChains set.Set[ids.ID],
 	sybilProtectionEnabled bool,
 	trackedSubnets set.Set[ids.ID],
 	onFatal func(exitCode int),
 	healthConfig HealthConfig,
-	metricsNamespace string,
-	metricsRegisterer prometheus.Registerer,
+	reg prometheus.Registerer,
 ) error {
 	return r.router.Initialize(
 		nodeID,
@@ -60,26 +59,23 @@ func (r *tracedRouter) Initialize(
 		trackedSubnets,
 		onFatal,
 		healthConfig,
-		metricsNamespace,
-		metricsRegisterer,
+		reg,
 	)
 }
 
 func (r *tracedRouter) RegisterRequest(
 	ctx context.Context,
 	nodeID ids.NodeID,
-	requestingChainID ids.ID,
-	respondingChainID ids.ID,
+	chainID ids.ID,
 	requestID uint32,
 	op message.Op,
-	failedMsg message.InboundMessage,
+	failedMsg *message.InboundMessage,
 	engineType p2p.EngineType,
 ) {
 	r.router.RegisterRequest(
 		ctx,
 		nodeID,
-		requestingChainID,
-		respondingChainID,
+		chainID,
 		requestID,
 		op,
 		failedMsg,
@@ -87,29 +83,40 @@ func (r *tracedRouter) RegisterRequest(
 	)
 }
 
-func (r *tracedRouter) HandleInbound(ctx context.Context, msg message.InboundMessage) {
-	m := msg.Message()
-	destinationChainID, err := message.GetChainID(m)
-	if err != nil {
-		r.router.HandleInbound(ctx, msg)
-		return
-	}
-
-	sourceChainID, err := message.GetSourceChainID(m)
+func (r *tracedRouter) HandleInbound(ctx context.Context, msg *message.InboundMessage) {
+	m := msg.Message
+	chainID, err := message.GetChainID(m)
 	if err != nil {
 		r.router.HandleInbound(ctx, msg)
 		return
 	}
 
 	ctx, span := r.tracer.Start(ctx, "tracedRouter.HandleInbound", oteltrace.WithAttributes(
-		attribute.Stringer("nodeID", msg.NodeID()),
-		attribute.Stringer("messageOp", msg.Op()),
-		attribute.Stringer("chainID", destinationChainID),
-		attribute.Stringer("sourceChainID", sourceChainID),
+		attribute.Stringer("nodeID", msg.NodeID),
+		attribute.Stringer("messageOp", msg.Op),
+		attribute.Stringer("chainID", chainID),
 	))
 	defer span.End()
 
 	r.router.HandleInbound(ctx, msg)
+}
+
+func (r *tracedRouter) HandleInternal(ctx context.Context, msg *message.InboundMessage) {
+	m := msg.Message
+	chainID, err := message.GetChainID(m)
+	if err != nil {
+		r.router.HandleInternal(ctx, msg)
+		return
+	}
+
+	ctx, span := r.tracer.Start(ctx, "tracedRouter.HandleInternal", oteltrace.WithAttributes(
+		attribute.Stringer("nodeID", msg.NodeID),
+		attribute.Stringer("messageOp", msg.Op),
+		attribute.Stringer("chainID", chainID),
+	))
+	defer span.End()
+
+	r.router.HandleInternal(ctx, msg)
 }
 
 func (r *tracedRouter) Shutdown(ctx context.Context) {

@@ -9,7 +9,9 @@ import (
 	_ "embed"
 
 	"github.com/ava-labs/avalanchego/utils/units"
+	"github.com/ava-labs/avalanchego/vms/components/gas"
 	"github.com/ava-labs/avalanchego/vms/platformvm/reward"
+	"github.com/ava-labs/avalanchego/vms/platformvm/validators/fee"
 )
 
 var (
@@ -19,24 +21,51 @@ var (
 	// CostwoParams are the params used for the costwo test network
 	CostwoParams = Params{
 		TxFeeConfig: TxFeeConfig{
-			TxFee:                 units.MilliAvax,
-			CreateAssetTxFee:      units.MilliAvax,
-			CreateSubnetTxFee:     100 * units.MegaAvax,
-			CreateBlockchainTxFee: 100 * units.MegaAvax,
+			CreateAssetTxFee: units.MilliAvax,
+			TxFee:            units.MilliAvax,
+			DynamicFeeConfig: gas.Config{
+				Weights: gas.Dimensions{
+					gas.Bandwidth: 1,     // Max block size ~1MB
+					gas.DBRead:    1_000, // Max reads per block 1,000
+					gas.DBWrite:   1_000, // Max writes per block 1,000
+					gas.Compute:   4,     // Max compute time per block ~250ms
+				},
+				MaxCapacity:     1_000_000,
+				MaxPerSecond:    100_000, // Refill time 10s
+				TargetPerSecond: 50_000,  // Target is half of max
+				MinPrice:        250,
+				// ExcessConversionConstant = (MaxPerSecond - TargetPerSecond) * NumberOfSecondsPerDoubling / ln(2)
+				//
+				// ln(2) is a float and the result is consensus critical, so we
+				// hardcode the result.
+				ExcessConversionConstant: 2_164_043, // Double every 30s
+			},
+			ValidatorFeeConfig: fee.Config{
+				Capacity: 20_000,
+				Target:   10_000,
+				MinPrice: gas.Price(512 * units.NanoAvax),
+				// ExcessConversionConstant = (Capacity - Target) * NumberOfSecondsPerDoubling / ln(2)
+				//
+				// ln(2) is a float and the result is consensus critical, so we
+				// hardcode the result.
+				ExcessConversionConstant: 1_246_488_515, // Double every day
+			},
 		},
+		// See GetStakingConfig for how these values apply on the Flare networks.
 		StakingConfig: StakingConfig{
-			UptimeRequirement: .8, // 80%
-			MinValidatorStake: 1 * units.Avax,
-			MaxValidatorStake: 10000 * units.Avax,
-			MinDelegatorStake: 0,
-			MinDelegationFee:  0,
-			MinStakeDuration:  24 * time.Hour,
-			MaxStakeDuration:  365 * 24 * time.Hour,
+			UptimeRequirement:       .8, // 80%
+			MinValidatorStake:       1 * units.MegaAvax,
+			MaxValidatorStake:       200 * units.MegaAvax,
+			MinDelegatorStake:       50 * units.KiloAvax,
+			MinDelegationFee:        200_000, // 20%
+			MinStakeDuration:        24 * time.Hour,
+			MaxStakeDuration:        365 * 24 * time.Hour,
+			HeliconMinStakeDuration: 1 * time.Hour,
 			RewardConfig: reward.Config{
 				MaxConsumptionRate: .12 * reward.PercentDenominator,
 				MinConsumptionRate: .10 * reward.PercentDenominator,
 				MintingPeriod:      365 * 24 * time.Hour,
-				SupplyCap:          0 * units.MegaAvax,
+				SupplyCap:          720 * units.MegaAvax,
 			},
 		},
 	}

@@ -1,10 +1,10 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package tracker
 
 import (
-	"go.uber.org/zap"
+	"math/big"
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/validators"
@@ -70,14 +70,13 @@ func (t *targeter) TargetUsage(nodeID ids.NodeID) float64 {
 		return baseAlloc
 	}
 
-	totalWeight, err := t.vdrs.TotalWeight(constants.PrimaryNetworkID)
-	if err != nil {
-		t.log.Error("couldn't get total weight of primary network",
-			zap.Error(err),
-		)
+	totalWeight := t.vdrs.TotalWeight(constants.PrimaryNetworkID)
+	if totalWeight.Cmp(big.NewInt(0)) == 0 {
 		return baseAlloc
 	}
 
-	vdrAlloc := t.vdrAlloc * float64(weight) / float64(totalWeight)
+	totalWeightFloat, _ := totalWeight.Float64()
+
+	vdrAlloc := t.vdrAlloc * float64(weight) / totalWeightFloat
 	return vdrAlloc + baseAlloc
 }

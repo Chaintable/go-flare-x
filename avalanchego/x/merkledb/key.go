@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package merkledb
@@ -48,14 +48,14 @@ const (
 	BranchFactor4   = BranchFactor(4)
 	BranchFactor16  = BranchFactor(16)
 	BranchFactor256 = BranchFactor(256)
+
+	BranchFactorLargest = BranchFactor256
 )
 
 // Valid checks if BranchFactor [b] is one of the predefined valid options for BranchFactor
 func (b BranchFactor) Valid() error {
-	for _, validBF := range validBranchFactors {
-		if validBF == b {
-			return nil
-		}
+	if slices.Contains(validBranchFactors, b) {
+		return nil
 	}
 	return fmt.Errorf("%w: %d", ErrInvalidBranchFactor, b)
 }

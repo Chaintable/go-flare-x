@@ -19,28 +19,24 @@ Chaintable write node (this repo · producer, embeds pipeline tracer)
 
 ---
 
+<p align="left">
+  <a href="https://flare.network/" target="blank"><img src="https://content.flare.network/Flare-2.svg" width="300" alt="Flare Logo" /></a>
+</p>
+
 # go-flare
 
-go-flare is a modified version of [avalanchego@v1.11.0](https://github.com/ava-labs/avalanchego/releases/tag/v1.11.0) and [coreth@v0.13.0](https://github.com/ava-labs/coreth/releases/tag/v0.13.0), incorporating specific features for Flare and Songbird networks. These features include prioritized contract handling and the invocation of the daemon contract.
-
-Networks should be updated to this version before
-
-- Coston2: June 24, 2025 at 12:00:00 UTC
-- Coston: July 1, 2025 at 12:00:00 UTC
-- Songbird: July 22, 2025 at 12:00:00 UTC
-- Flare: August 5, 2025 at 12:00:00 UTC
-
+go-flare is a modified version of [avalanchego@v1.15.1](https://github.com/ava-labs/avalanchego/releases/tag/v1.15.1) incorporating specific features for Flare and Songbird networks. These features include prioritized contract handling and the invocation of the daemon contract.
 
 See [release notes](./RELEASES-flare.md) for more info.
 
 ## System Requirements
 
-- go version 1.22
+- go version 1.26.10
 - gcc, g++ and jq
 - CPU: Equivalent of 8 AWS vCPU
 - RAM: 16 GiB
 - Storage: 1TB Flare / 3.5TB Songbird
-- OS: Ubuntu 22.04/24.04
+- OS: Ubuntu 24.04
 
 ## Compilation
 

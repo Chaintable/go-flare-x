@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package executor
@@ -10,8 +10,9 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/constants"
 	"github.com/ava-labs/avalanchego/utils/math"
+	"github.com/ava-labs/avalanchego/vms/platformvm/config"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
-	"github.com/ava-labs/avalanchego/vms/platformvm/txs"
 )
 
 type addValidatorRules struct {
@@ -23,6 +24,13 @@ type addValidatorRules struct {
 	minDelegationFee         uint32
 	minStakeStartTime        time.Time
 	minFutureStartTimeOffset time.Duration // For legacy addValidator transactions
+}
+
+func primaryNetworkValidatorMinStakeDuration(cfg *config.Internal, timestamp time.Time) time.Duration {
+	if cfg.UpgradeConfig.IsHeliconActivated(timestamp) {
+		return cfg.HeliconMinStakeDuration
+	}
+	return cfg.MinStakeDuration
 }
 
 func getValidatorRules(
@@ -85,44 +93,6 @@ func getDelegatorRules(
 	}, nil
 }
 
-// GetNextStakerChangeTime returns the next time a staker will be either added
-// or removed to/from the current validator set.
-func GetNextStakerChangeTime(state state.Chain) (time.Time, error) {
-	currentStakerIterator, err := state.GetCurrentStakerIterator()
-	if err != nil {
-		return time.Time{}, err
-	}
-	defer currentStakerIterator.Release()
-
-	pendingStakerIterator, err := state.GetPendingStakerIterator()
-	if err != nil {
-		return time.Time{}, err
-	}
-	defer pendingStakerIterator.Release()
-
-	hasCurrentStaker := currentStakerIterator.Next()
-	hasPendingStaker := pendingStakerIterator.Next()
-	switch {
-	case hasCurrentStaker && hasPendingStaker:
-		nextCurrentTime := currentStakerIterator.Value().NextTime
-		nextPendingTime := pendingStakerIterator.Value().NextTime
-		if nextCurrentTime.Before(nextPendingTime) {
-			return nextCurrentTime, nil
-		}
-		return nextPendingTime, nil
-	case hasCurrentStaker:
-		return currentStakerIterator.Value().NextTime, nil
-	case hasPendingStaker:
-		return pendingStakerIterator.Value().NextTime, nil
-	default:
-		// Due to no initial stakers in genesis for Songbird networks
-		if state.GetNetworkID() == constants.SongbirdID || state.GetNetworkID() == constants.CostonID || state.GetNetworkID() == constants.LocalID {
-			return songbirdLatestStakingTime, nil
-		}
-		return time.Time{}, database.ErrNotFound
-	}
-}
-
 // GetValidator returns information about the given validator, which may be a
 // current validator or pending validator.
 func GetValidator(state state.Chain, subnetID ids.ID, nodeID ids.NodeID) (*state.Staker, error) {
@@ -154,7 +124,7 @@ func overDelegated(
 	if err != nil {
 		return true, err
 	}
-	newMaxWeight, err := math.Add64(maxWeight, delegatorWeight)
+	newMaxWeight, err := math.Add(maxWeight, delegatorWeight)
 	if err != nil {
 		return true, err
 	}
@@ -188,7 +158,7 @@ func GetMaxWeight(
 	for currentDelegatorIterator.Next() {
 		currentDelegator := currentDelegatorIterator.Value()
 
-		currentWeight, err = math.Add64(currentWeight, currentDelegator.Weight)
+		currentWeight, err = math.Add(currentWeight, currentDelegator.Weight)
 		if err != nil {
 			currentDelegatorIterator.Release()
 			return 0, err
@@ -231,9 +201,9 @@ func GetMaxWeight(
 
 		var op func(uint64, uint64) (uint64, error)
 		if isAdded {
-			op = math.Add64
+			op = math.Add
 		} else {
-			op = math.Sub[uint64]
+			op = math.Sub
 		}
 		currentWeight, err = op(currentWeight, delegator.Weight)
 		if err != nil {
@@ -246,13 +216,13 @@ func GetMaxWeight(
 	return max(currentMax, currentWeight), nil
 }
 
-func GetTransformSubnetTx(chain state.Chain, subnetID ids.ID) (*txs.TransformSubnetTx, error) {
+func GetTransformSubnetTx(chain state.Chain, subnetID ids.ID) (*platform.TransformSubnetTx, error) {
 	transformSubnetIntf, err := chain.GetSubnetTransformation(subnetID)
 	if err != nil {
 		return nil, err
 	}
 
-	transformSubnet, ok := transformSubnetIntf.Unsigned.(*txs.TransformSubnetTx)
+	transformSubnet, ok := transformSubnetIntf.Unsigned.(*platform.TransformSubnetTx)
 	if !ok {
 		return nil, ErrIsNotTransformSubnetTx
 	}

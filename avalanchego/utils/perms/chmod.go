@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package perms
@@ -19,6 +19,6 @@ func ChmodR(dir string, dirOnly bool, perm os.FileMode) error {
 		if err != nil || (dirOnly && !info.IsDir()) {
 			return err
 		}
-		return os.Chmod(name, perm)
+		return os.Chmod(name, perm) //#nosec G122 -- the node operator supplies dir.
 	})
 }

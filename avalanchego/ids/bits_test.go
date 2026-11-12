@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package ids
@@ -9,7 +9,6 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -24,7 +23,7 @@ func flip(b uint8) uint8 {
 func BitString(id ID) string {
 	sb := strings.Builder{}
 	for _, b := range id {
-		sb.WriteString(fmt.Sprintf("%08b", flip(b)))
+		fmt.Fprintf(&sb, "%08b", flip(b))
 	}
 	return sb.String()
 }
@@ -71,8 +70,7 @@ func TestEqualSubsetBadMiddle(t *testing.T) {
 }
 
 func TestEqualSubsetAll3Bytes(t *testing.T) {
-	rand.Seed(time.Now().UnixNano())
-	seed := uint64(rand.Int63()) // #nosec G404
+	seed := rand.Uint64() //#nosec G404
 	t.Logf("seed: %d", seed)
 	id1 := ID{}.Prefix(seed)
 

@@ -1,10 +1,14 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package p2p
 
 import (
+	"cmp"
 	"context"
+	"fmt"
+	"math"
+	"math/big"
 	"sync"
 	"time"
 
@@ -12,102 +16,236 @@ import (
 
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow/validators"
+	"github.com/ava-labs/avalanchego/utils"
 	"github.com/ava-labs/avalanchego/utils/logging"
+	"github.com/ava-labs/avalanchego/utils/sampler"
 	"github.com/ava-labs/avalanchego/utils/set"
+	"github.com/ava-labs/avalanchego/version"
 )
 
 var (
-	_ ValidatorSet = (*Validators)(nil)
-	_ NodeSampler  = (*Validators)(nil)
+	_ ValidatorSet      = (*Validators)(nil)
+	_ ValidatorSubset   = (*Validators)(nil)
+	_ NodeSampler       = (*Validators)(nil)
+	_ ConnectionHandler = (*Validators)(nil)
 )
 
 type ValidatorSet interface {
+	Len(ctx context.Context) int
 	Has(ctx context.Context, nodeID ids.NodeID) bool // TODO return error
 }
 
+type ValidatorSubset interface {
+	Top(ctx context.Context, percentage float64) []ids.NodeID // TODO return error
+}
+
 func NewValidators(
-	peers *Peers,
 	log logging.Logger,
 	subnetID ids.ID,
 	validators validators.State,
 	maxValidatorSetStaleness time.Duration,
 ) *Validators {
 	return &Validators{
-		peers:                    peers,
 		log:                      log,
 		subnetID:                 subnetID,
 		validators:               validators,
 		maxValidatorSetStaleness: maxValidatorSetStaleness,
+		totalWeight:              new(big.Int),
 	}
 }
 
 // Validators contains a set of nodes that are staking.
 type Validators struct {
-	peers      *Peers
-	log        logging.Logger
-	subnetID   ids.ID
-	validators validators.State
-
-	lock                     sync.Mutex
-	validatorIDs             set.SampleableSet[ids.NodeID]
-	lastUpdated              time.Time
+	log                      logging.Logger
+	subnetID                 ids.ID
+	validators               validators.State
 	maxValidatorSetStaleness time.Duration
+
+	lock                sync.RWMutex
+	peers               set.Set[ids.NodeID]
+	connectedValidators set.Set[ids.NodeID]
+	validatorList       []validator
+	validatorSet        set.Set[ids.NodeID]
+	totalWeight         *big.Int
+	lastUpdated         time.Time
 }
 
-func (v *Validators) refresh(ctx context.Context) {
-	if time.Since(v.lastUpdated) < v.maxValidatorSetStaleness {
-		return
+type validator struct {
+	nodeID ids.NodeID
+	weight uint64
+}
+
+func (v validator) Compare(other validator) int {
+	if weightCmp := cmp.Compare(v.weight, other.weight); weightCmp != 0 {
+		return -weightCmp // Sort in decreasing order of stake
 	}
+	return v.nodeID.Compare(other.nodeID)
+}
 
-	v.validatorIDs.Clear()
-
+// getCurrentValidators must not be called with Validators.lock held to avoid a
+// potential deadlock.
+//
+// getCurrentValidators calls [validators.State] which grabs the context lock.
+// [Validators.Connected] and [Validators.Disconnected] are called with the
+// context lock.
+func (v *Validators) getCurrentValidators(ctx context.Context) (map[ids.NodeID]*validators.GetValidatorOutput, error) {
 	height, err := v.validators.GetCurrentHeight(ctx)
 	if err != nil {
-		v.log.Warn("failed to get current height", zap.Error(err))
-		return
+		return nil, fmt.Errorf("getting current height: %w", err)
 	}
 	validatorSet, err := v.validators.GetValidatorSet(ctx, height, v.subnetID)
 	if err != nil {
-		v.log.Warn("failed to get validator set", zap.Error(err))
+		return nil, fmt.Errorf("getting validator set: %w", err)
+	}
+	delete(validatorSet, ids.EmptyNodeID) // Ignore inactive ACP-77 validators.
+	return validatorSet, nil
+}
+
+// refresh must not be called with Validators.lock held.
+func (v *Validators) refresh(ctx context.Context) {
+	v.lock.RLock()
+	lastUpdated := v.lastUpdated
+	v.lock.RUnlock()
+
+	if time.Since(lastUpdated) < v.maxValidatorSetStaleness {
 		return
 	}
 
-	for nodeID := range validatorSet {
-		v.validatorIDs.Add(nodeID)
+	validatorSet, err := v.getCurrentValidators(ctx)
+	if err != nil {
+		v.log.Warn("failed to get current validator set", zap.Error(err))
+		return
 	}
+
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	// Even though validatorList may be nil, truncating will not panic.
+	v.validatorList = v.validatorList[:0]
+	v.validatorSet.Clear()
+	v.totalWeight.SetUint64(0)
+	for nodeID, vdr := range validatorSet {
+		v.validatorList = append(v.validatorList, validator{
+			nodeID: nodeID,
+			weight: vdr.Weight,
+		})
+		v.validatorSet.Add(nodeID)
+		v.totalWeight.Add(v.totalWeight, new(big.Int).SetUint64(vdr.Weight))
+	}
+	utils.Sort(v.validatorList)
+
+	v.connectedValidators = set.Intersect(v.validatorSet, v.peers)
 
 	v.lastUpdated = time.Now()
 }
 
 // Sample returns a random sample of connected validators
 func (v *Validators) Sample(ctx context.Context, limit int) []ids.NodeID {
-	v.lock.Lock()
-	defer v.lock.Unlock()
-
 	v.refresh(ctx)
 
-	// TODO: Account for peer connectivity during the sampling of validators
-	// rather than filtering sampled validators.
-	validatorIDs := v.validatorIDs.Sample(limit)
-	sampled := validatorIDs[:0]
+	v.lock.RLock()
+	defer v.lock.RUnlock()
 
-	for _, validatorID := range validatorIDs {
-		if !v.peers.has(validatorID) {
+	var (
+		uniform = sampler.NewUniform()
+		sampled = make([]ids.NodeID, 0, limit)
+	)
+
+	uniform.Initialize(uint64(len(v.validatorList)))
+	for len(sampled) < limit {
+		i, hasNext := uniform.Next()
+		if !hasNext {
+			break
+		}
+
+		nodeID := v.validatorList[i].nodeID
+		if !v.peers.Contains(nodeID) {
 			continue
 		}
 
-		sampled = append(sampled, validatorID)
+		sampled = append(sampled, nodeID)
 	}
 
 	return sampled
 }
 
-// Has returns if nodeID is a connected validator
-func (v *Validators) Has(ctx context.Context, nodeID ids.NodeID) bool {
-	v.lock.Lock()
-	defer v.lock.Unlock()
+// Top returns the top [percentage] of validators, regardless of if they are
+// connected or not.
+func (v *Validators) Top(ctx context.Context, percentage float64) []ids.NodeID {
+	percentage = max(0, min(1, percentage)) // bound percentage inside [0, 1]
 
 	v.refresh(ctx)
 
-	return v.peers.has(nodeID) && v.validatorIDs.Contains(nodeID)
+	v.lock.RLock()
+	defer v.lock.RUnlock()
+
+	var (
+		maxSize      = int(math.Ceil(percentage * float64(len(v.validatorList))))
+		top          = make([]ids.NodeID, 0, maxSize)
+		currentStake = new(big.Int)
+		targetStake  = ceilStake(v.totalWeight, percentage)
+	)
+
+	for _, vdr := range v.validatorList {
+		if currentStake.Cmp(targetStake) >= 0 {
+			break
+		}
+		top = append(top, vdr.nodeID)
+		currentStake.Add(currentStake, new(big.Int).SetUint64(vdr.weight))
+	}
+
+	return top
+}
+
+// ceilStake returns ceil(total * percentage) as a *big.Int. percentage is
+// expected to be in [0, 1].
+func ceilStake(total *big.Int, percentage float64) *big.Int {
+	scaled := new(big.Float).SetInt(total)
+	scaled.Mul(scaled, big.NewFloat(percentage))
+	result, acc := scaled.Int(nil)
+	if acc == big.Below {
+		result.Add(result, big.NewInt(1))
+	}
+	return result
+}
+
+// Has returns if nodeID is a connected validator
+func (v *Validators) Has(ctx context.Context, nodeID ids.NodeID) bool {
+	v.refresh(ctx)
+
+	v.lock.RLock()
+	defer v.lock.RUnlock()
+
+	return v.connectedValidators.Contains(nodeID)
+}
+
+// Len returns the number of connected validators.
+func (v *Validators) Len(ctx context.Context) int {
+	v.refresh(ctx)
+
+	v.lock.RLock()
+	defer v.lock.RUnlock()
+
+	return v.connectedValidators.Len()
+}
+
+func (v *Validators) Connected(nodeID ids.NodeID, _ *version.Application) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	v.peers.Add(nodeID)
+
+	if !v.validatorSet.Contains(nodeID) {
+		return
+	}
+
+	v.connectedValidators.Add(nodeID)
+}
+
+func (v *Validators) Disconnected(nodeID ids.NodeID) {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	v.peers.Remove(nodeID)
+	v.connectedValidators.Remove(nodeID)
 }

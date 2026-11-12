@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package subprocess
@@ -64,7 +64,7 @@ func Bootstrap(
 		return nil, nil, fmt.Errorf("%w: stderr and stdout required", runtime.ErrInvalidConfig)
 	}
 
-	intitializer := newInitializer()
+	intitializer := newInitializer(cmd.Path)
 
 	server := grpcutils.NewServer()
 	defer server.GracefulStop()
@@ -99,7 +99,7 @@ func Bootstrap(
 	stopper := NewStopper(log, cmd)
 
 	// start stdout collector
-	go func() {
+	go func() { //#nosec G118 -- this collector outlives Bootstrap, and a done ctx skips the graceful SIGTERM.
 		_, err := io.Copy(config.Stdout, stdoutPipe)
 		if err != nil {
 			log.Error("stdout collector failed",
@@ -112,7 +112,7 @@ func Bootstrap(
 	}()
 
 	// start stderr collector
-	go func() {
+	go func() { //#nosec G118 -- this collector outlives Bootstrap, and a done ctx skips the graceful SIGTERM.
 		_, err := io.Copy(config.Stderr, stderrPipe)
 		if err != nil {
 			log.Error("stderr collector failed",

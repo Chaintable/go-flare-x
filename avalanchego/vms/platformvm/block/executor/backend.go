@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package executor
@@ -10,7 +10,7 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/utils/set"
-	"github.com/ava-labs/avalanchego/vms/platformvm/block"
+	"github.com/ava-labs/avalanchego/vms/platformvm/platform"
 	"github.com/ava-labs/avalanchego/vms/platformvm/state"
 	"github.com/ava-labs/avalanchego/vms/platformvm/txs/mempool"
 )
@@ -19,7 +19,7 @@ var errConflictingParentTxs = errors.New("block contains a transaction that conf
 
 // Shared fields used by visitors.
 type backend struct {
-	mempool.Mempool
+	*mempool.Mempool
 	// lastAccepted is the ID of the last block that had Accept() called on it.
 	lastAccepted ids.ID
 
@@ -31,7 +31,7 @@ type backend struct {
 	// Note that Genesis block is a commit block so no need to update
 	// blkIDToState with it upon backend creation (Genesis is already accepted)
 	blkIDToState map[ids.ID]*blockState
-	state        state.State
+	state        *state.State
 
 	ctx *snow.Context
 }
@@ -51,7 +51,7 @@ func (b *backend) GetState(blkID ids.ID) (state.Chain, bool) {
 	return b.state, blkID == b.state.GetLastAccepted()
 }
 
-func (b *backend) getOnAbortState(blkID ids.ID) (state.Diff, bool) {
+func (b *backend) getOnAbortState(blkID ids.ID) (*state.Diff, bool) {
 	state, ok := b.blkIDToState[blkID]
 	if !ok || state.onAbortState == nil {
 		return nil, false
@@ -59,7 +59,7 @@ func (b *backend) getOnAbortState(blkID ids.ID) (state.Diff, bool) {
 	return state.onAbortState, true
 }
 
-func (b *backend) getOnCommitState(blkID ids.ID) (state.Diff, bool) {
+func (b *backend) getOnCommitState(blkID ids.ID) (*state.Diff, bool) {
 	state, ok := b.blkIDToState[blkID]
 	if !ok || state.onCommitState == nil {
 		return nil, false
@@ -67,7 +67,7 @@ func (b *backend) getOnCommitState(blkID ids.ID) (state.Diff, bool) {
 	return state.onCommitState, true
 }
 
-func (b *backend) GetBlock(blkID ids.ID) (block.Block, error) {
+func (b *backend) GetBlock(blkID ids.ID) (platform.Block, error) {
 	// See if the block is in memory.
 	if blk, ok := b.blkIDToState[blkID]; ok {
 		return blk.statelessBlock, nil

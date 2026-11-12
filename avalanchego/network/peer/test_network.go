@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package peer
@@ -7,6 +7,7 @@ import (
 	"github.com/ava-labs/avalanchego/ids"
 	"github.com/ava-labs/avalanchego/utils/bloom"
 	"github.com/ava-labs/avalanchego/utils/ips"
+	"github.com/ava-labs/avalanchego/utils/set"
 )
 
 var TestNetwork Network = testNetwork{}
@@ -29,6 +30,12 @@ func (testNetwork) KnownPeers() ([]byte, []byte) {
 	return bloom.EmptyFilter.Marshal(), nil
 }
 
-func (testNetwork) Peers(ids.NodeID, *bloom.ReadFilter, []byte) []*ips.ClaimedIPPort {
+func (testNetwork) Peers(
+	ids.NodeID,
+	set.Set[ids.ID],
+	bool,
+	*bloom.ReadFilter,
+	[]byte,
+) []*ips.ClaimedIPPort {
 	return nil
 }

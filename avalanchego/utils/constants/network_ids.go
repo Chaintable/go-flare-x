@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package constants
@@ -99,19 +99,7 @@ var (
 		SongbirdID:   SongbirdHRP,
 		CostonID:     CostonHRP,
 	}
-	NetworkHRPToNetworkID = map[string]uint32{
-		MainnetHRP:    MainnetID,
-		CascadeHRP:    CascadeID,
-		DenaliHRP:     DenaliID,
-		EverestHRP:    EverestID,
-		UnitTestHRP:   UnitTestID,
-		LocalHRP:      LocalID,
-		FlareHRP:      FlareID,
-		CostwoHRP:     CostwoID,
-		LocalFlareHRP: LocalFlareID,
-		SongbirdHRP:   SongbirdID,
-		CostonHRP:     CostonID,
-	}
+
 	ProductionNetworkIDs = set.Of(FlareID, SongbirdID, CostwoID, CostonID)
 
 	ValidNetworkPrefix = "network-"

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package leveldb
@@ -186,7 +186,7 @@ type config struct {
 }
 
 // New returns a wrapped LevelDB object.
-func New(file string, configBytes []byte, log logging.Logger, namespace string, reg prometheus.Registerer) (database.Database, error) {
+func New(file string, configBytes []byte, log logging.Logger, reg prometheus.Registerer) (database.Database, error) {
 	parsedConfig := config{
 		BlockCacheCapacity:     DefaultBlockCacheSize,
 		DisableSeeksCompaction: true,
@@ -236,7 +236,7 @@ func New(file string, configBytes []byte, log logging.Logger, namespace string, 
 		closeCh: make(chan struct{}),
 	}
 	if parsedConfig.MetricUpdateFrequency > 0 {
-		metrics, err := newMetrics(namespace, reg)
+		metrics, err := newMetrics(reg)
 		if err != nil {
 			// Drop any close error to report the original error
 			_ = db.Close()

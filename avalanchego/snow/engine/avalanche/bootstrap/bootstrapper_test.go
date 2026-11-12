@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package bootstrap
@@ -7,28 +7,35 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math/big"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ava-labs/avalanchego/database/memdb"
 	"github.com/ava-labs/avalanchego/database/prefixdb"
 	"github.com/ava-labs/avalanchego/ids"
-	"github.com/ava-labs/avalanchego/proto/pb/p2p"
+	"github.com/ava-labs/avalanchego/network/p2p"
 	"github.com/ava-labs/avalanchego/snow"
 	"github.com/ava-labs/avalanchego/snow/choices"
 	"github.com/ava-labs/avalanchego/snow/consensus/avalanche"
 	"github.com/ava-labs/avalanchego/snow/consensus/snowstorm"
+	"github.com/ava-labs/avalanchego/snow/engine/avalanche/bootstrap/queue"
 	"github.com/ava-labs/avalanchego/snow/engine/avalanche/getter"
-	"github.com/ava-labs/avalanchego/snow/engine/avalanche/vertex"
+	"github.com/ava-labs/avalanchego/snow/engine/avalanche/vertex/vertextest"
 	"github.com/ava-labs/avalanchego/snow/engine/common"
-	"github.com/ava-labs/avalanchego/snow/engine/common/queue"
 	"github.com/ava-labs/avalanchego/snow/engine/common/tracker"
+	"github.com/ava-labs/avalanchego/snow/engine/enginetest"
 	"github.com/ava-labs/avalanchego/snow/snowtest"
 	"github.com/ava-labs/avalanchego/snow/validators"
 	"github.com/ava-labs/avalanchego/utils/constants"
+	"github.com/ava-labs/avalanchego/utils/logging"
 	"github.com/ava-labs/avalanchego/utils/set"
+	"github.com/ava-labs/avalanchego/version"
+
+	p2ppb "github.com/ava-labs/avalanchego/proto/pb/p2p"
 )
 
 var (
@@ -51,7 +58,7 @@ func (t *testTx) Accept(ctx context.Context) error {
 	return nil
 }
 
-func newConfig(t *testing.T) (Config, ids.NodeID, *common.SenderTest, *vertex.TestManager, *vertex.TestVM) {
+func newConfig(t *testing.T) (Config, ids.NodeID, *enginetest.Sender, *vertextest.Manager, *vertextest.VM) {
 	require := require.New(t)
 
 	snowCtx := snowtest.Context(t, snowtest.CChainID)
@@ -59,9 +66,9 @@ func newConfig(t *testing.T) (Config, ids.NodeID, *common.SenderTest, *vertex.Te
 
 	vdrs := validators.NewManager()
 	db := memdb.New()
-	sender := &common.SenderTest{T: t}
-	manager := vertex.NewTestManager(t)
-	vm := &vertex.TestVM{}
+	sender := &enginetest.Sender{T: t}
+	manager := vertextest.NewManager(t)
+	vm := &vertextest.VM{}
 	vm.T = t
 
 	sender.Default(true)
@@ -71,32 +78,44 @@ func newConfig(t *testing.T) (Config, ids.NodeID, *common.SenderTest, *vertex.Te
 	peer := ids.GenerateTestNodeID()
 	require.NoError(vdrs.AddStaker(constants.PrimaryNetworkID, peer, nil, ids.Empty, 1))
 
-	vtxBlocker, err := queue.NewWithMissing(prefixdb.New([]byte("vtx"), db), "vtx", ctx.AvalancheRegisterer)
+	vtxBlocker, err := queue.NewWithMissing(prefixdb.New([]byte("vtx"), db), "vtx", prometheus.NewRegistry())
 	require.NoError(err)
 
-	txBlocker, err := queue.New(prefixdb.New([]byte("tx"), db), "tx", ctx.AvalancheRegisterer)
+	txBlocker, err := queue.New(prefixdb.New([]byte("tx"), db), "tx", prometheus.NewRegistry())
 	require.NoError(err)
 
 	peerTracker := tracker.NewPeers()
-	totalWeight, err := vdrs.TotalWeight(constants.PrimaryNetworkID)
-	require.NoError(err)
-	startupTracker := tracker.NewStartup(peerTracker, totalWeight/2+1)
-	vdrs.RegisterCallbackListener(constants.PrimaryNetworkID, startupTracker)
+	totalWeight := vdrs.TotalWeight(constants.PrimaryNetworkID)
+	startupWeight := new(big.Int).Add(new(big.Int).Div(totalWeight, big.NewInt(2)), big.NewInt(1))
+	startupTracker := tracker.NewStartup(peerTracker, startupWeight)
+	vdrs.RegisterSetCallbackListener(constants.PrimaryNetworkID, startupTracker)
 
-	avaGetHandler, err := getter.New(manager, sender, ctx.Log, time.Second, 2000, ctx.AvalancheRegisterer)
+	avaGetHandler, err := getter.New(manager, sender, ctx.Log, time.Second, 2000, prometheus.NewRegistry())
 	require.NoError(err)
+
+	p2pTracker, err := p2p.NewPeerTracker(
+		logging.NoLog{},
+		"",
+		prometheus.NewRegistry(),
+		nil,
+		version.Current,
+	)
+	require.NoError(err)
+
+	p2pTracker.Connected(peer, version.Current)
 
 	return Config{
 		AllGetsServer:                  avaGetHandler,
 		Ctx:                            ctx,
-		Beacons:                        vdrs,
 		StartupTracker:                 startupTracker,
 		Sender:                         sender,
+		PeerTracker:                    p2pTracker,
 		AncestorsMaxContainersReceived: 2000,
 		VtxBlocked:                     vtxBlocker,
 		TxBlocked:                      txBlocker,
 		Manager:                        manager,
 		VM:                             vm,
+		Haltable:                       &common.Halter{},
 	}, peer, sender, manager, vm
 }
 
@@ -151,11 +170,12 @@ func TestBootstrapperSingleFrontier(t *testing.T) {
 		config,
 		func(context.Context, uint32) error {
 			config.Ctx.State.Set(snow.EngineState{
-				Type:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+				Type:  p2ppb.EngineType_ENGINE_TYPE_DAG,
 				State: snow.NormalOp,
 			})
 			return nil
 		},
+		prometheus.NewRegistry(),
 	)
 	require.NoError(err)
 
@@ -168,7 +188,7 @@ func TestBootstrapperSingleFrontier(t *testing.T) {
 		case vtxID2:
 			return vtx2, nil
 		default:
-			require.FailNow(errUnknownVertex.Error())
+			t.Fatal(errUnknownVertex)
 			return nil, errUnknownVertex
 		}
 	}
@@ -182,7 +202,7 @@ func TestBootstrapperSingleFrontier(t *testing.T) {
 		case bytes.Equal(vtxBytes, vtxBytes2):
 			return vtx2, nil
 		default:
-			require.FailNow(errParsedUnknownVertex.Error())
+			t.Fatal(errParsedUnknownVertex)
 			return nil, errParsedUnknownVertex
 		}
 	}
@@ -202,7 +222,7 @@ func TestBootstrapperSingleFrontier(t *testing.T) {
 	}
 
 	vm.CantSetState = false
-	require.NoError(bs.Start(context.Background(), 0))
+	require.NoError(bs.Start(t.Context(), 0))
 	require.Equal(snow.NormalOp, config.Ctx.State.Get().State)
 	require.Equal(choices.Accepted, vtx0.Status())
 	require.Equal(choices.Accepted, vtx1.Status())
@@ -257,11 +277,12 @@ func TestBootstrapperByzantineResponses(t *testing.T) {
 		config,
 		func(context.Context, uint32) error {
 			config.Ctx.State.Set(snow.EngineState{
-				Type:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+				Type:  p2ppb.EngineType_ENGINE_TYPE_DAG,
 				State: snow.NormalOp,
 			})
 			return nil
 		},
+		prometheus.NewRegistry(),
 	)
 	require.NoError(err)
 
@@ -272,7 +293,7 @@ func TestBootstrapperByzantineResponses(t *testing.T) {
 		case vtxID0:
 			return nil, errUnknownVertex
 		default:
-			require.FailNow(errUnknownVertex.Error())
+			t.Fatal(errUnknownVertex)
 			return nil, errUnknownVertex
 		}
 	}
@@ -299,18 +320,18 @@ func TestBootstrapperByzantineResponses(t *testing.T) {
 			vtx2.StatusV = choices.Processing
 			return vtx2, nil
 		default:
-			require.FailNow(errParsedUnknownVertex.Error())
+			t.Fatal(errParsedUnknownVertex)
 			return nil, errParsedUnknownVertex
 		}
 	}
 
 	vm.CantSetState = false
-	require.NoError(bs.Start(context.Background(), 0)) // should request vtx0
+	require.NoError(bs.Start(t.Context(), 0)) // should request vtx0
 	require.Equal(vtxID0, reqVtxID)
 
 	oldReqID := *requestID
-	require.NoError(bs.Ancestors(context.Background(), peerID, *requestID, [][]byte{vtxBytes2})) // send unexpected vertex
-	require.NotEqual(oldReqID, *requestID)                                                       // should have sent a new request
+	require.NoError(bs.Ancestors(t.Context(), peerID, *requestID, [][]byte{vtxBytes2})) // send unexpected vertex
+	require.NotEqual(oldReqID, *requestID)                                              // should have sent a new request
 
 	oldReqID = *requestID
 	manager.GetVtxF = func(_ context.Context, vtxID ids.ID) (avalanche.Vertex, error) {
@@ -320,7 +341,7 @@ func TestBootstrapperByzantineResponses(t *testing.T) {
 		case vtxID0:
 			return vtx0, nil
 		default:
-			require.FailNow(errUnknownVertex.Error())
+			t.Fatal(errUnknownVertex)
 			return nil, errUnknownVertex
 		}
 	}
@@ -339,8 +360,8 @@ func TestBootstrapperByzantineResponses(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(bs.Ancestors(context.Background(), peerID, *requestID, [][]byte{vtxBytes0, vtxBytes2})) // send expected vertex and vertex that should not be accepted
-	require.Equal(oldReqID, *requestID)                                                                     // shouldn't have sent a new request
+	require.NoError(bs.Ancestors(t.Context(), peerID, *requestID, [][]byte{vtxBytes0, vtxBytes2})) // send expected vertex and vertex that should not be accepted
+	require.Equal(oldReqID, *requestID)                                                            // shouldn't have sent a new request
 	require.Equal(snow.NormalOp, config.Ctx.State.Get().State)
 	require.Equal(choices.Accepted, vtx0.Status())
 	require.Equal(choices.Accepted, vtx1.Status())
@@ -423,11 +444,12 @@ func TestBootstrapperTxDependencies(t *testing.T) {
 		config,
 		func(context.Context, uint32) error {
 			config.Ctx.State.Set(snow.EngineState{
-				Type:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+				Type:  p2ppb.EngineType_ENGINE_TYPE_DAG,
 				State: snow.NormalOp,
 			})
 			return nil
 		},
+		prometheus.NewRegistry(),
 	)
 	require.NoError(err)
 
@@ -438,7 +460,7 @@ func TestBootstrapperTxDependencies(t *testing.T) {
 		case bytes.Equal(vtxBytes, vtxBytes0):
 			return vtx0, nil
 		default:
-			require.FailNow(errParsedUnknownVertex.Error())
+			t.Fatal(errParsedUnknownVertex)
 			return nil, errParsedUnknownVertex
 		}
 	}
@@ -449,7 +471,7 @@ func TestBootstrapperTxDependencies(t *testing.T) {
 		case vtxID0:
 			return nil, errUnknownVertex
 		default:
-			require.FailNow(errUnknownVertex.Error())
+			t.Fatal(errUnknownVertex)
 			return nil, errUnknownVertex
 		}
 	}
@@ -463,7 +485,7 @@ func TestBootstrapperTxDependencies(t *testing.T) {
 	}
 
 	vm.CantSetState = false
-	require.NoError(bs.Start(context.Background(), 0))
+	require.NoError(bs.Start(t.Context(), 0))
 
 	manager.ParseVtxF = func(_ context.Context, vtxBytes []byte) (avalanche.Vertex, error) {
 		switch {
@@ -473,7 +495,7 @@ func TestBootstrapperTxDependencies(t *testing.T) {
 			vtx0.StatusV = choices.Processing
 			return vtx0, nil
 		default:
-			require.FailNow(errParsedUnknownVertex.Error())
+			t.Fatal(errParsedUnknownVertex)
 			return nil, errParsedUnknownVertex
 		}
 	}
@@ -492,7 +514,7 @@ func TestBootstrapperTxDependencies(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(bs.Ancestors(context.Background(), peerID, *reqIDPtr, [][]byte{vtxBytes0}))
+	require.NoError(bs.Ancestors(t.Context(), peerID, *reqIDPtr, [][]byte{vtxBytes0}))
 	require.Equal(snow.NormalOp, config.Ctx.State.Get().State)
 	require.Equal(choices.Accepted, tx0.Status())
 	require.Equal(choices.Accepted, tx1.Status())
@@ -546,24 +568,25 @@ func TestBootstrapperIncompleteAncestors(t *testing.T) {
 		config,
 		func(context.Context, uint32) error {
 			config.Ctx.State.Set(snow.EngineState{
-				Type:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
+				Type:  p2ppb.EngineType_ENGINE_TYPE_DAG,
 				State: snow.NormalOp,
 			})
 			return nil
 		},
+		prometheus.NewRegistry(),
 	)
 	require.NoError(err)
 
 	manager.GetVtxF = func(_ context.Context, vtxID ids.ID) (avalanche.Vertex, error) {
-		switch {
-		case vtxID == vtxID0:
+		switch vtxID {
+		case vtxID0:
 			return nil, errUnknownVertex
-		case vtxID == vtxID1:
+		case vtxID1:
 			return nil, errUnknownVertex
-		case vtxID == vtxID2:
+		case vtxID2:
 			return vtx2, nil
 		default:
-			require.FailNow(errUnknownVertex.Error())
+			t.Fatal(errUnknownVertex)
 			return nil, errUnknownVertex
 		}
 	}
@@ -578,7 +601,7 @@ func TestBootstrapperIncompleteAncestors(t *testing.T) {
 		case bytes.Equal(vtxBytes, vtxBytes2):
 			return vtx2, nil
 		default:
-			require.FailNow(errParsedUnknownVertex.Error())
+			t.Fatal(errParsedUnknownVertex)
 			return nil, errParsedUnknownVertex
 		}
 	}
@@ -593,10 +616,10 @@ func TestBootstrapperIncompleteAncestors(t *testing.T) {
 	}
 
 	vm.CantSetState = false
-	require.NoError(bs.Start(context.Background(), 0)) // should request vtx1
+	require.NoError(bs.Start(t.Context(), 0)) // should request vtx1
 	require.Equal(vtxID1, requested)
 
-	require.NoError(bs.Ancestors(context.Background(), peerID, *reqIDPtr, [][]byte{vtxBytes1})) // Provide vtx1; should request vtx0
+	require.NoError(bs.Ancestors(t.Context(), peerID, *reqIDPtr, [][]byte{vtxBytes1})) // Provide vtx1; should request vtx0
 	require.Equal(snow.Bootstrapping, bs.Context().State.Get().State)
 	require.Equal(vtxID0, requested)
 
@@ -614,117 +637,9 @@ func TestBootstrapperIncompleteAncestors(t *testing.T) {
 		return nil
 	}
 
-	require.NoError(bs.Ancestors(context.Background(), peerID, *reqIDPtr, [][]byte{vtxBytes0})) // Provide vtx0; can finish now
+	require.NoError(bs.Ancestors(t.Context(), peerID, *reqIDPtr, [][]byte{vtxBytes0})) // Provide vtx0; can finish now
 	require.Equal(snow.NormalOp, bs.Context().State.Get().State)
 	require.Equal(choices.Accepted, vtx0.Status())
 	require.Equal(choices.Accepted, vtx1.Status())
 	require.Equal(choices.Accepted, vtx2.Status())
-}
-
-func TestBootstrapperUnexpectedVertex(t *testing.T) {
-	require := require.New(t)
-
-	config, peerID, sender, manager, vm := newConfig(t)
-
-	vtxID0 := ids.Empty.Prefix(0)
-	vtxID1 := ids.Empty.Prefix(1)
-
-	vtxBytes0 := []byte{0}
-	vtxBytes1 := []byte{1}
-
-	vtx0 := &avalanche.TestVertex{
-		TestDecidable: choices.TestDecidable{
-			IDV:     vtxID0,
-			StatusV: choices.Unknown,
-		},
-		HeightV: 0,
-		BytesV:  vtxBytes0,
-	}
-	vtx1 := &avalanche.TestVertex{ // vtx1 is the stop vertex
-		TestDecidable: choices.TestDecidable{
-			IDV:     vtxID1,
-			StatusV: choices.Unknown,
-		},
-		ParentsV: []avalanche.Vertex{vtx0},
-		HeightV:  1,
-		BytesV:   vtxBytes1,
-	}
-
-	config.StopVertexID = vtxID1
-	bs, err := New(
-		config,
-		func(context.Context, uint32) error {
-			config.Ctx.State.Set(snow.EngineState{
-				Type:  p2p.EngineType_ENGINE_TYPE_AVALANCHE,
-				State: snow.NormalOp,
-			})
-			return nil
-		},
-	)
-	require.NoError(err)
-
-	parsedVtx0 := false
-	parsedVtx1 := false
-	manager.GetVtxF = func(_ context.Context, vtxID ids.ID) (avalanche.Vertex, error) {
-		switch vtxID {
-		case vtxID0:
-			if parsedVtx0 {
-				return vtx0, nil
-			}
-			return nil, errUnknownVertex
-		case vtxID1:
-			if parsedVtx1 {
-				return vtx1, nil
-			}
-			return nil, errUnknownVertex
-		default:
-			require.FailNow(errUnknownVertex.Error())
-			return nil, errUnknownVertex
-		}
-	}
-	manager.ParseVtxF = func(_ context.Context, vtxBytes []byte) (avalanche.Vertex, error) {
-		switch {
-		case bytes.Equal(vtxBytes, vtxBytes0):
-			vtx0.StatusV = choices.Processing
-			parsedVtx0 = true
-			return vtx0, nil
-		case bytes.Equal(vtxBytes, vtxBytes1):
-			vtx1.StatusV = choices.Processing
-			parsedVtx1 = true
-			return vtx1, nil
-		default:
-			require.FailNow(errUnknownVertex.Error())
-			return nil, errUnknownVertex
-		}
-	}
-
-	requestIDs := map[ids.ID]uint32{}
-	sender.SendGetAncestorsF = func(_ context.Context, vdr ids.NodeID, reqID uint32, vtxID ids.ID) {
-		require.Equal(peerID, vdr)
-		requestIDs[vtxID] = reqID
-	}
-
-	vm.CantSetState = false
-	require.NoError(bs.Start(context.Background(), 0)) // should request vtx1
-	require.Contains(requestIDs, vtxID1)
-
-	reqID := requestIDs[vtxID1]
-	clear(requestIDs)
-	require.NoError(bs.Ancestors(context.Background(), peerID, reqID, [][]byte{vtxBytes0}))
-	require.Contains(requestIDs, vtxID1)
-
-	manager.EdgeF = func(context.Context) []ids.ID {
-		require.Equal(choices.Accepted, vtx1.Status())
-		return []ids.ID{vtxID1}
-	}
-
-	vm.LinearizeF = func(_ context.Context, stopVertexID ids.ID) error {
-		require.Equal(vtxID1, stopVertexID)
-		return nil
-	}
-
-	require.NoError(bs.Ancestors(context.Background(), peerID, reqID, [][]byte{vtxBytes1, vtxBytes0}))
-	require.Equal(choices.Accepted, vtx0.Status())
-	require.Equal(choices.Accepted, vtx1.Status())
-	require.Equal(snow.NormalOp, config.Ctx.State.Get().State)
 }

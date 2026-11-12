@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package uptime
@@ -35,7 +35,7 @@ func NewLockedCalculator() LockedCalculator {
 	return &lockedCalculator{}
 }
 
-func (c *lockedCalculator) CalculateUptime(nodeID ids.NodeID, subnetID ids.ID) (time.Duration, time.Time, error) {
+func (c *lockedCalculator) CalculateUptime(nodeID ids.NodeID) (time.Duration, time.Time, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
@@ -46,10 +46,24 @@ func (c *lockedCalculator) CalculateUptime(nodeID ids.NodeID, subnetID ids.ID) (
 	c.calculatorLock.Lock()
 	defer c.calculatorLock.Unlock()
 
-	return c.c.CalculateUptime(nodeID, subnetID)
+	return c.c.CalculateUptime(nodeID)
 }
 
-func (c *lockedCalculator) CalculateUptimePercent(nodeID ids.NodeID, subnetID ids.ID) (float64, error) {
+func (c *lockedCalculator) GetStartTime(nodeID ids.NodeID) (time.Time, error) {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	if c.isBootstrapped == nil || !c.isBootstrapped.Get() {
+		return time.Time{}, errStillBootstrapping
+	}
+
+	c.calculatorLock.Lock()
+	defer c.calculatorLock.Unlock()
+
+	return c.c.GetStartTime(nodeID)
+}
+
+func (c *lockedCalculator) CalculateUptimePercent(nodeID ids.NodeID) (float64, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
@@ -60,10 +74,10 @@ func (c *lockedCalculator) CalculateUptimePercent(nodeID ids.NodeID, subnetID id
 	c.calculatorLock.Lock()
 	defer c.calculatorLock.Unlock()
 
-	return c.c.CalculateUptimePercent(nodeID, subnetID)
+	return c.c.CalculateUptimePercent(nodeID)
 }
 
-func (c *lockedCalculator) CalculateUptimePercentFrom(nodeID ids.NodeID, subnetID ids.ID, startTime time.Time) (float64, error) {
+func (c *lockedCalculator) CalculateUptimePercentFrom(nodeID ids.NodeID, startTime time.Time) (float64, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
@@ -74,7 +88,7 @@ func (c *lockedCalculator) CalculateUptimePercentFrom(nodeID ids.NodeID, subnetI
 	c.calculatorLock.Lock()
 	defer c.calculatorLock.Unlock()
 
-	return c.c.CalculateUptimePercentFrom(nodeID, subnetID, startTime)
+	return c.c.CalculateUptimePercentFrom(nodeID, startTime)
 }
 
 func (c *lockedCalculator) SetCalculator(isBootstrapped *utils.Atomic[bool], lock sync.Locker, newC Calculator) {

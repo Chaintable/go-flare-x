@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package merkledb
@@ -92,11 +92,10 @@ type View interface {
 	CommitToDB(ctx context.Context) error
 }
 
-// Returns the nodes along the path to [key].
+// Calls [visitNode] on the nodes along the path to [key].
 // The first node is the root, and the last node is either the node with the
 // given [key], if it's in the trie, or the node with the largest prefix of
 // the [key] if it isn't in the trie.
-// Always returns at least the root node.
 // Assumes [t] doesn't change while this function is running.
 func visitPathToKey(t Trie, key Key, visitNode func(*node) error) error {
 	maybeRoot := t.getRoot()
@@ -137,7 +136,7 @@ func visitPathToKey(t Trie, key Key, visitNode func(*node) error) error {
 	return nil
 }
 
-// Returns a proof that [bytesPath] is in or not in trie [t].
+// Returns a proof that [key] is in or not in trie [t].
 // Assumes [t] doesn't change while this function is running.
 func getProof(t Trie, key []byte) (*Proof, error) {
 	root := t.getRoot()
@@ -192,7 +191,7 @@ func getProof(t Trie, key []byte) (*Proof, error) {
 	return proof, nil
 }
 
-// GetRangeProof returns a range proof for (at least part of) the key range [start, end].
+// getRangeProof returns a range proof for (at least part of) the key range [start, end].
 // The returned proof's [KeyValues] has at most [maxLength] values.
 // [maxLength] must be > 0.
 // Assumes [t] doesn't change while this function is running.
@@ -212,14 +211,14 @@ func getRangeProof(
 	}
 
 	result := RangeProof{
-		KeyValues: make([]KeyValue, 0, initKeyValuesSize),
+		KeyChanges: make([]KeyChange, 0, initKeyValuesSize),
 	}
 	it := t.NewIteratorWithStart(start.Value())
-	for it.Next() && len(result.KeyValues) < maxLength && (end.IsNothing() || bytes.Compare(it.Key(), end.Value()) <= 0) {
+	for it.Next() && len(result.KeyChanges) < maxLength && (end.IsNothing() || bytes.Compare(it.Key(), end.Value()) <= 0) {
 		// clone the value to prevent editing of the values stored within the trie
-		result.KeyValues = append(result.KeyValues, KeyValue{
+		result.KeyChanges = append(result.KeyChanges, KeyChange{
 			Key:   it.Key(),
-			Value: slices.Clone(it.Value()),
+			Value: maybe.Some(slices.Clone(it.Value())),
 		})
 	}
 	it.Release()
@@ -234,13 +233,15 @@ func getRangeProof(
 		endProof *Proof
 		err      error
 	)
-	if len(result.KeyValues) > 0 {
-		greatestKey := result.KeyValues[len(result.KeyValues)-1].Key
+	if len(result.KeyChanges) > 0 {
+		// [endProof] => inclusion proof for the largest key
+		greatestKey := result.KeyChanges[len(result.KeyChanges)-1].Key
 		endProof, err = getProof(t, greatestKey)
 		if err != nil {
 			return nil, err
 		}
 	} else if end.HasValue() {
+		// [endProof] => exclusion proof for the [end] key
 		endProof, err = getProof(t, end.Value())
 		if err != nil {
 			return nil, err
@@ -251,6 +252,7 @@ func getRangeProof(
 	}
 
 	if start.HasValue() {
+		// [startProof] => inclusion/exclusion proof for [start] key
 		startProof, err := getProof(t, start.Value())
 		if err != nil {
 			return nil, err

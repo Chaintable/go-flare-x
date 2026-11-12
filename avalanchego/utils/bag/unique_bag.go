@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package bag
@@ -97,9 +97,9 @@ func (b *UniqueBag[T]) Bag(threshold int) Bag[T] {
 func (b *UniqueBag[T]) PrefixedString(prefix string) string {
 	sb := strings.Builder{}
 
-	sb.WriteString(fmt.Sprintf("UniqueBag[%T]: (Size = %d)", utils.Zero[T](), len(*b)))
+	fmt.Fprintf(&sb, "UniqueBag[%T]: (Size = %d)", utils.Zero[T](), len(*b))
 	for key, set := range *b {
-		sb.WriteString(fmt.Sprintf("\n%s    %v: %s", prefix, key, set))
+		fmt.Fprintf(&sb, "\n%s    %v: %s", prefix, key, set)
 	}
 
 	return sb.String()

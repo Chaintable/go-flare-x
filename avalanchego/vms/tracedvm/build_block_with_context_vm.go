@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package tracedvm
@@ -21,6 +21,7 @@ func (vm *blockVM) BuildBlockWithContext(ctx context.Context, blockCtx *block.Co
 
 	ctx, span := vm.tracer.Start(ctx, vm.buildBlockWithContextTag, oteltrace.WithAttributes(
 		attribute.Int64("pChainHeight", int64(blockCtx.PChainHeight)),
+		attribute.Int64("proposerPChainHeight", int64(blockCtx.ProposerPChainHeight)),
 	))
 	defer span.End()
 

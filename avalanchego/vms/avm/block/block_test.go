@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package block
@@ -29,8 +29,6 @@ func TestInvalidBlock(t *testing.T) {
 	require := require.New(t)
 
 	parser, err := NewParser(
-		time.Time{},
-		time.Time{},
 		[]fxs.Fx{
 			&secp256k1fx.Fx{},
 		},
@@ -46,8 +44,6 @@ func TestStandardBlocks(t *testing.T) {
 	require := require.New(t)
 
 	parser, err := NewParser(
-		time.Time{},
-		time.Time{},
 		[]fxs.Fx{
 			&secp256k1fx.Fx{},
 		},

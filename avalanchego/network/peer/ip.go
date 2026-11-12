@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2024, Ava Labs, Inc. All rights reserved.
+// Copyright (C) 2019, Ava Labs, Inc. All rights reserved.
 // See the file LICENSE for licensing terms.
 
 package peer
@@ -8,12 +8,13 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"time"
 
 	"github.com/ava-labs/avalanchego/staking"
 	"github.com/ava-labs/avalanchego/utils/crypto/bls"
 	"github.com/ava-labs/avalanchego/utils/hashing"
-	"github.com/ava-labs/avalanchego/utils/ips"
 	"github.com/ava-labs/avalanchego/utils/wrappers"
 )
 
@@ -26,32 +27,42 @@ var (
 // ensure that the most updated IP claim is tracked by peers for a given
 // validator.
 type UnsignedIP struct {
-	ips.IPPort
+	AddrPort  netip.AddrPort
 	Timestamp uint64
 }
 
 // Sign this IP with the provided signer and return the signed IP.
-func (ip *UnsignedIP) Sign(tlsSigner crypto.Signer, blsSigner *bls.SecretKey) (*SignedIP, error) {
+func (ip *UnsignedIP) Sign(tlsSigner crypto.Signer, blsSigner bls.Signer) (*SignedIP, error) {
 	ipBytes := ip.bytes()
 	tlsSignature, err := tlsSigner.Sign(
 		rand.Reader,
 		hashing.ComputeHash256(ipBytes),
 		crypto.SHA256,
 	)
-	blsSignature := bls.SignProofOfPossession(blsSigner, ipBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	blsSignature, err := blsSigner.SignProofOfPossession(ipBytes)
+	if err != nil {
+		return nil, err
+	}
+
 	return &SignedIP{
 		UnsignedIP:        *ip,
 		TLSSignature:      tlsSignature,
 		BLSSignature:      blsSignature,
 		BLSSignatureBytes: bls.SignatureToBytes(blsSignature),
-	}, err
+	}, nil
 }
 
 func (ip *UnsignedIP) bytes() []byte {
 	p := wrappers.Packer{
-		Bytes: make([]byte, ips.IPPortLen+wrappers.LongLen),
+		Bytes: make([]byte, net.IPv6len+wrappers.ShortLen+wrappers.LongLen),
 	}
-	ips.PackIP(&p, ip.IPPort)
+	addrBytes := ip.AddrPort.Addr().As16()
+	p.PackFixedBytes(addrBytes[:])
+	p.PackShort(ip.AddrPort.Port())
 	p.PackLong(ip.Timestamp)
 	return p.Bytes
 }

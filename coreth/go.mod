@@ -1,6 +1,6 @@
 module github.com/ava-labs/coreth
 
-go 1.22
+go 1.24
 
 require (
 	github.com/VictoriaMetrics/fastcache v1.10.0
@@ -24,7 +24,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.5-0.20210104140557-80c98217689d
 	github.com/holiman/bloomfilter/v2 v2.0.3
 	github.com/holiman/uint256 v1.2.2-0.20230321075855-87b91420868c
-	github.com/klauspost/compress v1.15.15
+	github.com/klauspost/compress v1.18.7
 	github.com/kylelemons/godebug v1.1.0
 	github.com/mattn/go-colorable v0.1.13
 	github.com/mattn/go-isatty v0.0.16
